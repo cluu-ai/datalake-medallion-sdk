@@ -16,6 +16,8 @@ readme = "../README.md"
 [lib]
 name = "_core"
 crate-type = ["cdylib", "rlib"]
+# Benchmarks live in benches/ (Criterion); libtest's bench harness rejects Criterion flags.
+bench = false
 
 [dependencies]
 # Python bridge

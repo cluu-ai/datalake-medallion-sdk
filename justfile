@@ -1,5 +1,8 @@
 # Task runner for datalake-medallion-sdk (https://just.systems). Mirrors CI.
 
+# LTO release/bench builds use ~0.5-1 GB per rustc process; cap local parallelism.
+export CARGO_BUILD_JOBS := env_var_or_default("CARGO_BUILD_JOBS", "4")
+
 default:
     @just --list
 
