@@ -1,0 +1,14 @@
+title = "datalake-medallion-sdk"
+
+[extend]
+useDefault = true
+
+# Only literal placeholder values used by tests and local emulators are allowed.
+# Whole directories are never allowlisted.
+[allowlist]
+description = "Emulator and test placeholder credentials"
+regexTarget = "match"
+regexes = [
+    '''(?i)aws_(access_key_id|secret_access_key)\s*=\s*["']test["']''',
+    '''(?i)AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)\s*[:=]\s*["']?test["']?''',
+]

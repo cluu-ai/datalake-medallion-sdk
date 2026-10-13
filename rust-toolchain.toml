@@ -1,0 +1,5 @@
+[toolchain]
+# Development uses stable; the MSRV (rust-version in Cargo.toml) is checked in CI.
+# Cross-platform wheels are built by maturin-action, so no extra targets are pinned here.
+channel = "stable"
+components = ["rustfmt", "clippy"]

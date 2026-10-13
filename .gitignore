@@ -1,0 +1,61 @@
+# Rust build artifacts
+/target/
+/datalake-medallion-sdk/target/
+/datalake-medallion-sdk/fuzz/target/
+/datalake-medallion-sdk/fuzz/corpus/
+/datalake-medallion-sdk/fuzz/artifacts/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.eggs/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+.venv/
+
+# maturin
+/wheels/
+
+# Docker volumes data (local overrides)
+docker/localstack/data/
+
+# Environment files (never commit credentials)
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/settings.json
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Criterion benchmark output
+/criterion/
+
+# cargo audit
+audit.json
+
+# Coverage
+coverage/
+tarpaulin-report.html
+lcov.info
+
+# Local leftovers from removed infrastructure tooling
+**/.terraform/
+
+# mdBook build output
+/book/

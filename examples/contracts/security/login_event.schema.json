@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoginEvent",
+  "description": "Example contract: authentication events.",
+  "type": "object",
+  "x-dl-layer": "bronze",
+  "x-dl-domain": "security",
+  "x-dl-datatype": "login_event",
+  "x-dl-schema_version": "1.0.0",
+  "x-dl-flexibility_mode": "strict",
+  "required": ["event_id", "occurred_at", "outcome"],
+  "properties": {
+    "event_id": {"type": "string", "format": "uuid"},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "outcome": {"type": "string", "enum": ["SUCCESS", "FAILURE", "LOCKED"]},
+    "attempts": {"type": "integer", "minimum": 1},
+    "source_ip": {"type": "string", "format": "ipv4", "x-dl-pii": true},
+    "user_email": {"type": "string", "format": "email", "x-dl-pii": true},
+    "user_agent": {"type": ["string", "null"], "maxLength": 512},
+    "context": {"type": "object"}
+  }
+}

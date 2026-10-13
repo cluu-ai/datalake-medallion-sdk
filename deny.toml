@@ -1,0 +1,44 @@
+# cargo-deny configuration. Run: cargo deny check
+# Every advisory ignore must name the transitive path, an owner and a review date.
+
+[graph]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    { name = "openssl", reason = "rustls only" },
+    { name = "openssl-sys", reason = "rustls only" },
+    { name = "sqlx", reason = "database clients are out of scope for the core" },
+    { name = "reqwest", reason = "contracts must never be fetched over the network" },
+    { name = "polars", reason = "not needed by the core; heavy and advisory-prone" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

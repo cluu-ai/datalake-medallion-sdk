@@ -1,0 +1,33 @@
+[workspace]
+members = ["datalake-medallion-sdk"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.1"
+authors = ["Igor Ramirez Almanza"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ramirezalmanzaigor/datalake-medallion-sdk"
+homepage = "https://github.com/ramirezalmanzaigor/datalake-medallion-sdk"
+documentation = "https://docs.rs/datalake-medallion-sdk"
+keywords = ["datalake", "medallion", "parquet", "arrow", "data-contracts"]
+categories = ["database", "encoding", "api-bindings"]
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.test]
+opt-level = 1

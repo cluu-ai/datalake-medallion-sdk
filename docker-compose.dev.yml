@@ -1,0 +1,20 @@
+# Optional local S3 for the Rust integration test and manual experiments.
+# Usage: docker compose -f docker-compose.dev.yml up -d --wait
+# Python tests do not need it: they use an in-process S3 emulator (moto).
+
+services:
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      SERVICES: s3
+      DEFAULT_REGION: us-east-1
+    volumes:
+      - ./docker/localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal s3 ls >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
