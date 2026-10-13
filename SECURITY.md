@@ -9,7 +9,7 @@
 ## Reporting a vulnerability
 
 Do not open a public issue. Use GitHub's private vulnerability reporting:
-[Report a vulnerability](https://github.com/ramirezalmanzaigor/datalake-medallion-sdk/security/advisories/new).
+[Report a vulnerability](https://github.com/cluu-ai/datalake-medallion-sdk/security/advisories/new).
 
 Include the affected version, a description, reproduction steps and the impact you expect. You will get an acknowledgement within 5 business days and a remediation plan once the report is confirmed.
 

@@ -48,11 +48,11 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ramirezalmanzaigor/datalake-medallion-sdk"
-Repository = "https://github.com/ramirezalmanzaigor/datalake-medallion-sdk"
-Issues = "https://github.com/ramirezalmanzaigor/datalake-medallion-sdk/issues"
-Changelog = "https://github.com/ramirezalmanzaigor/datalake-medallion-sdk/blob/main/CHANGELOG.md"
-Security = "https://github.com/ramirezalmanzaigor/datalake-medallion-sdk/security/policy"
+Homepage = "https://github.com/cluu-ai/datalake-medallion-sdk"
+Repository = "https://github.com/cluu-ai/datalake-medallion-sdk"
+Issues = "https://github.com/cluu-ai/datalake-medallion-sdk/issues"
+Changelog = "https://github.com/cluu-ai/datalake-medallion-sdk/blob/main/CHANGELOG.md"
+Security = "https://github.com/cluu-ai/datalake-medallion-sdk/security/policy"
 
 [tool.maturin]
 manifest-path = "datalake-medallion-sdk/Cargo.toml"
