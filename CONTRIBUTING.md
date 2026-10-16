@@ -6,6 +6,8 @@ Thanks for helping. This guide covers setup, the checks every change must pass, 
 
 Requirements: Rust 1.94.1+ (`rustup`), Python 3.12+. No Docker is needed: Python end-to-end tests run against an in-process S3 emulator (moto).
 
+Release and benchmark builds use fat LTO, and each `rustc` process can take 0.5–1 GB of RAM. `dev.ps1` and `justfile` cap parallel compilation through `CARGO_BUILD_JOBS` (default 4, or a quarter of the CPU threads); set it explicitly on machines with less memory, e.g. `CARGO_BUILD_JOBS=2`.
+
 ```bash
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"                        # builds the native extension with maturin

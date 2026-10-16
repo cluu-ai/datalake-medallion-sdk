@@ -27,7 +27,8 @@ panic = "abort"
 
 [profile.bench]
 inherits = "release"
-debug = true
+# Line tables are enough for profilers and use far less memory than full debug info.
+debug = "line-tables-only"
 
 [profile.test]
 opt-level = 1

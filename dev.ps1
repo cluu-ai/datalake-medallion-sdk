@@ -21,6 +21,12 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
+# Each LTO release/bench rustc process can take ~0.5-1 GB of RAM; cap parallelism
+# locally unless the caller chose a value.
+if (-not $env:CARGO_BUILD_JOBS) {
+    $env:CARGO_BUILD_JOBS = [Math]::Max(2, [int][Math]::Floor([Environment]::ProcessorCount / 4))
+}
+
 $Venv = Join-Path $PSScriptRoot ".venv"
 $Py = if ($IsWindows -or $env:OS -eq "Windows_NT") { Join-Path $Venv "Scripts/python.exe" } else { Join-Path $Venv "bin/python" }
 
