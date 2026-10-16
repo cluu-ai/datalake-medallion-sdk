@@ -35,8 +35,8 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "h
 bytes = "1"
 
 # Columnar data
-arrow = { version = "59", features = ["json", "ffi", "pyarrow"] }
-parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
+arrow = { version = "60", features = ["json", "ffi", "pyarrow"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd"] }
 
 # Contracts and validation
 # No remote or file $ref resolution: contracts must be self-contained, and
