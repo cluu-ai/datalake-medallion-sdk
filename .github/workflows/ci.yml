@@ -138,7 +138,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, msrv]
+        # Pull requests: stable only. The MSRV build runs on main.
+        rust: ${{ fromJSON(github.event_name == 'pull_request' && '["stable"]' || '["stable", "msrv"]') }}
     services:
       localstack:
         image: localstack/localstack:3
@@ -176,7 +177,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Pull requests: Linux only. Windows and macOS run on main and in the
+        # release workflow, which tests every wheel before publishing.
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "windows-latest", "macos-latest"]') }}
         python: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -194,6 +197,7 @@ jobs:
 
   fuzz:
     name: Fuzz contract compilation
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -211,6 +215,7 @@ jobs:
 
   coverage:
     name: Coverage (llvm-cov)
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
