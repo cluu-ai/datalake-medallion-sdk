@@ -1,32 +1,38 @@
+# Monthly, grouped updates keep CI usage low: minor and patch bumps arrive as one
+# pull request per ecosystem; each major bump gets its own pull request for review.
+# Security updates are not affected by this schedule and open as soon as needed.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    open-pull-requests-limit: 3
     groups:
-      aws-sdk:
-        patterns: ["aws-*"]
-      arrow:
-        patterns: ["arrow*", "parquet"]
-      pyo3:
-        patterns: ["pyo3*"]
-    open-pull-requests-limit: 10
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: pip
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    open-pull-requests-limit: 2
+    groups:
+      pip-all:
+        patterns: ["*"]
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    open-pull-requests-limit: 2
     groups:
-      actions:
+      actions-all:
         patterns: ["*"]
 
   - package-ecosystem: docker-compose
     directory: /
     schedule:
       interval: monthly
+    open-pull-requests-limit: 1
