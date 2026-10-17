@@ -16,10 +16,10 @@ Include the affected version, a description, reproduction steps and the impact y
 ## Security properties
 
 - **Tenant isolation**: tenant ids are restricted to `[a-z0-9_-]` with structural rules, so they cannot traverse or inject into object keys. Every key carries the `tenant_id=` partition.
-- **PII**: by default, fields marked `x-dl-pii` are replaced by their SHA-256 or HMAC-SHA256 digest before encoding, in Bronze objects and in dead-letter entries. Masking can be disabled per client (`pii_masking=False`) or per call; the scheme applied is recorded in the `_dl_pii_masking` column, so unmasked data is always identifiable. Disabling it means raw personal data is stored, and protecting it is then the operator's responsibility. Unkeyed SHA-256 of low-entropy values (e-mail addresses, phone numbers) can be reversed by dictionary attack; use `pii_hmac_key` with a secret stored outside the lake.
+- **PII**: fields marked `x-dl-pii` are stored as received unless the tenant profile sets `pii_protection`. When it does, every value is replaced before encoding, in Bronze objects and in dead-letter entries alike: SHA-256 or HMAC-SHA256 digests, AES-256-GCM tokens bound to their tenant and field (with a data key the host obtains, e.g. from AWS KMS per tenant), or a custom scheme. The scheme is recorded in the `_dl_pii_protection` column and in each dead letter, so unprotected data is always identifiable; storing raw personal data is then the operator's responsibility. Unkeyed SHA-256 of low-entropy values (e-mail addresses, phone numbers) can be reversed by dictionary attack; prefer HMAC with a key stored outside the lake, or encryption. A failing protector fails the call before anything is written.
 - **No values in diagnostics**: schema errors are rendered with instance values masked, hook exceptions are reported by type only, and logs contain counts and identifiers only.
 - **Contracts are offline**: `$ref` resolution over the network or the file system is disabled.
-- **Least privilege**: the SDK never creates buckets; the writer role needs `s3:PutObject` on the data and dead-letter prefixes only. Credentials are never logged and are redacted from `repr`/`Debug`.
+- **Least privilege**: the SDK never creates buckets; the writer role needs `s3:PutObject` on each tenant's bronze and quarantine locations only. Credentials are never logged and are redacted from `repr`/`Debug`.
 
 ## Supply chain
 
