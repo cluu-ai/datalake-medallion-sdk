@@ -29,7 +29,7 @@ use serde_json::{Map, Value};
 use crate::codec;
 use crate::contracts::{Contract, FieldKind, FlexibilityMode};
 use crate::error::DatalakeError;
-use crate::validation::pii::PiiHasher;
+use crate::validation::pii::{FieldProtector, ProtectionContext};
 
 /// Columns at least this long are checked and hashed on the rayon pool.
 const PARALLEL_THRESHOLD: usize = 4096;
@@ -202,7 +202,7 @@ impl ColumnarPlan {
                 }
                 continue;
             };
-            let masked = field.pii && ctx.hasher.is_some();
+            let masked = field.pii && ctx.protector.is_some();
             let mut checks: Vec<Check<'_>> = Vec::new();
             if rule.required && self.enforce_schema {
                 checks.push(Check::NotNull);
@@ -244,14 +244,16 @@ impl ColumnarPlan {
 
         let mut out = Vec::with_capacity(columns.len() + 1);
         for (field, column) in contract.fields().iter().zip(&columns) {
-            let masked = field.pii && ctx.hasher.is_some();
+            let masked = field.pii && ctx.protector.is_some();
             let target = codec::arrow_type(codec::storage_kind(field, masked));
             let array = match column {
                 None => new_null_array(&target, accepted_rows),
                 Some(a) => {
                     let selected = select(a).map_err(arrow_error)?;
-                    match ctx.hasher {
-                        Some(h) if field.pii => hash_column(h, &selected),
+                    match ctx.protector {
+                        Some(p) if field.pii => {
+                            protect_column(p, ctx.tenant_id, &field.name, &selected)?
+                        }
                         _ => cast(&selected, &target).map_err(arrow_error)?,
                     }
                 }
@@ -335,7 +337,8 @@ pub(crate) struct ScreenContext<'a> {
     pub now: DateTime<Utc>,
     pub max_future_skew: Option<Duration>,
     pub max_record_bytes: usize,
-    pub hasher: Option<&'a PiiHasher>,
+    pub tenant_id: &'a str,
+    pub protector: Option<&'a dyn FieldProtector>,
 }
 
 /// Rows accepted by the columnar path.
@@ -473,27 +476,49 @@ fn cell_value(array: &ArrayRef, i: usize) -> Value {
     }
 }
 
-/// Text the row path hashes for the non-null cell `i`: strings as-is, any
+/// Text the row path protects for the non-null cell `i`: strings as-is, any
 /// other value as its compact JSON.
-fn hash_input(array: &ArrayRef, i: usize) -> Cow<'_, str> {
+fn protection_input(array: &ArrayRef, i: usize) -> Cow<'_, str> {
     match array.data_type() {
         DataType::Utf8 => Cow::Borrowed(array.as_string::<i32>().value(i)),
         _ => Cow::Owned(cell_value(array, i).to_string()),
     }
 }
 
-fn hash_column(hasher: &PiiHasher, array: &ArrayRef) -> ArrayRef {
-    let digest = |i: usize| {
-        array
-            .is_valid(i)
-            .then(|| hasher.hash(&hash_input(array, i)))
-    };
-    let digests: Vec<Option<String>> = if array.len() >= PARALLEL_THRESHOLD {
-        (0..array.len()).into_par_iter().map(digest).collect()
-    } else {
-        (0..array.len()).map(digest).collect()
-    };
-    Arc::new(StringArray::from(digests))
+/// Protects the non-null cells of one column with a single
+/// [`FieldProtector::protect_batch`] call; nulls stay null.
+fn protect_column(
+    protector: &dyn FieldProtector,
+    tenant_id: &str,
+    field: &str,
+    array: &ArrayRef,
+) -> Result<ArrayRef, DatalakeError> {
+    let inputs: Vec<Cow<'_, str>> = (0..array.len())
+        .filter(|i| array.is_valid(*i))
+        .map(|i| protection_input(array, i))
+        .collect();
+    let refs: Vec<&str> = inputs.iter().map(AsRef::as_ref).collect();
+    let ctx = ProtectionContext { tenant_id, field };
+    let protected = protector.protect_batch(&ctx, &refs)?;
+    if protected.len() != refs.len() {
+        return Err(DatalakeError::protection(format!(
+            "scheme '{}' returned {} values for {} inputs of field '{field}'",
+            protector.scheme(),
+            protected.len(),
+            refs.len()
+        )));
+    }
+    let mut values = protected.into_iter();
+    let column: StringArray = (0..array.len())
+        .map(|i| {
+            if array.is_valid(i) {
+                values.next()
+            } else {
+                None
+            }
+        })
+        .collect();
+    Ok(Arc::new(column))
 }
 
 /// Interleaves columnar rows and row-path rows back into input order.

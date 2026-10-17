@@ -65,6 +65,13 @@ pub enum DatalakeError {
         message: String,
     },
 
+    /// PII protection failed (Level 6); nothing was written.
+    #[error("PII protection error: {message}")]
+    Protection {
+        /// What failed, free of record values.
+        message: String,
+    },
+
     /// Invalid SDK configuration.
     #[error("configuration error: {message}")]
     Configuration {
@@ -82,6 +89,12 @@ impl DatalakeError {
 
     pub(crate) fn boot(message: impl Into<String>) -> Self {
         Self::ContractBoot {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn protection(message: impl Into<String>) -> Self {
+        Self::Protection {
             message: message.into(),
         }
     }
@@ -174,6 +187,12 @@ pub mod exceptions {
         DatalakeError,
         "Encoding or object storage failure. Safe to retry."
     );
+    create_exception!(
+        datalake_medallion_sdk,
+        ProtectionError,
+        DatalakeError,
+        "PII protection failed (Level 6); nothing was written."
+    );
 }
 
 impl From<DatalakeError> for PyErr {
@@ -196,6 +215,7 @@ impl From<DatalakeError> for PyErr {
                 _ => ex::RecordRejectedError::new_err(msg),
             },
             DatalakeError::Storage { .. } => ex::StorageError::new_err(msg),
+            DatalakeError::Protection { .. } => ex::ProtectionError::new_err(msg),
         }
     }
 }
@@ -233,6 +253,7 @@ pub(crate) fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("TypeCoercionError", py.get_type::<ex::TypeCoercionError>())?;
     m.add("StorageError", py.get_type::<ex::StorageError>())?;
+    m.add("ProtectionError", py.get_type::<ex::ProtectionError>())?;
     Ok(())
 }
 

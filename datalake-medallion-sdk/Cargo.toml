@@ -48,10 +48,14 @@ serde = { version = "1", features = ["derive"] }
 # Arrow input gives the same numbers on the columnar and the row path.
 serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
 
-# PII pseudonymization
+# PII protection: pseudonymization (SHA-256, HMAC) and envelope encryption
+# (AES-256-GCM with a host-provided data key, e.g. from AWS KMS per tenant).
 sha2 = "0.11"
 hmac = "0.13"
 hex = "0.4"
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+base64 = "0.23"
+getrandom = "0.4"
 
 # Identifiers and time
 ulid = "3"

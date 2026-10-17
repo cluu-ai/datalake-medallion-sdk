@@ -4,33 +4,30 @@
 //!
 //! Every record goes through one pipeline before it reaches object storage:
 //! tenant validation, payload checks, JSON Schema contract, optional host
-//! hook, semantic rules, optional PII pseudonymization (on by default) and
-//! Arrow type coercion. Valid records become one Hive-partitioned Parquet
-//! object with lineage columns; invalid records are quarantined under a
-//! dead-letter prefix. See [`validation`] for the level table.
+//! hook, semantic rules, optional PII protection (off by default) and Arrow
+//! type coercion. Valid records become one Hive-partitioned Parquet object
+//! with lineage columns; invalid records are quarantined. Where both go, and
+//! how PII is protected, is decided per tenant by its [`tenant::TenantProfile`],
+//! which every ingest call carries. See [`validation`] for the level table.
 //!
 //! ```rust,no_run
 //! use std::sync::Arc;
 //! use _core::contracts::{ContractRegistry, FileSystemSchemaProvider, DEFAULT_EXTENSION_PREFIX};
 //! use _core::pipeline::{BronzePipeline, IngestRequest, PipelineConfig, RecordSource};
 //! use _core::storage::{S3Options, S3Storage};
-//! use _core::tenant::{BronzePathResolver, TenantId};
+//! use _core::tenant::{TenantId, TenantProfile};
 //!
 //! # async fn run() -> Result<(), _core::error::DatalakeError> {
 //! let registry = ContractRegistry::from_provider(
 //!     &FileSystemSchemaProvider::new("contracts"),
 //!     DEFAULT_EXTENSION_PREFIX,
 //! )?;
-//! let storage = S3Storage::connect(S3Options { bucket: "acme-lake".into(), ..Default::default() }).await;
-//! let pipeline = BronzePipeline::new(
-//!     Arc::new(registry),
-//!     Arc::new(storage),
-//!     BronzePathResolver::new("acme-lake")?,
-//!     PipelineConfig::default(),
-//! )?;
+//! let storage = S3Storage::connect(S3Options::default()).await;
+//! let pipeline = BronzePipeline::new(Arc::new(registry), Arc::new(storage), PipelineConfig::default())?;
+//! let tenant = TenantProfile::for_bucket(TenantId::new("acme-001")?, "acme-lake")?.build()?;
 //! let report = pipeline
 //!     .ingest(IngestRequest::new(
-//!         TenantId::new("acme-001")?,
+//!         Arc::new(tenant),
 //!         "security/login_event/1.0.0",
 //!         RecordSource::Json(r#"[{"event_id": "e1"}]"#.into()),
 //!     ))

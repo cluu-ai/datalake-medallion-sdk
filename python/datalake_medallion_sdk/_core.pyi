@@ -15,10 +15,14 @@ __all__ = [
     "HookError",
     "IngestReport",
     "MalformedPayloadError",
+    "PiiProtection",
+    "ProtectionError",
     "RecordRejectedError",
     "SchemaViolationError",
     "SemanticViolationError",
     "StorageError",
+    "TenantProfile",
+    "TenantRegistry",
     "TenantViolationError",
     "TypeCoercionError",
     "__version__",
@@ -58,6 +62,93 @@ class TypeCoercionError(RecordRejectedError):
 class StorageError(DatalakeError):
     """Encoding or object storage failure. Safe to retry."""
 
+class ProtectionError(DatalakeError):
+    """PII protection failed (Level 6); nothing was written."""
+
+@final
+class PiiProtection:
+    """A PII protection scheme for a :class:`TenantProfile`."""
+
+    @staticmethod
+    def sha256() -> PiiProtection:
+        """Unkeyed SHA-256 (hex). Deterministic; weak for low-entropy values."""
+    @staticmethod
+    def hmac_sha256(key: bytes) -> PiiProtection:
+        """Keyed HMAC-SHA256 (hex); ``key`` has 16+ bytes and lives outside the lake."""
+    @staticmethod
+    def aes_256_gcm(data_key: bytes, *, key_ref: str) -> PiiProtection:
+        """AES-256-GCM envelope encryption with a 32-byte data key.
+
+        ``key_ref`` is what readers need to recover the key, e.g. the
+        ``CiphertextBlob`` returned by AWS KMS ``GenerateDataKey``.
+        """
+    @staticmethod
+    def custom(protector: Any) -> PiiProtection:
+        """Wrap an object implementing :class:`datalake_medallion_sdk.FieldProtector`."""
+    @property
+    def scheme(self) -> str:
+        """Scheme name recorded in ``_dl_pii_protection``."""
+    @property
+    def key_ref(self) -> str | None:
+        """Key reference recorded in ``_dl_pii_key_ref``."""
+    def decrypt(self, token: str, *, tenant_id: str, field: str) -> str:
+        """Decrypt an ``aes-256-gcm`` value written for ``tenant_id`` and ``field``."""
+
+@final
+class TenantProfile:
+    """Where a tenant's data lives per medallion layer, and how its PII is protected.
+
+    Locations are ``s3://bucket/prefix`` URIs. ``bronze`` and ``quarantine``
+    are required; ``silver`` and ``gold`` are optional. Layers may not share
+    or nest a location. PII is stored as received unless ``pii_protection``
+    is set.
+    """
+
+    def __new__(
+        cls,
+        tenant_id: str,
+        *,
+        bronze: str,
+        quarantine: str,
+        silver: str | None = None,
+        gold: str | None = None,
+        partition_order: Literal["tenant_first", "data_type_first"] = ...,
+        pii_protection: PiiProtection | None = None,
+    ) -> TenantProfile: ...
+    @staticmethod
+    def for_bucket(
+        tenant_id: str,
+        bucket: str,
+        *,
+        partition_order: Literal["tenant_first", "data_type_first"] = ...,
+        pii_protection: PiiProtection | None = None,
+    ) -> TenantProfile:
+        """Every layer in one bucket under ``bronze/``, ``quarantine/``, ``silver/``, ``gold/``."""
+    @property
+    def tenant_id(self) -> str: ...
+    @property
+    def partition_order(self) -> Literal["tenant_first", "data_type_first"]: ...
+    @property
+    def pii_protection(self) -> str:
+        """PII scheme name, or ``none``."""
+    def location(self, layer: Literal["bronze", "quarantine", "silver", "gold"]) -> str | None:
+        """``s3://bucket/prefix`` of ``layer``, or ``None`` when undefined."""
+    def table_uri(
+        self, layer: Literal["bronze", "quarantine", "silver", "gold"], data_type: str
+    ) -> str | None:
+        """``s3://`` prefix of this tenant's ``data_type`` table in ``layer``."""
+
+@final
+class TenantRegistry:
+    """Immutable directory of tenant profiles, looked up by tenant id."""
+
+    def __new__(cls, profiles: Iterable[TenantProfile]) -> TenantRegistry: ...
+    def get(self, tenant_id: str) -> TenantProfile:
+        """Profile of ``tenant_id``; raises :class:`TenantViolationError` when unknown."""
+    def tenant_ids(self) -> list[str]: ...
+    def __len__(self) -> int: ...
+    def __contains__(self, tenant_id: str, /) -> bool: ...
+
 @final
 class ContractRegistry:
     """Immutable set of compiled data contracts."""
@@ -94,6 +185,9 @@ class IngestReport:
     def batch_id(self) -> str:
         """ULID of the call; names the Parquet and dead-letter objects."""
     @property
+    def tenant_id(self) -> str:
+        """Tenant the records were written for."""
+    @property
     def records_received(self) -> int: ...
     @property
     def records_ok(self) -> int: ...
@@ -106,8 +200,8 @@ class IngestReport:
     def data_uri(self) -> str | None:
         """``s3://`` URI of the Parquet object, if any record was valid."""
     @property
-    def pii_masking(self) -> str:
-        """PII scheme applied: ``sha256``, ``hmac-sha256`` or ``none``."""
+    def pii_protection(self) -> str:
+        """PII scheme of the tenant profile (``none`` when stored as received)."""
     @property
     def dlq_uris(self) -> list[str]:
         """``s3://`` URIs of the dead-letter objects, one per error code."""
@@ -116,23 +210,19 @@ class IngestReport:
 class BronzeIngestionClient:
     """Validating Bronze writer for S3 and S3-compatible object stores.
 
-    The S3 client is created on the first ``ingest`` and reused. Credentials
-    come from the AWS default chain unless both static keys are given.
+    Holds no destination: each call names its tenant, whose profile decides
+    where the records go. The S3 client is created on the first ``ingest``
+    and reused for every bucket.
     """
 
     def __new__(
         cls,
-        bucket: str,
         registry: ContractRegistry,
         *,
-        data_prefix: str = ...,
-        dlq_prefix: str = ...,
-        partition_order: Literal["tenant_first", "data_type_first"] = ...,
+        tenants: TenantRegistry | None = None,
         envelope_prefix: str = ...,
         max_record_bytes: int = ...,
         max_future_skew_seconds: int | None = ...,
-        pii_masking: bool = ...,
-        pii_hmac_key: bytes | None = None,
         on_invalid: Literal["quarantine", "raise"] = ...,
         hooks: Mapping[str, Callable[[dict[str, Any]], Any]] | None = None,
         aws_region: str | None = None,
@@ -146,24 +236,24 @@ class BronzeIngestionClient:
         self,
         batch: Any,
         *,
-        tenant_id: str,
+        tenant: TenantProfile | str,
         contract: str,
-        pii_masking: bool | None = None,
     ) -> IngestReport:
-        """Validate ``batch`` against ``contract`` and write it for ``tenant_id``.
+        """Validate ``batch`` against ``contract`` and write it for ``tenant``.
 
         ``batch`` is a dict, a list of dicts, JSON ``str``/``bytes``, or an
         object implementing ``__arrow_c_stream__`` / ``__arrow_c_array__``
         (pyarrow, Polars, ...).
 
         Raises:
-            TenantViolationError: invalid ``tenant_id``.
+            TenantViolationError: invalid or unknown tenant.
+            ProtectionError: the tenant's PII protector failed.
             ConfigurationError: unknown ``contract``.
             MalformedPayloadError: the batch cannot be decoded.
             RecordRejectedError: a record is invalid and ``on_invalid="raise"``.
             StorageError: encoding or upload failed.
         """
     @property
-    def bucket(self) -> str: ...
+    def tenant_ids(self) -> list[str]: ...
     @property
     def hooked_contracts(self) -> list[str]: ...

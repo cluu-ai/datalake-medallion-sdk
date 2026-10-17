@@ -5,6 +5,7 @@
 mod client;
 mod hooks;
 mod registry;
+mod tenancy;
 
 use pyo3::prelude::*;
 
@@ -14,5 +15,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<registry::PyContractRegistry>()?;
     m.add_class::<client::PyBronzeIngestionClient>()?;
     m.add_class::<client::PyIngestReport>()?;
+    m.add_class::<tenancy::PyPiiProtection>()?;
+    m.add_class::<tenancy::PyTenantProfile>()?;
+    m.add_class::<tenancy::PyTenantRegistry>()?;
     Ok(())
 }
