@@ -44,7 +44,9 @@ parquet = { version = "59", default-features = false, features = ["arrow", "snap
 # `idn-email` and `idn-hostname` formats asserted (offline, pure Rust).
 jsonschema = { version = "0.58", default-features = false, features = ["idna"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+# `float_roundtrip`: JSON text parses to the exact f64 it was printed from, so
+# Arrow input gives the same numbers on the columnar and the row path.
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
 
 # PII pseudonymization
 sha2 = "0.11"

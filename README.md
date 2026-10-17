@@ -115,7 +115,7 @@ Lineage columns (prefix `_dl_`, configurable):
 
 ## Inputs
 
-`ingest` accepts a `dict`, a list of dicts, JSON `str`/`bytes`, or any object implementing the Arrow PyCapsule interface, such as a pyarrow `Table`/`RecordBatch` or a Polars `DataFrame`. Arrow rows go through the same validation as JSON. Validation and encoding run in Rust outside the GIL.
+`ingest` accepts a `dict`, a list of dicts, JSON `str`/`bytes`, or any object implementing the Arrow PyCapsule interface, such as a pyarrow `Table`/`RecordBatch` or a Polars `DataFrame`. Arrow rows get the same validation and the same results as JSON; when every rule of the contract applies to one field at a time, Arrow input is checked column by column and only rows that may be invalid are converted to JSON. Validation and encoding run in Rust outside the GIL.
 
 ## Hooks
 
@@ -151,14 +151,15 @@ Measured 2026-10-13 with Criterion on a laptop (AMD Ryzen 7 7730U, 8 cores, Wind
 
 | Benchmark | Records | Mean | Throughput |
 |---|---|---|---|
-| `prepare`, JSON text input | 100,000 | 192 ms | 0.52 M records/s |
-| `prepare`, Arrow input | 100,000 | 212 ms | 0.47 M records/s |
+| `prepare`, JSON text input | 100,000 | 199 ms | 0.50 M records/s |
+| `prepare`, Arrow input (columnar path) | 100,000 | 81 ms | 1.24 M records/s |
+| `prepare`, Arrow input forced through the row path | 100,000 | 206 ms | 0.49 M records/s |
 | Contract check, valid records | 10,000 | 1.96 ms | 5.1 M records/s |
 | Contract check, invalid records (errors rendered) | 10,000 | 22.4 ms | 0.45 M records/s |
 | PII masking, SHA-256, 2 fields | 10,000 | 4.3 ms | 2.3 M records/s |
 | PII masking, HMAC-SHA256, 2 fields | 10,000 | 5.2 ms | 1.9 M records/s |
 
-Reproduce with `cargo bench`. Upload time depends on the network and is not included.
+The `prepare` rows were measured on 2026-10-17 with `opt-level = 3` and LTO disabled; published wheels are built with LTO. Reproduce with `cargo bench`. Upload time depends on the network and is not included.
 
 ## Rust crate
 

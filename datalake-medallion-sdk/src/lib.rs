@@ -55,6 +55,7 @@
 use pyo3::prelude::*;
 
 mod codec;
+mod columnar;
 pub mod contracts;
 pub mod dlq;
 pub mod envelope;

@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 
+use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -20,6 +21,7 @@ use serde_json::{Map, Value};
 use ulid::Ulid;
 
 use crate::codec;
+use crate::columnar::{self, ColumnarRows, ScreenContext};
 use crate::contracts::{Contract, ContractRegistry};
 use crate::dlq::{self, DeadLetter};
 use crate::envelope::{Envelope, EnvelopePrefix};
@@ -62,6 +64,10 @@ pub struct PipelineConfig {
     pub mask_pii: bool,
     /// Handling of invalid records.
     pub invalid_records: InvalidRecordPolicy,
+    /// Check Arrow input column by column when the contract allows it.
+    /// Accepted rows, rejections and dead letters are the same as on the row
+    /// path; turn it off only to compare the two paths or to debug.
+    pub arrow_fast_path: bool,
 }
 
 impl Default for PipelineConfig {
@@ -73,6 +79,7 @@ impl Default for PipelineConfig {
             pii_hasher: PiiHasher::default(),
             mask_pii: true,
             invalid_records: InvalidRecordPolicy::default(),
+            arrow_fast_path: true,
         }
     }
 }
@@ -190,6 +197,14 @@ struct CallContext<'a> {
     hasher: Option<&'a PiiHasher>,
 }
 
+/// Decoded input: rows already accepted by the columnar path, and the rest,
+/// with their input index, for the row path.
+struct Decoded {
+    received: usize,
+    columnar: Option<ColumnarRows>,
+    raws: Vec<(usize, Raw)>,
+}
+
 struct Slot {
     index: usize,
     bytes: usize,
@@ -293,17 +308,18 @@ impl BronzePipeline {
                 .unwrap_or(self.config.mask_pii)
                 .then_some(&self.config.pii_hasher),
         };
-        let raws = decode(request.records)?;
-        let received = raws.len();
+        let Decoded {
+            received,
+            columnar,
+            raws,
+        } = self.decode(&contract, &call, request.records, request.hook.is_some())?;
 
-        let mut slots: Vec<Slot> = if received >= PARALLEL_THRESHOLD {
+        let mut slots: Vec<Slot> = if raws.len() >= PARALLEL_THRESHOLD {
             raws.into_par_iter()
-                .enumerate()
                 .map(|(i, raw)| self.admit(&contract, i, raw))
                 .collect()
         } else {
             raws.into_iter()
-                .enumerate()
                 .map(|(i, raw)| self.admit(&contract, i, raw))
                 .collect()
         };
@@ -333,7 +349,7 @@ impl BronzePipeline {
             }
         }
 
-        self.assemble(&contract, &call, received, slots)
+        self.assemble(&contract, &call, received, slots, columnar)
     }
 
     /// Uploads a prepared batch: dead-letter objects first, then data.
@@ -357,6 +373,82 @@ impl BronzePipeline {
             "bronze batch committed"
         );
         Ok(prepared.report)
+    }
+
+    /// Decodes the input. Arrow input is screened column by column first when
+    /// the contract allows it; only the rows the screen cannot accept are
+    /// serialized for the row path.
+    fn decode(
+        &self,
+        contract: &Contract,
+        call: &CallContext<'_>,
+        source: RecordSource,
+        has_hook: bool,
+    ) -> Result<Decoded, DatalakeError> {
+        if let RecordSource::Arrow(batches) = &source {
+            // Hooks see and may rewrite whole records, so they need the row path.
+            if self.config.arrow_fast_path && !has_hook {
+                if let Some(decoded) = self.decode_columnar(contract, call, batches)? {
+                    return Ok(decoded);
+                }
+            }
+        }
+        let raws = decode_rows(source)?;
+        Ok(Decoded {
+            received: raws.len(),
+            columnar: None,
+            raws: raws.into_iter().enumerate().collect(),
+        })
+    }
+
+    fn decode_columnar(
+        &self,
+        contract: &Contract,
+        call: &CallContext<'_>,
+        batches: &[RecordBatch],
+    ) -> Result<Option<Decoded>, DatalakeError> {
+        let Some(plan) = contract.columnar() else {
+            return Ok(None);
+        };
+        let concatenated;
+        let batch = match batches {
+            [] => return Ok(None),
+            [one] => one,
+            [first, ..] => match concat_batches(&first.schema(), batches) {
+                Ok(b) => {
+                    concatenated = b;
+                    &concatenated
+                }
+                // Batches with different schemas stay on the row path.
+                Err(_) => return Ok(None),
+            },
+        };
+        let ctx = ScreenContext {
+            now: call.now,
+            max_future_skew: self.config.max_future_skew,
+            max_record_bytes: self.config.max_record_bytes,
+            hasher: call.hasher,
+        };
+        let Some(split) = plan.split(contract, batch, &ctx)? else {
+            return Ok(None);
+        };
+        let raws: Vec<(usize, Raw)> = match split.flagged {
+            None => Vec::new(),
+            Some((rest, indices)) => indices
+                .into_iter()
+                .zip(codec::arrow_rows(&[rest])?.into_iter().map(Raw::Text))
+                .collect(),
+        };
+        tracing::debug!(
+            columnar = split.accepted.indices.len(),
+            row_path = raws.len(),
+            "arrow input screened"
+        );
+        Ok(Some(Decoded {
+            received: batch.num_rows(),
+            columnar: Some(split.accepted),
+            raws,
+        }))
     }
 
     /// Level 2 and Level 3.
@@ -510,17 +602,22 @@ impl BronzePipeline {
         call: &CallContext<'_>,
         received: usize,
         slots: Vec<Slot>,
+        columnar: Option<ColumnarRows>,
     ) -> Result<PreparedBatch, DatalakeError> {
         let (tenant, batch_id, now, hasher) =
             (call.tenant, call.batch_id.as_str(), call.now, call.hasher);
         let pii_masking = hasher.map_or("none", PiiHasher::algorithm);
         let mut valid = Vec::new();
+        let mut valid_indices = Vec::new();
         let mut by_code: BTreeMap<String, Vec<DeadLetter>> = BTreeMap::new();
         let quarantined_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
 
         for slot in slots {
             match slot.state {
-                State::Valid(map) => valid.push(map),
+                State::Valid(map) => {
+                    valid.push(map);
+                    valid_indices.push(slot.index);
+                }
                 State::Rejected(rejection, payload) => {
                     by_code
                         .entry(rejection.code.clone())
@@ -556,7 +653,8 @@ impl BronzePipeline {
             });
         }
 
-        let data = if valid.is_empty() {
+        let records_ok = valid.len() + columnar.as_ref().map_or(0, |c| c.indices.len());
+        let data = if records_ok == 0 {
             None
         } else {
             let envelope = Envelope {
@@ -568,12 +666,23 @@ impl BronzePipeline {
                 received_at: now,
                 pii_masking,
             };
-            let batch = codec::build_batch(
+            let pii_masked = hasher.is_some();
+            let columns = match columnar {
+                None => codec::declared_columns(contract, &valid, pii_masked)?,
+                Some(fast) if valid.is_empty() => fast.columns,
+                Some(fast) => columnar::merge(
+                    &fast,
+                    &codec::declared_columns(contract, &valid, pii_masked)?,
+                    &valid_indices,
+                )?,
+            };
+            let batch = codec::finish_batch(
                 contract,
                 &self.config.envelope_prefix,
-                &valid,
+                columns,
                 &envelope,
-                hasher.is_some(),
+                pii_masked,
+                records_ok,
             )?;
             Some(PendingObject {
                 path: self
@@ -589,7 +698,7 @@ impl BronzePipeline {
             report: IngestReport {
                 batch_id: batch_id.to_owned(),
                 records_received: received,
-                records_ok: valid.len(),
+                records_ok,
                 records_quarantined,
                 rejections,
                 data_uri: data.as_ref().map(|d| d.path.uri.clone()),
@@ -602,7 +711,7 @@ impl BronzePipeline {
     }
 }
 
-fn decode(source: RecordSource) -> Result<Vec<Raw>, DatalakeError> {
+fn decode_rows(source: RecordSource) -> Result<Vec<Raw>, DatalakeError> {
     match source {
         RecordSource::Json(text) => {
             let malformed = |e: serde_json::Error| DatalakeError::MalformedPayload {
@@ -1261,5 +1370,406 @@ mod tests {
     fn json_len_matches_serialization() {
         let v = json!({"a": [1, 2, {"b": "c"}], "d": null});
         assert_eq!(json_len(&v), serde_json::to_string(&v).unwrap().len());
+    }
+}
+
+/// The columnar path must be invisible: for any Arrow input, the Bronze rows,
+/// the dead letters and the report match the row path exactly.
+#[cfg(test)]
+mod columnar_equivalence {
+    use super::*;
+    use crate::storage::InMemoryStorage;
+    use arrow::array::RecordBatchOptions;
+    use arrow::array::{
+        Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, LargeStringArray,
+        StringArray, StringViewArray, UInt64Array,
+    };
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    const CONTRACT: &str = "eq/event/1";
+    const VOLATILE: [&str; 3] = ["_dl_ingest_id", "_dl_batch_id", "_dl_received_at"];
+
+    fn contract(mode: &str) -> Value {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "x-dl-domain": "eq", "x-dl-datatype": "event", "x-dl-schema_version": "1",
+            "x-dl-flexibility_mode": mode,
+            "required": ["id"],
+            "properties": {
+                "id": {"type": "string", "pattern": "^e[0-9]+$"},
+                "level": {"type": "string", "enum": ["LOW", "HIGH"]},
+                "n": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000},
+                "big": {"type": "integer"},
+                "score": {"type": "number", "exclusiveMaximum": 100},
+                "ok": {"type": "boolean"},
+                "at": {"type": "string", "format": "date-time"},
+                "mail": {"type": "string", "minLength": 3, "x-dl-pii": true},
+                "pnum": {"type": "integer", "x-dl-pii": true},
+                "name": {"type": "string", "maxLength": 5}
+            }
+        })
+    }
+
+    #[derive(Debug, Clone)]
+    struct Case {
+        mode: &'static str,
+        mask: bool,
+        hmac: bool,
+        string_type: u8,
+        columns: u16,
+        undeclared: bool,
+        max_bytes: Option<usize>,
+        rows: Vec<Row>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Row {
+        id: Option<String>,
+        level: Option<&'static str>,
+        n: Option<i32>,
+        big: Option<u64>,
+        score: Option<f64>,
+        ok: Option<bool>,
+        at: Option<&'static str>,
+        mail: Option<String>,
+        pnum: Option<i64>,
+        name: Option<String>,
+    }
+
+    fn row() -> impl Strategy<Value = Row> {
+        let id = proptest::option::weighted(0.9, "(e[0-9]{1,3})|(x[0-9])|");
+        let level = proptest::option::of(prop_oneof![Just("LOW"), Just("HIGH"), Just("MID")]);
+        let n = proptest::option::of(-5i32..1005);
+        let big = proptest::option::of(prop_oneof![
+            0u64..10,
+            u64::try_from(i64::MAX).unwrap() - 2..=u64::MAX
+        ]);
+        let score = proptest::option::of(prop_oneof![
+            -1e3f64..1e3,
+            Just(f64::NAN),
+            Just(f64::INFINITY),
+            Just(100.0),
+            Just(99.999_999_999_999),
+            Just(0.1),
+            Just(3.0),
+        ]);
+        let at = proptest::option::of(prop_oneof![
+            Just("2026-01-01T00:00:00Z"),
+            Just("2026-10-17T10:00:00+02:00"),
+            Just("2999-01-01T00:00:00Z"),
+            Just("nope"),
+        ]);
+        let mail = proptest::option::of("[a-zñ]{0,6}");
+        let name = proptest::option::of("[a-zé😀\"\\\\]{0,7}");
+        (
+            id,
+            level,
+            n,
+            big,
+            score,
+            proptest::option::of(any::<bool>()),
+            at,
+            mail,
+            proptest::option::of(any::<i64>()),
+            name,
+        )
+            .prop_map(|(id, level, n, big, score, ok, at, mail, pnum, name)| Row {
+                id,
+                level,
+                n,
+                big,
+                score,
+                ok,
+                at,
+                mail,
+                pnum,
+                name,
+            })
+    }
+
+    fn case() -> impl Strategy<Value = Case> {
+        (
+            prop_oneof![Just("strict"), Just("permissive"), Just("schema_on_read")],
+            any::<bool>(),
+            any::<bool>(),
+            0u8..3,
+            // Mostly every column; sometimes a random subset.
+            prop_oneof![3 => Just(u16::MAX), 1 => any::<u16>()],
+            proptest::bool::weighted(0.1),
+            proptest::option::weighted(0.2, 40usize..200),
+            proptest::collection::vec(row(), 0..40),
+        )
+            .prop_map(
+                |(mode, mask, hmac, string_type, columns, undeclared, max_bytes, rows)| Case {
+                    mode,
+                    mask,
+                    hmac,
+                    string_type,
+                    columns,
+                    undeclared,
+                    max_bytes,
+                    rows,
+                },
+            )
+    }
+
+    fn strings(kind: u8, values: Vec<Option<String>>) -> ArrayRef {
+        match kind {
+            0 => Arc::new(StringArray::from_iter(values)),
+            1 => Arc::new(LargeStringArray::from_iter(values)),
+            _ => Arc::new(StringViewArray::from_iter(values)),
+        }
+    }
+
+    fn batch(case: &Case) -> RecordBatch {
+        let r = &case.rows;
+        let s =
+            |f: fn(&Row) -> Option<String>| strings(case.string_type, r.iter().map(f).collect());
+        let all: Vec<(&str, ArrayRef)> = vec![
+            ("id", s(|x| x.id.clone())),
+            ("level", s(|x| x.level.map(str::to_owned))),
+            (
+                "n",
+                Arc::new(Int32Array::from(r.iter().map(|x| x.n).collect::<Vec<_>>())),
+            ),
+            (
+                "big",
+                Arc::new(UInt64Array::from(
+                    r.iter().map(|x| x.big).collect::<Vec<_>>(),
+                )),
+            ),
+            (
+                "score",
+                Arc::new(Float64Array::from(
+                    r.iter().map(|x| x.score).collect::<Vec<_>>(),
+                )),
+            ),
+            (
+                "ok",
+                Arc::new(BooleanArray::from(
+                    r.iter().map(|x| x.ok).collect::<Vec<_>>(),
+                )),
+            ),
+            ("at", s(|x| x.at.map(str::to_owned))),
+            ("mail", s(|x| x.mail.clone())),
+            (
+                "pnum",
+                Arc::new(Int64Array::from(
+                    r.iter().map(|x| x.pnum).collect::<Vec<_>>(),
+                )),
+            ),
+            ("name", s(|x| x.name.clone())),
+        ];
+        let mut fields = Vec::new();
+        let mut arrays = Vec::new();
+        for (i, (name, array)) in all.into_iter().enumerate() {
+            if case.columns & (1 << i) != 0 {
+                fields.push(Field::new(name, array.data_type().clone(), true));
+                arrays.push(array);
+            }
+        }
+        if case.undeclared {
+            fields.push(Field::new("extra", DataType::Int64, true));
+            arrays.push(Arc::new(Int64Array::from(vec![Some(1); r.len()])));
+        }
+        let options = RecordBatchOptions::new().with_row_count(Some(r.len()));
+        RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), arrays, &options).unwrap()
+    }
+
+    fn pipeline(case: &Case, fast: bool) -> BronzePipeline {
+        let mut registry = ContractRegistry::default();
+        registry.register(&contract(case.mode)).unwrap();
+        let config = PipelineConfig {
+            pii_hasher: if case.hmac {
+                PiiHasher::hmac_sha256(b"0123456789abcdef0123456789abcdef").unwrap()
+            } else {
+                PiiHasher::Sha256
+            },
+            mask_pii: case.mask,
+            arrow_fast_path: fast,
+            max_record_bytes: case.max_bytes.unwrap_or(DEFAULT_MAX_RECORD_BYTES),
+            ..PipelineConfig::default()
+        };
+        BronzePipeline::new(
+            Arc::new(registry),
+            Arc::new(InMemoryStorage::new()),
+            BronzePathResolver::new("eq-lake").unwrap(),
+            config,
+        )
+        .unwrap()
+    }
+
+    /// Everything in a prepared batch that does not depend on ids or time.
+    #[derive(Debug, PartialEq)]
+    struct Outcome {
+        received: usize,
+        ok: usize,
+        quarantined: usize,
+        rejections: BTreeMap<String, usize>,
+        pii_masking: String,
+        data: Option<RecordBatch>,
+        dead_letters: Vec<Value>,
+    }
+
+    fn outcome(prepared: PreparedBatch) -> Outcome {
+        let data = prepared.data.map(|d| {
+            let batch = ParquetRecordBatchReaderBuilder::try_new(d.body)
+                .unwrap()
+                .build()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            let keep: Vec<usize> = (0..batch.num_columns())
+                .filter(|i| !VOLATILE.contains(&batch.schema().field(*i).name().as_str()))
+                .collect();
+            batch.project(&keep).unwrap()
+        });
+        let dead_letters = prepared
+            .dead_letters
+            .iter()
+            .flat_map(|d| {
+                std::str::from_utf8(&d.body)
+                    .unwrap()
+                    .lines()
+                    .map(|l| {
+                        let mut v: Value = serde_json::from_str(l).unwrap();
+                        let entry = v.as_object_mut().unwrap();
+                        entry.remove("batch_id");
+                        entry.remove("quarantined_at");
+                        v
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let r = prepared.report;
+        Outcome {
+            received: r.records_received,
+            ok: r.records_ok,
+            quarantined: r.records_quarantined,
+            rejections: r.rejections,
+            pii_masking: r.pii_masking,
+            data,
+            dead_letters,
+        }
+    }
+
+    fn run(case: &Case, fast: bool) -> Result<Outcome, String> {
+        let request = IngestRequest::new(
+            TenantId::new("acme-001").unwrap(),
+            CONTRACT,
+            RecordSource::Arrow(vec![batch(case)]),
+        );
+        pipeline(case, fast)
+            .prepare(request)
+            .map(outcome)
+            .map_err(|e| e.to_string())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(192))]
+
+        #[test]
+        fn columnar_and_row_paths_agree(case in case()) {
+            prop_assert_eq!(run(&case, true), run(&case, false));
+        }
+    }
+
+    #[test]
+    fn valid_batches_skip_the_row_path() {
+        let case = Case {
+            mode: "strict",
+            mask: true,
+            hmac: false,
+            string_type: 2,
+            columns: u16::MAX,
+            undeclared: false,
+            max_bytes: None,
+            rows: (0..5000i64)
+                .map(|i| Row {
+                    id: Some(format!("e{i}")),
+                    level: Some("LOW"),
+                    n: Some(7),
+                    big: Some(1),
+                    score: Some(1.5),
+                    ok: Some(true),
+                    at: Some("2026-01-01T00:00:00Z"),
+                    mail: Some(format!("u{i}@x")),
+                    pnum: Some(i),
+                    name: Some("ana".into()),
+                })
+                .collect(),
+        };
+        let p = pipeline(&case, true);
+        let contract = Arc::clone(p.registry.get(CONTRACT).unwrap());
+        let tenant = TenantId::new("acme-001").unwrap();
+        let call = CallContext {
+            tenant: &tenant,
+            batch_id: String::new(),
+            now: Utc::now(),
+            hasher: Some(&p.config.pii_hasher),
+        };
+        let decoded = p
+            .decode(
+                &contract,
+                &call,
+                RecordSource::Arrow(vec![batch(&case)]),
+                false,
+            )
+            .unwrap();
+        assert!(decoded.raws.is_empty());
+        assert_eq!(decoded.columnar.unwrap().indices.len(), 5000);
+        assert_eq!(run(&case, true), run(&case, false));
+    }
+
+    #[test]
+    fn hooks_and_split_batches_use_the_row_path_safely() {
+        let case = Case {
+            mode: "permissive",
+            mask: true,
+            hmac: false,
+            string_type: 0,
+            columns: u16::MAX,
+            undeclared: false,
+            max_bytes: None,
+            rows: vec![],
+        };
+        let p = pipeline(&case, true);
+        let contract = Arc::clone(p.registry.get(CONTRACT).unwrap());
+        let tenant = TenantId::new("acme-001").unwrap();
+        let call = CallContext {
+            tenant: &tenant,
+            batch_id: String::new(),
+            now: Utc::now(),
+            hasher: None,
+        };
+        let one = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["e1", "bad", "e3"]))],
+        )
+        .unwrap();
+        let decoded = p
+            .decode(
+                &contract,
+                &call,
+                RecordSource::Arrow(vec![one.clone(), one.clone()]),
+                false,
+            )
+            .unwrap();
+        assert_eq!(decoded.received, 6);
+        assert_eq!(decoded.columnar.unwrap().indices, vec![0, 2, 3, 5]);
+        assert_eq!(
+            decoded.raws.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        let with_hook = p
+            .decode(&contract, &call, RecordSource::Arrow(vec![one]), true)
+            .unwrap();
+        assert!(with_hook.columnar.is_none());
+        assert_eq!(with_hook.raws.len(), 3);
     }
 }
