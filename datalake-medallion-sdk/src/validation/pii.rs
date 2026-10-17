@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 

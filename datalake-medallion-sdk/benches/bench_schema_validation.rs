@@ -1,8 +1,9 @@
 //! Level 3 contract check throughput (valid and invalid records).
 
 use _core::contracts::ContractRegistry;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::{json, Value};
+use std::hint::black_box;
 
 fn bench_check(c: &mut Criterion) {
     let mut registry = ContractRegistry::default();

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use chrono::{DateTime, Utc};
-use ulid::{Generator, Ulid};
+use ulid::{Generator, Overflow};
 
 use crate::error::DatalakeError;
 
@@ -134,10 +134,12 @@ impl Envelope<'_> {
             Arc::new(StringArray::from_iter_values(std::iter::repeat_n(v, rows)))
         };
         let mut generator = Generator::new();
+        // More than 2^80 ids in one millisecond overflows the random part; carrying
+        // into the next millisecond keeps the column strictly increasing.
         let ingest_ids = StringArray::from_iter_values((0..rows).map(|_| {
             generator
                 .generate()
-                .unwrap_or_else(|_| Ulid::new())
+                .unwrap_or_else(Overflow::commit_overflow_increment)
                 .to_string()
         }));
         let received = TimestampMicrosecondArray::from_iter_values(std::iter::repeat_n(
