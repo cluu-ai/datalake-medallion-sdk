@@ -317,3 +317,49 @@ async def test_client_is_reusable_across_tenants(make_client: MakeClient, store:
     keys = store.keys()
     assert any("tenant_id=tenant-a/" in k for k in keys)
     assert any("tenant_id=tenant-b/" in k for k in keys)
+
+
+VOLATILE_COLUMNS = {"_dl_ingest_id", "_dl_batch_id", "_dl_received_at"}
+
+
+async def test_dict_pyarrow_and_polars_inputs_store_the_same_bronze_data(
+    make_client: MakeClient, store: Bucket
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pl = pytest.importorskip("polars")
+    rows: list[dict[str, Any]] = [
+        {
+            "event_id": f"e{i}" if i % 7 else None,
+            "attempts": -1 if i % 11 == 0 else i,
+            "occurred_at": "2999-01-01T00:00:00Z" if i % 13 == 0 else "2026-10-17T10:00:00Z",
+            "user_email": f"user{i}@example.com" if i % 2 else None,
+        }
+        for i in range(600)
+    ]
+    as_dicts = [{k: v for k, v in r.items() if v is not None} for r in rows]
+    columns = {k: [r[k] for r in rows] for k in rows[0]}
+    client = make_client()
+
+    def outcome(report: Any) -> tuple[Any, ...]:
+        table = store.parquet(report.data_uri)
+        table = table.drop_columns([c for c in table.column_names if c in VOLATILE_COLUMNS])
+        letters = [
+            {k: v for k, v in entry.items() if k not in {"batch_id", "quarantined_at"}}
+            for uri in report.dlq_uris
+            for entry in store.dead_letters(uri)
+        ]
+        counts = (report.records_ok, report.records_quarantined, report.rejections)
+        return counts, table.to_pylist(), letters
+
+    from_dicts = outcome(await client.ingest(as_dicts, tenant_id=TENANT, contract=CONTRACT))
+    from_arrow = outcome(
+        await client.ingest(pa.table(columns), tenant_id=TENANT, contract=CONTRACT)
+    )
+    from_polars = outcome(
+        await client.ingest(pl.DataFrame(columns), tenant_id=TENANT, contract=CONTRACT)
+    )
+    assert from_dicts[0][0] > 0 and from_dicts[0][1] > 0
+    assert from_arrow == from_dicts
+    assert from_polars == from_dicts
+    assert EMAIL.encode() not in store.all_bytes()
+    assert b"user1@example.com" not in store.all_bytes()

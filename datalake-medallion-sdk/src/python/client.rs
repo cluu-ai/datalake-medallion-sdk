@@ -158,6 +158,7 @@ impl PyBronzeIngestionClient {
             },
             mask_pii: pii_masking,
             invalid_records,
+            ..PipelineConfig::default()
         };
 
         let credentials = match (aws_access_key_id, aws_secret_access_key) {
@@ -335,6 +336,9 @@ fn to_source(py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<RecordSource>
         let kwargs = PyDict::new(py);
         kwargs.set_item("allow_nan", false)?;
         kwargs.set_item("ensure_ascii", false)?;
+        // Compact text: size limits and `payload_bytes` count data, not
+        // formatting, the same as for JSON and Arrow input.
+        kwargs.set_item("separators", (",", ":"))?;
         let text = py
             .import("json")?
             .call_method("dumps", (batch,), Some(&kwargs))

@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::provider::SchemaProvider;
+use crate::columnar::ColumnarPlan;
 use crate::error::DatalakeError;
 use crate::validation::{codes, level, Rejection};
 
@@ -106,6 +107,7 @@ pub struct Contract {
     date_time_fields: Vec<String>,
     schema_hash: String,
     validator: Validator,
+    columnar: Option<ColumnarPlan>,
 }
 
 impl fmt::Debug for Contract {
@@ -115,6 +117,7 @@ impl fmt::Debug for Contract {
             .field("mode", &self.mode)
             .field("fields", &self.fields.len())
             .field("pii_fields", &self.pii_fields)
+            .field("columnar", &self.columnar.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -195,6 +198,7 @@ impl Contract {
             }
         }
 
+        let columnar = ColumnarPlan::compile(root, &fields, mode, extension_prefix);
         let validator = jsonschema::options()
             .should_validate_formats(true)
             .build(schema)
@@ -229,6 +233,7 @@ impl Contract {
             pii_fields,
             date_time_fields,
             validator,
+            columnar,
         })
     }
 
@@ -281,6 +286,11 @@ impl Contract {
     #[must_use]
     pub fn schema_hash(&self) -> &str {
         &self.schema_hash
+    }
+    /// Plan for checking Arrow input column by column, when every rule of
+    /// the contract can be evaluated one field at a time.
+    pub(crate) fn columnar(&self) -> Option<&ColumnarPlan> {
+        self.columnar.as_ref()
     }
     /// Whether `name` is a declared top-level field.
     #[must_use]
