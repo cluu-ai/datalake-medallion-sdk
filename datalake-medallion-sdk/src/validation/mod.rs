@@ -8,7 +8,7 @@
 //! | 3 | JSON Schema contract (formats asserted) and undeclared fields in strict mode | [`crate::contracts::Contract`] |
 //! | 4 | Pre-ingest hook supplied by the host | [`hooks::RecordHook`] |
 //! | 5 | Semantic rules: future-timestamp guard on `date-time` fields | [`semantic`] |
-//! | 6 | PII pseudonymization of fields marked in the contract (optional, on by default) | [`pii::PiiHasher`] |
+//! | 6 | PII protection of fields marked in the contract (per tenant profile, off by default) | [`pii::FieldProtector`] |
 //! | 7 | Value fits the Arrow column type derived from the contract | pipeline |
 //! | 8 | Lineage envelope columns | [`crate::envelope`] |
 //!

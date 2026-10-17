@@ -60,7 +60,7 @@ def test_imports_without_pyarrow_polars_or_boto3() -> None:
         "import datalake_medallion_sdk as sdk\n"
         "r = sdk.ContractRegistry.from_schemas([{'type': 'object', 'x-dl-domain': 'd',"
         " 'x-dl-datatype': 't', 'x-dl-schema_version': '1'}])\n"
-        "sdk.BronzeIngestionClient('some-bucket', r)\n"
+        "sdk.BronzeIngestionClient(r)\n"
         "print('ok')\n"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
