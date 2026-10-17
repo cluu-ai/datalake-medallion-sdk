@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::provider::SchemaProvider;
+use crate::columnar::ColumnarPlan;
 use crate::error::DatalakeError;
 use crate::validation::{codes, level, Rejection};
 
@@ -106,6 +107,7 @@ pub struct Contract {
     date_time_fields: Vec<String>,
     schema_hash: String,
     validator: Validator,
+    columnar: Option<ColumnarPlan>,
 }
 
 impl fmt::Debug for Contract {
@@ -115,6 +117,7 @@ impl fmt::Debug for Contract {
             .field("mode", &self.mode)
             .field("fields", &self.fields.len())
             .field("pii_fields", &self.pii_fields)
+            .field("columnar", &self.columnar.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -195,6 +198,7 @@ impl Contract {
             }
         }
 
+        let columnar = ColumnarPlan::compile(root, &fields, mode, extension_prefix);
         let validator = jsonschema::options()
             .should_validate_formats(true)
             .build(schema)
@@ -229,6 +233,7 @@ impl Contract {
             pii_fields,
             date_time_fields,
             validator,
+            columnar,
         })
     }
 
@@ -282,6 +287,11 @@ impl Contract {
     pub fn schema_hash(&self) -> &str {
         &self.schema_hash
     }
+    /// Plan for checking Arrow input column by column, when every rule of
+    /// the contract can be evaluated one field at a time.
+    pub(crate) fn columnar(&self) -> Option<&ColumnarPlan> {
+        self.columnar.as_ref()
+    }
     /// Whether `name` is a declared top-level field.
     #[must_use]
     pub fn declares(&self, name: &str) -> bool {
@@ -314,7 +324,7 @@ impl Contract {
             .iter_errors(record)
             .take(MAX_REPORTED_ERRORS)
             .map(|e| {
-                let path = e.instance_path.to_string();
+                let path = e.instance_path().to_string();
                 let path = if path.is_empty() { "/" } else { path.as_str() };
                 format!("{path}: {}", e.masked())
             })
@@ -611,6 +621,36 @@ mod tests {
             .check(&json!({"event_id": "e1", "severity": "LOW", "occurred_at": "yesterday"}))
             .unwrap();
         assert_eq!(rej.code, codes::SCHEMA_VIOLATION);
+    }
+
+    #[test]
+    fn every_builtin_format_is_asserted() {
+        // A format the validator does not know is silently accepted, so a
+        // dependency upgrade that drops one must fail here.
+        let cases = [
+            ("date", "2026-10-17", "17/10/2026"),
+            ("email", "ana@example.com", "ana"),
+            ("idn-email", "ñandú@example.com", "ñandú"),
+            ("hostname", "example.com", "-bad-.com"),
+            ("idn-hostname", "ejemplo.españa", "-bad-.com"),
+            ("ipv4", "10.0.0.1", "10.0.0.256"),
+            ("ipv6", "::1", "1:::1"),
+            ("uri", "https://example.com/a", "not a uri"),
+            ("uuid", "67e55044-10b1-426f-9247-bb680e5fe0c8", "67e55044"),
+        ];
+        for (format, good, bad) in cases {
+            let mut r = ContractRegistry::default();
+            let key = r
+                .register(&json!({
+                    "type": "object",
+                    "x-dl-domain": "d", "x-dl-datatype": "t", "x-dl-schema_version": "1",
+                    "properties": {"v": {"type": "string", "format": format}}
+                }))
+                .unwrap();
+            let c = r.get(&key).unwrap();
+            assert!(c.check(&json!({ "v": good })).is_none(), "{format}: {good}");
+            assert!(c.check(&json!({ "v": bad })).is_some(), "{format}: {bad}");
+        }
     }
 
     #[test]

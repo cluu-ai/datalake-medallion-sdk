@@ -11,7 +11,8 @@
 //! | `_dl_schema_version` | utf8 | contract version |
 //! | `_dl_schema_hash` | utf8 | SHA-256 of the contract document |
 //! | `_dl_received_at` | timestamp(µs, UTC) | ingest time |
-//! | `_dl_pii_masking` | utf8 | PII scheme applied: `sha256`, `hmac-sha256` or `none` |
+//! | `_dl_pii_protection` | utf8 | PII scheme of the tenant profile: `none` (default), `sha256`, `hmac-sha256`, `aes-256-gcm` or a custom name |
+//! | `_dl_pii_key_ref` | utf8, nullable | key reference of reversible schemes (e.g. the KMS-encrypted data key); null otherwise |
 //! | `_dl_sdk_version` | utf8 | version of this SDK |
 //!
 //! Contracts in `permissive` or `schema_on_read` mode add `_dl_extra`, a JSON
@@ -20,17 +21,19 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow::array::{
+    ArrayRef, DictionaryArray, Int8Array, StringArray, StringBuilder, TimestampMicrosecondArray,
+};
+use arrow::datatypes::{DataType, Field, Int8Type, TimeUnit};
 use chrono::{DateTime, Utc};
-use ulid::{Generator, Ulid};
+use ulid::{Generator, Overflow, ULID_LEN};
 
 use crate::error::DatalakeError;
 
 /// Default envelope column prefix.
 pub const DEFAULT_ENVELOPE_PREFIX: &str = "_dl_";
 
-const SUFFIXES: [&str; 9] = [
+const SUFFIXES: [&str; 10] = [
     "ingest_id",
     "batch_id",
     "tenant_id",
@@ -38,7 +41,8 @@ const SUFFIXES: [&str; 9] = [
     "schema_version",
     "schema_hash",
     "received_at",
-    "pii_masking",
+    "pii_protection",
+    "pii_key_ref",
     "sdk_version",
 ];
 
@@ -104,12 +108,12 @@ impl EnvelopePrefix {
         SUFFIXES
             .iter()
             .map(|s| {
-                let dt = if *s == "received_at" {
-                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-                } else {
-                    DataType::Utf8
+                let dt = match *s {
+                    "received_at" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    "ingest_id" => DataType::Utf8,
+                    _ => constant_type(),
                 };
-                Field::new(self.column(s), dt, false)
+                Field::new(self.column(s), dt, *s == "pii_key_ref")
             })
             .collect()
     }
@@ -124,39 +128,60 @@ pub(crate) struct Envelope<'a> {
     pub schema_version: &'a str,
     pub schema_hash: &'a str,
     pub received_at: DateTime<Utc>,
-    pub pii_masking: &'a str,
+    pub pii_protection: &'a str,
+    pub pii_key_ref: Option<&'a str>,
 }
 
 impl Envelope<'_> {
     /// Envelope arrays for `rows` rows, matching [`EnvelopePrefix::fields`].
     pub(crate) fn columns(&self, rows: usize) -> Vec<ArrayRef> {
-        let constant = |v: &str| -> ArrayRef {
-            Arc::new(StringArray::from_iter_values(std::iter::repeat_n(v, rows)))
-        };
+        let constant = |v: Option<&str>| -> ArrayRef { Arc::new(constant_column(v, rows)) };
         let mut generator = Generator::new();
-        let ingest_ids = StringArray::from_iter_values((0..rows).map(|_| {
-            generator
+        let mut ingest_ids = StringBuilder::with_capacity(rows, rows * ULID_LEN);
+        let mut text = [0u8; ULID_LEN];
+        for _ in 0..rows {
+            // More than 2^80 ids in one millisecond overflows the random part;
+            // carrying into the next millisecond keeps the column increasing.
+            let id = generator
                 .generate()
-                .unwrap_or_else(|_| Ulid::new())
-                .to_string()
-        }));
+                .unwrap_or_else(Overflow::commit_overflow_increment);
+            ingest_ids.append_value(id.array_to_str(&mut text));
+        }
         let received = TimestampMicrosecondArray::from_iter_values(std::iter::repeat_n(
             self.received_at.timestamp_micros(),
             rows,
         ))
         .with_timezone("UTC");
         vec![
-            Arc::new(ingest_ids),
-            constant(self.batch_id),
-            constant(self.tenant_id),
-            constant(self.data_type),
-            constant(self.schema_version),
-            constant(self.schema_hash),
+            Arc::new(ingest_ids.finish()),
+            constant(Some(self.batch_id)),
+            constant(Some(self.tenant_id)),
+            constant(Some(self.data_type)),
+            constant(Some(self.schema_version)),
+            constant(Some(self.schema_hash)),
             Arc::new(received),
-            constant(self.pii_masking),
-            constant(env!("CARGO_PKG_VERSION")),
+            constant(Some(self.pii_protection)),
+            constant(self.pii_key_ref),
+            constant(Some(env!("CARGO_PKG_VERSION"))),
         ]
     }
+}
+
+/// Arrow type of the columns that hold one value per batch: a one-entry
+/// dictionary costs one byte per row instead of a copy of the value. Parquet
+/// files store them as plain strings (see `ParquetEncoder`).
+fn constant_type() -> DataType {
+    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+}
+
+/// `rows` copies of `value` (or nulls) as a one-entry dictionary.
+fn constant_column(value: Option<&str>, rows: usize) -> DictionaryArray<Int8Type> {
+    let keys = match value {
+        Some(_) => Int8Array::from_value(0, rows),
+        None => Int8Array::new_null(rows),
+    };
+    let values = StringArray::from_iter_values(value);
+    DictionaryArray::new(keys, Arc::new(values))
 }
 
 #[cfg(test)]
@@ -195,7 +220,8 @@ mod tests {
             schema_version: "1.0.0",
             schema_hash: "h",
             received_at: Utc::now(),
-            pii_masking: "none",
+            pii_protection: "aes-256-gcm",
+            pii_key_ref: Some("kms-blob"),
         };
         let cols = env.columns(100);
         let fields = p.fields();

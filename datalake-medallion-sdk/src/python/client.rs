@@ -13,6 +13,7 @@ use tokio::sync::OnceCell;
 
 use super::hooks::PyRecordHook;
 use super::registry::PyContractRegistry;
+use super::tenancy::{PyTenantProfile, PyTenantRegistry};
 use crate::contracts::ContractRegistry;
 use crate::envelope::{EnvelopePrefix, DEFAULT_ENVELOPE_PREFIX};
 use crate::error::DatalakeError;
@@ -21,10 +22,8 @@ use crate::pipeline::{
     DEFAULT_MAX_RECORD_BYTES,
 };
 use crate::storage::{InMemoryStorage, S3Options, S3Storage, StaticCredentials};
-use crate::tenant::path::{DEFAULT_DATA_PREFIX, DEFAULT_DLQ_PREFIX};
-use crate::tenant::{BronzePathResolver, PartitionOrder, TenantId};
+use crate::tenant::{TenantDirectory, TenantProfile, TenantRegistry};
 use crate::validation::hooks::RecordHook;
-use crate::validation::pii::PiiHasher;
 
 /// Outcome of `BronzeIngestionClient.ingest`.
 #[pyclass(
@@ -35,26 +34,28 @@ use crate::validation::pii::PiiHasher;
 )]
 pub(crate) struct PyIngestReport {
     batch_id: String,
+    tenant_id: String,
     records_received: usize,
     records_ok: usize,
     records_quarantined: usize,
     rejections: BTreeMap<String, usize>,
     data_uri: Option<String>,
     dlq_uris: Vec<String>,
-    pii_masking: String,
+    pii_protection: String,
 }
 
 impl From<IngestReport> for PyIngestReport {
     fn from(r: IngestReport) -> Self {
         Self {
             batch_id: r.batch_id,
+            tenant_id: r.tenant_id,
             records_received: r.records_received,
             records_ok: r.records_ok,
             records_quarantined: r.records_quarantined,
             rejections: r.rejections,
             data_uri: r.data_uri,
             dlq_uris: r.dlq_uris,
-            pii_masking: r.pii_masking,
+            pii_protection: r.pii_protection,
         }
     }
 }
@@ -63,20 +64,22 @@ impl From<IngestReport> for PyIngestReport {
 impl PyIngestReport {
     fn __repr__(&self) -> String {
         format!(
-            "IngestReport(batch_id={:?}, records_received={}, records_ok={}, records_quarantined={})",
-            self.batch_id, self.records_received, self.records_ok, self.records_quarantined
+            "IngestReport(tenant_id={:?}, batch_id={:?}, records_received={}, records_ok={}, records_quarantined={})",
+            self.tenant_id, self.batch_id, self.records_received, self.records_ok, self.records_quarantined
         )
     }
 }
 
 struct Parts {
     registry: Arc<ContractRegistry>,
-    paths: BronzePathResolver,
+    tenants: Option<Arc<TenantRegistry>>,
     config: PipelineConfig,
     s3: S3Options,
 }
 
-/// Validating Bronze writer for S3 and S3-compatible object stores.
+/// Validating Bronze writer for S3 and S3-compatible object stores. Holds no
+/// destination: each call names its tenant, whose profile decides where the
+/// records go and how their PII is protected.
 #[pyclass(
     name = "BronzeIngestionClient",
     module = "datalake_medallion_sdk._core",
@@ -92,17 +95,12 @@ pub(crate) struct PyBronzeIngestionClient {
 impl PyBronzeIngestionClient {
     #[new]
     #[pyo3(signature = (
-        bucket,
         registry,
         *,
-        data_prefix = DEFAULT_DATA_PREFIX,
-        dlq_prefix = DEFAULT_DLQ_PREFIX,
-        partition_order = "tenant_first",
+        tenants = None,
         envelope_prefix = DEFAULT_ENVELOPE_PREFIX,
         max_record_bytes = DEFAULT_MAX_RECORD_BYTES,
         max_future_skew_seconds = Some(3600),
-        pii_masking = true,
-        pii_hmac_key = None,
         on_invalid = "quarantine",
         hooks = None,
         aws_region = None,
@@ -114,16 +112,11 @@ impl PyBronzeIngestionClient {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        bucket: String,
         registry: &PyContractRegistry,
-        data_prefix: &str,
-        dlq_prefix: &str,
-        partition_order: &str,
+        tenants: Option<&PyTenantRegistry>,
         envelope_prefix: &str,
         max_record_bytes: usize,
         max_future_skew_seconds: Option<i64>,
-        pii_masking: bool,
-        pii_hmac_key: Option<Vec<u8>>,
         on_invalid: &str,
         hooks: Option<&Bound<'_, PyDict>>,
         aws_region: Option<String>,
@@ -133,11 +126,6 @@ impl PyBronzeIngestionClient {
         aws_session_token: Option<String>,
         force_path_style: Option<bool>,
     ) -> PyResult<Self> {
-        let paths = BronzePathResolver::new(bucket.clone())?
-            .with_data_prefix(data_prefix)?
-            .with_dlq_prefix(dlq_prefix)?
-            .with_partition_order(PartitionOrder::parse(partition_order)?);
-
         let invalid_records = match on_invalid {
             "quarantine" => InvalidRecordPolicy::Quarantine,
             "raise" => InvalidRecordPolicy::Reject,
@@ -152,12 +140,8 @@ impl PyBronzeIngestionClient {
             envelope_prefix: EnvelopePrefix::new(envelope_prefix)?,
             max_record_bytes,
             max_future_skew: max_future_skew_seconds.map(Duration::seconds),
-            pii_hasher: match pii_hmac_key {
-                Some(key) => PiiHasher::hmac_sha256(&key)?,
-                None => PiiHasher::Sha256,
-            },
-            mask_pii: pii_masking,
             invalid_records,
+            ..PipelineConfig::default()
         };
 
         let credentials = match (aws_access_key_id, aws_secret_access_key) {
@@ -201,17 +185,15 @@ impl PyBronzeIngestionClient {
         BronzePipeline::new(
             Arc::clone(&registry),
             Arc::new(InMemoryStorage::new()),
-            paths.clone(),
             config.clone(),
         )?;
 
         Ok(Self {
             parts: Arc::new(Parts {
                 registry,
-                paths,
+                tenants: tenants.map(|t| Arc::clone(&t.inner)),
                 config,
                 s3: S3Options {
-                    bucket,
                     region: aws_region,
                     endpoint_url: aws_endpoint_url,
                     force_path_style,
@@ -223,28 +205,25 @@ impl PyBronzeIngestionClient {
         })
     }
 
-    /// Validates `batch` against `contract` and writes it for `tenant_id`.
+    /// Validates `batch` against `contract` and writes it for `tenant`: a
+    /// `TenantProfile`, or a tenant id resolved in the client's `tenants`.
     ///
     /// `batch` may be a dict, a list of dicts, a JSON string or bytes, or any
     /// object implementing the Arrow `PyCapsule` interface (`__arrow_c_stream__`
     /// or `__arrow_c_array__`), such as a `pyarrow` table or record batch or a
     /// Polars data frame.
-    #[pyo3(signature = (batch, *, tenant_id, contract, pii_masking = None))]
+    #[pyo3(signature = (batch, *, tenant, contract))]
     fn ingest<'py>(
         &self,
         py: Python<'py>,
         batch: &Bound<'py, PyAny>,
-        tenant_id: &str,
+        tenant: &Bound<'py, PyAny>,
         contract: &str,
-        pii_masking: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let tenant = TenantId::new(tenant_id)?;
+        let tenant = self.resolve(tenant)?;
         self.parts.registry.get(contract)?;
         let records = to_source(py, batch)?;
         let mut request = IngestRequest::new(tenant, contract, records);
-        if let Some(enabled) = pii_masking {
-            request = request.with_pii_masking(enabled);
-        }
         if let Some(hook) = self.hooks.get(contract) {
             request = request.with_hook(Arc::clone(hook));
         }
@@ -258,7 +237,6 @@ impl PyBronzeIngestionClient {
                     BronzePipeline::new(
                         Arc::clone(&parts.registry),
                         Arc::new(storage),
-                        parts.paths.clone(),
                         parts.config.clone(),
                     )
                     .map(Arc::new)
@@ -275,10 +253,14 @@ impl PyBronzeIngestionClient {
         })
     }
 
-    /// Target bucket.
+    /// Tenant ids of the client's `tenants` registry (empty without one).
     #[getter]
-    fn bucket(&self) -> String {
-        self.parts.paths.bucket().to_owned()
+    fn tenant_ids(&self) -> Vec<String> {
+        self.parts
+            .tenants
+            .as_ref()
+            .map(|t| t.tenant_ids().map(str::to_owned).collect())
+            .unwrap_or_default()
     }
 
     /// Contracts that have a hook bound.
@@ -292,13 +274,30 @@ impl PyBronzeIngestionClient {
     fn __repr__(&self) -> String {
         let p = &self.parts;
         format!(
-            "BronzeIngestionClient(bucket={:?}, data_prefix={:?}, dlq_prefix={:?}, contracts={}, pii={})",
-            p.paths.bucket(),
-            p.paths.data_prefix(),
-            p.paths.dlq_prefix(),
+            "BronzeIngestionClient(contracts={}, tenants={})",
             p.registry.len(),
-            if p.config.mask_pii { p.config.pii_hasher.algorithm() } else { "none" }
+            p.tenants.as_ref().map_or(0, |t| t.len())
         )
+    }
+}
+
+impl PyBronzeIngestionClient {
+    fn resolve(&self, tenant: &Bound<'_, PyAny>) -> PyResult<Arc<TenantProfile>> {
+        if let Ok(profile) = tenant.cast::<PyTenantProfile>() {
+            return Ok(Arc::clone(&profile.get().inner));
+        }
+        let Ok(tenant_id) = tenant.extract::<String>() else {
+            return Err(PyTypeError::new_err(
+                "tenant must be a TenantProfile or a tenant id string",
+            ));
+        };
+        let registry = self.parts.tenants.as_ref().ok_or_else(|| {
+            DatalakeError::config(
+                "tenant given by id but the client has no tenants registry; \
+                 pass a TenantProfile or create the client with tenants=TenantRegistry([...])",
+            )
+        })?;
+        Ok(registry.resolve(&tenant_id)?)
     }
 }
 
@@ -335,6 +334,9 @@ fn to_source(py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<RecordSource>
         let kwargs = PyDict::new(py);
         kwargs.set_item("allow_nan", false)?;
         kwargs.set_item("ensure_ascii", false)?;
+        // Compact text: size limits and `payload_bytes` count data, not
+        // formatting, the same as for JSON and Arrow input.
+        kwargs.set_item("separators", (",", ":"))?;
         let text = py
             .import("json")?
             .call_method("dumps", (batch,), Some(&kwargs))

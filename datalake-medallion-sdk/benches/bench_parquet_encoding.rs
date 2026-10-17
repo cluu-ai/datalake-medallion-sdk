@@ -6,7 +6,8 @@ use _core::storage::ParquetEncoder;
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 
 fn batch(n: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use _core::contracts::ContractRegistry;
 use _core::pipeline::{BronzePipeline, IngestRequest, PipelineConfig, RecordSource};
 use _core::storage::InMemoryStorage;
-use _core::tenant::{BronzePathResolver, TenantId};
+use _core::tenant::{TenantId, TenantProfile};
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 const CONTRACT: &str = "bench/event/1.0.0";
 
-fn pipeline() -> BronzePipeline {
+fn pipeline(arrow_fast_path: bool) -> BronzePipeline {
     let mut registry = ContractRegistry::default();
     registry
         .register(&json!({
@@ -34,8 +34,10 @@ fn pipeline() -> BronzePipeline {
     BronzePipeline::new(
         Arc::new(registry),
         Arc::new(InMemoryStorage::new()),
-        BronzePathResolver::new("bench-bucket").expect("bucket"),
-        PipelineConfig::default(),
+        PipelineConfig {
+            arrow_fast_path,
+            ..PipelineConfig::default()
+        },
     )
     .expect("pipeline")
 }
@@ -81,8 +83,17 @@ fn arrow_batch(n: usize) -> RecordBatch {
 }
 
 fn bench_prepare(c: &mut Criterion) {
-    let p = pipeline();
-    let tenant = TenantId::new("bench-tenant").expect("tenant");
+    let p = pipeline(true);
+    let row_path = pipeline(false);
+    let tenant = Arc::new(
+        TenantProfile::for_bucket(
+            TenantId::new("bench-tenant").expect("tenant"),
+            "bench-bucket",
+        )
+        .expect("bucket")
+        .build()
+        .expect("profile"),
+    );
     let mut group = c.benchmark_group("prepare");
     for n in [1_000usize, 10_000, 100_000] {
         group.throughput(Throughput::Elements(n as u64));
@@ -90,7 +101,7 @@ fn bench_prepare(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("json_text", n), &json_text, |b, text| {
             b.iter(|| {
                 p.prepare(IngestRequest::new(
-                    tenant.clone(),
+                    Arc::clone(&tenant),
                     CONTRACT,
                     RecordSource::Json(text.clone()),
                 ))
@@ -101,11 +112,22 @@ fn bench_prepare(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("arrow", n), &batch, |b, batch| {
             b.iter(|| {
                 p.prepare(IngestRequest::new(
-                    tenant.clone(),
+                    Arc::clone(&tenant),
                     CONTRACT,
                     RecordSource::Arrow(vec![batch.clone()]),
                 ))
                 .expect("prepare")
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("arrow_row_path", n), &batch, |b, batch| {
+            b.iter(|| {
+                row_path
+                    .prepare(IngestRequest::new(
+                        Arc::clone(&tenant),
+                        CONTRACT,
+                        RecordSource::Arrow(vec![batch.clone()]),
+                    ))
+                    .expect("prepare")
             });
         });
     }

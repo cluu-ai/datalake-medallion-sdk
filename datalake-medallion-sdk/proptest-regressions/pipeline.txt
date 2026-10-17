@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ae143aa0264dea1ba69de180d68a10cc4e305bde0346e78bb37f31d94f5f6605 # shrinks to case = Case { mode: "schema_on_read", mask: false, hmac: false, string_type: 0, columns: 65535, undeclared: false, rows: [Row { id: None, level: None, n: None, big: None, score: Some(NaN), ok: None, at: None, mail: None, pnum: None, name: None }] }
+cc da66e7b12cf31d9bac16a269c69b8e06d3d31a34af7638c91b72ee5a07737286 # shrinks to case = Case { mode: "strict", mask: false, hmac: false, string_type: 0, columns: 65535, undeclared: false, rows: [Row { id: Some("x0"), level: None, n: None, big: None, score: None, ok: None, at: None, mail: None, pnum: None, name: None }] }
+cc 732018b703185c6344ad878f5204c365465de18b8e1b7606c5a8ed6e0e37f862 # shrinks to case = Case { mode: "strict", mask: false, hmac: false, string_type: 0, columns: 65535, undeclared: false, max_bytes: Some(40), rows: [Row { id: Some("e0"), level: None, n: None, big: None, score: None, ok: None, at: None, mail: None, pnum: Some(-10000000000), name: Some("") }] }
+cc 0e727589fa2af8703e006dce701b84616c205a930a95cbc4841fd7bfeea1412d # shrinks to case = Case { mode: "strict", mask: false, hmac: false, string_type: 0, columns: 13312, undeclared: false, max_bytes: None, rows: [] }

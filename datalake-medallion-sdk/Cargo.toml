@@ -40,18 +40,25 @@ parquet = { version = "59", default-features = false, features = ["arrow", "snap
 
 # Contracts and validation
 # No remote or file $ref resolution: contracts must be self-contained, and
-# compiling a schema must never perform network I/O.
-jsonschema = { version = "0.29", default-features = false }
+# compiling a schema must never perform network I/O. `idna` keeps the
+# `idn-email` and `idn-hostname` formats asserted (offline, pure Rust).
+jsonschema = { version = "0.58", default-features = false, features = ["idna"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+# `float_roundtrip`: JSON text parses to the exact f64 it was printed from, so
+# Arrow input gives the same numbers on the columnar and the row path.
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
 
-# PII pseudonymization
-sha2 = "0.10"
-hmac = "0.12"
+# PII protection: pseudonymization (SHA-256, HMAC) and envelope encryption
+# (AES-256-GCM with a host-provided data key, e.g. from AWS KMS per tenant).
+sha2 = "0.11"
+hmac = "0.13"
 hex = "0.4"
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+base64 = "0.23"
+getrandom = "0.4"
 
 # Identifiers and time
-ulid = "1"
+ulid = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # CPU parallelism for batch validation and masking
@@ -65,7 +72,7 @@ tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"
 proptest = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "bench_pipeline"

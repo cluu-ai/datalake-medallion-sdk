@@ -21,7 +21,7 @@ use crate::validation::{codes, level, Rejection};
 
 /// Column type of a declared field. Masked PII fields are stored as hex digests;
 /// unmasked PII fields keep their declared type.
-fn storage_kind(field: &FieldSpec, pii_masked: bool) -> FieldKind {
+pub(crate) fn storage_kind(field: &FieldSpec, pii_masked: bool) -> FieldKind {
     if field.pii && pii_masked {
         FieldKind::String
     } else {
@@ -29,7 +29,7 @@ fn storage_kind(field: &FieldSpec, pii_masked: bool) -> FieldKind {
     }
 }
 
-fn arrow_type(kind: FieldKind) -> DataType {
+pub(crate) fn arrow_type(kind: FieldKind) -> DataType {
     match kind {
         FieldKind::String | FieldKind::Json => DataType::Utf8,
         FieldKind::Integer => DataType::Int64,
@@ -109,6 +109,7 @@ pub(crate) fn bronze_schema(
 }
 
 /// Builds the Bronze batch. Records must already have passed [`check_types`].
+#[cfg(test)]
 pub(crate) fn build_batch(
     contract: &Contract,
     prefix: &EnvelopePrefix,
@@ -116,8 +117,26 @@ pub(crate) fn build_batch(
     envelope: &Envelope<'_>,
     pii_masked: bool,
 ) -> Result<RecordBatch, DatalakeError> {
+    let columns = declared_columns(contract, records, pii_masked)?;
+    finish_batch(
+        contract,
+        prefix,
+        columns,
+        envelope,
+        pii_masked,
+        records.len(),
+    )
+}
+
+/// Declared columns, then the extra column when the mode keeps undeclared
+/// fields, for records that already passed [`check_types`].
+pub(crate) fn declared_columns(
+    contract: &Contract,
+    records: &[Map<String, Value>],
+    pii_masked: bool,
+) -> Result<Vec<ArrayRef>, DatalakeError> {
     let rows = records.len();
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(contract.fields().len() + 9);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(contract.fields().len() + 1);
 
     for field in contract.fields() {
         let values = records
@@ -194,7 +213,19 @@ pub(crate) fn build_batch(
         }
         columns.push(Arc::new(b.finish()));
     }
+    Ok(columns)
+}
 
+/// Appends the envelope for `rows` rows to the declared columns and assembles
+/// the Bronze batch.
+pub(crate) fn finish_batch(
+    contract: &Contract,
+    prefix: &EnvelopePrefix,
+    mut columns: Vec<ArrayRef>,
+    envelope: &Envelope<'_>,
+    pii_masked: bool,
+    rows: usize,
+) -> Result<RecordBatch, DatalakeError> {
     columns.extend(envelope.columns(rows));
     RecordBatch::try_new(
         Arc::new(bronze_schema(contract, prefix, pii_masked)),
@@ -281,7 +312,8 @@ mod tests {
             schema_version: "1",
             schema_hash: "h",
             received_at: Utc::now(),
-            pii_masking: "sha256",
+            pii_protection: "sha256",
+            pii_key_ref: None,
         }
     }
 

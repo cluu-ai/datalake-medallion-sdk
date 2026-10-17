@@ -17,6 +17,7 @@ use bytes::Bytes;
 
 use super::ObjectStorage;
 use crate::error::DatalakeError;
+use crate::tenant::ObjectPath;
 
 /// Explicit credentials. `Debug` never prints the secret parts.
 #[derive(Clone)]
@@ -45,8 +46,6 @@ impl fmt::Debug for StaticCredentials {
 /// Connection options for [`S3Storage::connect`].
 #[derive(Debug, Clone, Default)]
 pub struct S3Options {
-    /// Target bucket. It must already exist.
-    pub bucket: String,
     /// Region; when `None`, resolved by the AWS default chain.
     pub region: Option<String>,
     /// Endpoint override for S3-compatible stores or `LocalStack`.
@@ -57,21 +56,18 @@ pub struct S3Options {
     pub credentials: Option<StaticCredentials>,
 }
 
-/// S3 adapter.
+/// S3 adapter. One client serves every bucket of every tenant; buckets must
+/// already exist and be reachable in the client's region.
 #[derive(Debug, Clone)]
 pub struct S3Storage {
     client: Client,
-    bucket: String,
 }
 
 impl S3Storage {
     /// Wraps an existing client.
     #[must_use]
-    pub fn new(client: Client, bucket: impl Into<String>) -> Self {
-        Self {
-            client,
-            bucket: bucket.into(),
-        }
+    pub fn new(client: Client) -> Self {
+        Self { client }
     }
 
     /// Builds a client from `options`.
@@ -99,23 +95,22 @@ impl S3Storage {
         let config = aws_sdk_s3::config::Builder::from(&shared)
             .force_path_style(path_style)
             .build();
-        Self::new(Client::from_conf(config), options.bucket)
-    }
-
-    /// Bucket written to.
-    #[must_use]
-    pub fn bucket(&self) -> &str {
-        &self.bucket
+        Self::new(Client::from_conf(config))
     }
 }
 
 #[async_trait]
 impl ObjectStorage for S3Storage {
-    async fn put(&self, key: &str, body: Bytes, content_type: &str) -> Result<(), DatalakeError> {
+    async fn put(
+        &self,
+        path: &ObjectPath,
+        body: Bytes,
+        content_type: &str,
+    ) -> Result<(), DatalakeError> {
         self.client
             .put_object()
-            .bucket(&self.bucket)
-            .key(key)
+            .bucket(&path.bucket)
+            .key(&path.key)
             .content_type(content_type)
             .body(ByteStream::from(body))
             .send()
@@ -124,11 +119,7 @@ impl ObjectStorage for S3Storage {
             .map_err(|e| {
                 DatalakeError::storage(
                     "s3",
-                    format!(
-                        "PutObject s3://{}/{key} failed: {}",
-                        self.bucket,
-                        DisplayErrorContext(&e)
-                    ),
+                    format!("PutObject {} failed: {}", path.uri, DisplayErrorContext(&e)),
                 )
             })
     }
@@ -152,9 +143,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_with_endpoint_uses_bucket() {
-        let storage = S3Storage::connect(S3Options {
-            bucket: "local-bucket".into(),
+    async fn connect_with_endpoint_builds_a_client() {
+        let _storage = S3Storage::connect(S3Options {
             region: Some("us-east-1".into()),
             endpoint_url: Some("http://127.0.0.1:4566".into()),
             credentials: Some(StaticCredentials {
@@ -165,7 +155,6 @@ mod tests {
             ..S3Options::default()
         })
         .await;
-        assert_eq!(storage.bucket(), "local-bucket");
     }
 
     #[tokio::test]
@@ -174,7 +163,6 @@ mod tests {
         let endpoint =
             std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "http://127.0.0.1:4566".into());
         let storage = S3Storage::connect(S3Options {
-            bucket: "sdk-it-bucket".into(),
             region: Some("us-east-1".into()),
             endpoint_url: Some(endpoint),
             credentials: Some(StaticCredentials {
@@ -192,7 +180,11 @@ mod tests {
             .send()
             .await;
         storage
-            .put("it/check.txt", Bytes::from_static(b"ok"), "text/plain")
+            .put(
+                &ObjectPath::new("sdk-it-bucket", "it/check.txt".into()),
+                Bytes::from_static(b"ok"),
+                "text/plain",
+            )
             .await
             .unwrap();
         let got = storage
