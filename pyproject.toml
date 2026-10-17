@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "datalake-medallion-sdk"
-version = "0.1.0rc2"
+version = "0.1.0"
 description = "Contract-enforced Bronze-layer ingestion for medallion data lakes: JSON Schema validation, PII pseudonymization, dead-letter quarantine and Hive-partitioned Parquet on S3"
 readme = "README.md"
 requires-python = ">=3.12"
