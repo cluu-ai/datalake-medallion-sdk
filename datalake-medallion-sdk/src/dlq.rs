@@ -2,8 +2,8 @@
 //!
 //! Rejected records of one ingest call are grouped by error code and written
 //! as newline-delimited JSON under the dead-letter prefix, one object per
-//! code. Payloads get the same PII treatment as the Bronze data of the call
-//! (hashed when masking is on), so a dead-letter object never holds a value
+//! code. Payloads get the same PII protection as the Bronze data of the call
+//! (the tenant profile's scheme), so a dead-letter object never holds a value
 //! the Bronze layer would not hold.
 
 use bytes::Bytes;
@@ -37,8 +37,10 @@ pub struct DeadLetter {
     pub sdk_version: String,
     /// Size of the record as submitted, in bytes.
     pub payload_bytes: usize,
-    /// The record (PII hashed when masking is on); `null` when it was not a JSON object or
-    /// exceeded the size limit.
+    /// PII scheme applied to `payload` (`none` when stored as received).
+    pub pii_protection: String,
+    /// The record, PII protected as in Bronze; `null` when it was not a JSON
+    /// object or exceeded the size limit.
     pub payload: Option<Value>,
 }
 
@@ -73,6 +75,7 @@ mod tests {
             quarantined_at: "2026-10-12T00:00:00Z".into(),
             sdk_version: "0.1.0".into(),
             payload_bytes: 10,
+            pii_protection: "none".into(),
             payload: Some(json!({"x": 1})),
         }
     }

@@ -2,13 +2,14 @@
 
 Quick start::
 
-    from datalake_medallion_sdk import BronzeIngestionClient, ContractRegistry
+    from datalake_medallion_sdk import BronzeIngestionClient, ContractRegistry, TenantProfile
 
     registry = ContractRegistry.from_directory("contracts")
-    client = BronzeIngestionClient("acme-lake", registry)
+    client = BronzeIngestionClient(registry)
+    acme = TenantProfile.for_bucket("acme-001", "acme-lake")
     report = await client.ingest(
         [{"event_id": "e1", "user_email": "a@b.c"}],
-        tenant_id="acme-001",
+        tenant=acme,
         contract="security/login_event/1.0.0",
     )
 """
@@ -25,10 +26,14 @@ from ._core import (
     HookError,
     IngestReport,
     MalformedPayloadError,
+    PiiProtection,
+    ProtectionError,
     RecordRejectedError,
     SchemaViolationError,
     SemanticViolationError,
     StorageError,
+    TenantProfile,
+    TenantRegistry,
     TenantViolationError,
     TypeCoercionError,
 )
@@ -49,6 +54,7 @@ from .metrics import (
     Metric,
     MetricsSink,
 )
+from .tenancy import FieldProtector, TenantResolver
 
 # PEP 440 version of the installed distribution (the Rust crate uses SemVer,
 # e.g. 0.1.0-rc.1 for 0.1.0rc1).
@@ -62,6 +68,7 @@ __all__ = [
     "ContractRegistry",
     "DatalakeError",
     "EmfMetricsSink",
+    "FieldProtector",
     "Hook",
     "HookError",
     "HookRegistry",
@@ -72,11 +79,16 @@ __all__ = [
     "MalformedPayloadError",
     "Metric",
     "MetricsSink",
+    "PiiProtection",
     "PreIngestHookResult",
+    "ProtectionError",
     "RecordRejectedError",
     "SchemaViolationError",
     "SemanticViolationError",
     "StorageError",
+    "TenantProfile",
+    "TenantRegistry",
+    "TenantResolver",
     "TenantViolationError",
     "TypeCoercionError",
     "__version__",

@@ -1,11 +1,16 @@
-//! Tenant isolation (Level 1).
+//! Tenant isolation (Level 1) and tenant profiles.
 //!
 //! Every write requires a validated [`TenantId`]; a raw string cannot reach
-//! storage. Isolation is enforced through the `tenant_id=` Hive partition of
-//! each object key built by [`BronzePathResolver`].
+//! storage. Each tenant's [`TenantProfile`] decides where its data lives per
+//! medallion layer and how its PII is protected, and every object key keeps
+//! the tenant in a `tenant_id=` Hive partition.
 
 pub mod id;
 pub mod path;
+pub mod profile;
 
 pub use id::TenantId;
-pub use path::{BronzePathResolver, ObjectPath, PartitionOrder};
+pub use path::{ObjectPath, PartitionOrder};
+pub use profile::{
+    Layer, StorageLocation, TenantDirectory, TenantProfile, TenantProfileBuilder, TenantRegistry,
+};
