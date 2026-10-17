@@ -194,6 +194,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[dev]"
       - run: pytest pytests -q
+      - run: python scripts/release_smoke.py
 
   fuzz:
     name: Fuzz contract compilation
