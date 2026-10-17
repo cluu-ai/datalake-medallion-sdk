@@ -1,8 +1,9 @@
 //! PII masking throughput: SHA-256 vs HMAC-SHA256.
 
 use _core::validation::pii::PiiHasher;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::{json, Map, Value};
+use std::hint::black_box;
 
 fn records(n: usize) -> Vec<Map<String, Value>> {
     (0..n)

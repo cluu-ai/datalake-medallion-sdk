@@ -1,5 +1,7 @@
 # Monthly, grouped updates keep CI usage low: minor and patch bumps arrive as one
-# pull request per ecosystem; each major bump gets its own pull request for review.
+# pull request per ecosystem, and Cargo major bumps as a second one. Majors often
+# break the build only in combination (sha2 and hmac, for example), so they are
+# adapted and reviewed together instead of failing CI one crate at a time.
 # Security updates are not affected by this schedule and open as soon as needed.
 version: 2
 updates:
@@ -12,6 +14,9 @@ updates:
       cargo-minor-and-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+      cargo-major:
+        patterns: ["*"]
+        update-types: ["major"]
 
   - package-ecosystem: pip
     directory: /
