@@ -41,7 +41,7 @@ parquet = { version = "59", default-features = false, features = ["arrow", "snap
 # Contracts and validation
 # No remote or file $ref resolution: contracts must be self-contained, and
 # compiling a schema must never perform network I/O.
-jsonschema = { version = "0.29", default-features = false }
+jsonschema = { version = "0.58", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 
