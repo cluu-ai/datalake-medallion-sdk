@@ -47,7 +47,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 
 # PII pseudonymization
 sha2 = "0.10"
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 
 # Identifiers and time
