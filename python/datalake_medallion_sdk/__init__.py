@@ -15,6 +15,8 @@ Quick start::
 
 from __future__ import annotations
 
+from importlib.metadata import version as _dist_version
+
 from ._core import (
     ConfigurationError,
     ContractBootError,
@@ -29,7 +31,6 @@ from ._core import (
     StorageError,
     TenantViolationError,
     TypeCoercionError,
-    __version__,
 )
 from .client import BronzeIngestionClient, ClientOptions
 from .decorators import datalake_retry, emit_metrics
@@ -48,6 +49,10 @@ from .metrics import (
     Metric,
     MetricsSink,
 )
+
+# PEP 440 version of the installed distribution (the Rust crate uses SemVer,
+# e.g. 0.1.0-rc.1 for 0.1.0rc1).
+__version__: str = _dist_version("datalake-medallion-sdk")
 
 __all__ = [
     "BronzeIngestionClient",
