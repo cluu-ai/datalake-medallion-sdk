@@ -286,7 +286,7 @@ impl BronzePipeline {
         let contract = Arc::clone(self.registry.get(&request.contract)?);
         let call = CallContext {
             tenant: &request.tenant_id,
-            batch_id: Ulid::new().to_string(),
+            batch_id: Ulid::generate().to_string(),
             now: Utc::now(),
             hasher: request
                 .mask_pii
