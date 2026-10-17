@@ -40,7 +40,7 @@ print(report.records_ok, report.records_quarantined, report.rejections)
 pip install datalake-medallion-sdk
 ```
 
-Wheels are `abi3` (one wheel per platform for CPython 3.12+) for Linux (glibc and musl, x86_64 and aarch64), macOS (x86_64 and arm64) and Windows x86_64. There are no mandatory Python dependencies: Arrow input uses the [PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html), so pyarrow and Polars are optional.
+Wheels are `abi3` (one wheel per platform for CPython 3.12+) for Linux (glibc and musl, x86_64 and aarch64), macOS on Apple silicon and Windows x86_64. Other platforms, including Intel macOS, build from the source distribution and need a Rust toolchain. There are no mandatory Python dependencies: Arrow input uses the [PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html), so pyarrow and Polars are optional.
 
 ## What happens to a record
 
