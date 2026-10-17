@@ -9,7 +9,13 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
-from datalake_medallion_sdk import BronzeIngestionClient, ContractRegistry
+from datalake_medallion_sdk import (
+    BronzeIngestionClient,
+    ContractRegistry,
+    PiiProtection,
+    TenantProfile,
+    TenantRegistry,
+)
 
 CONTRACT = "security/login_event/1.0.0"
 EMAIL = "alice@example.com"
@@ -83,9 +89,20 @@ def make_client(
     s3_endpoint: str, bucket: str, registry: ContractRegistry
 ) -> Callable[..., BronzeIngestionClient]:
     def make(**kwargs: Any) -> BronzeIngestionClient:
+        """Client whose tenants (acme-001, tenant-a, tenant-b) all use the test
+        bucket; ``pii_protection=`` applies to every one of them."""
         reg = kwargs.pop("registry", registry)
+        protection: PiiProtection | None = kwargs.pop("pii_protection", None)
+        kwargs.setdefault(
+            "tenants",
+            TenantRegistry(
+                [
+                    TenantProfile.for_bucket(t, bucket, pii_protection=protection)
+                    for t in ("acme-001", "tenant-a", "tenant-b")
+                ]
+            ),
+        )
         return BronzeIngestionClient(
-            bucket,
             reg,
             aws_region="us-east-1",
             aws_endpoint_url=s3_endpoint,

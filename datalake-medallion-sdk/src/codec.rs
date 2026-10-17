@@ -312,7 +312,8 @@ mod tests {
             schema_version: "1",
             schema_hash: "h",
             received_at: Utc::now(),
-            pii_masking: "sha256",
+            pii_protection: "sha256",
+            pii_key_ref: None,
         }
     }
 

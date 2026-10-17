@@ -1,6 +1,7 @@
 //! Parquet encoding of Bronze batches.
 
 use bytes::Bytes;
+use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
@@ -10,6 +11,10 @@ use arrow::record_batch::RecordBatch;
 use crate::error::DatalakeError;
 
 /// Encodes record batches into one Parquet file (Snappy, page statistics).
+///
+/// The Arrow schema is not embedded: readers take column types from the
+/// Parquet logical types, so in-memory encodings such as the one-entry
+/// dictionaries of constant lineage columns read back as plain strings.
 #[derive(Debug, Clone)]
 pub struct ParquetEncoder {
     properties: WriterProperties,
@@ -49,9 +54,11 @@ impl ParquetEncoder {
         let err =
             |e: parquet::errors::ParquetError| DatalakeError::storage("parquet", e.to_string());
         let mut buffer = Vec::new();
+        let options = ArrowWriterOptions::new()
+            .with_properties(self.properties.clone())
+            .with_skip_arrow_metadata(true);
         let mut writer =
-            ArrowWriter::try_new(&mut buffer, first.schema(), Some(self.properties.clone()))
-                .map_err(err)?;
+            ArrowWriter::try_new_with_options(&mut buffer, first.schema(), options).map_err(err)?;
         for batch in batches {
             writer.write(batch).map_err(err)?;
         }
