@@ -51,7 +51,7 @@ hmac = "0.12"
 hex = "0.4"
 
 # Identifiers and time
-ulid = "1"
+ulid = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # CPU parallelism for batch validation and masking
