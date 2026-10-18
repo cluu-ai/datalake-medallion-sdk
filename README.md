@@ -5,70 +5,34 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org)
 
-Contract-enforced Bronze-layer ingestion for medallion data lakes, with a Rust core and a Python API.
+Ingest data into a multi-tenant data lake on S3 with every record checked against a data contract, and read it back per tenant without Athena or Glue. Rust core, Python API.
 
-Every record is checked against a JSON Schema data contract before anything is written. Valid records become one Hive-partitioned Parquet object with lineage columns; invalid records go to a dead-letter prefix with the reason attached. Every call names its tenant, and the tenant's profile decides where its data goes. Fields the contract marks as PII are stored as received by default; a tenant profile can protect them with SHA-256, HMAC-SHA256, AES-256-GCM envelope encryption (for example a KMS data key per tenant) or a scheme of your own, in the data and in the dead letters alike. `LakeReader` reads a tenant's Parquet and Iceberg tables back straight from S3, without Athena or Glue.
+A *medallion* lake keeps data in layers: **Bronze** holds raw data as received (validated here), **Silver** cleaned and conformed data, **Gold** aggregates for consumers. This SDK writes Bronze and reads every layer:
 
-```python
-import asyncio
-from datalake_medallion_sdk import (
-    BronzeIngestionClient,
-    ContractRegistry,
-    TenantProfile,
-    TenantRegistry,
-)
-
-registry = ContractRegistry.from_directory("contracts")  # compiles every contract, all-or-nothing
-tenants = TenantRegistry([TenantProfile.for_bucket("acme-001", "acme-lake")])
-client = BronzeIngestionClient(registry, tenants=tenants)  # AWS default credential chain
-
-report = asyncio.run(
-    client.ingest(
-        [
-            {
-                "event_id": "e1",
-                "occurred_at": "2026-10-01T12:00:00Z",
-                "user_email": "ana@example.com",
-            },
-            {"event_id": 42},
-        ],
-        tenant="acme-001",
-        contract="security/login_event/1.0.0",
-    )
-)
-print(report.records_ok, report.records_quarantined, report.rejections)
-# 1 1 {'ERR_SCHEMA_VIOLATION': 1}
-```
+- **Contract first**: each record is validated against a JSON Schema contract before anything is written. Valid records become one Hive-partitioned Parquet object with lineage columns; invalid records go to a quarantine location with the reason attached.
+- **Multi-tenant by design**: every call names its tenant, and the tenant's profile decides where its data lives (its own buckets or prefixes) and how its personal data is protected.
+- **PII protection, off by default**: fields marked as PII can be hashed, HMAC-ed, encrypted with a per-tenant KMS data key, or protected with your own scheme.
+- **Fast reads without a query service**: `LakeReader` scans a tenant's Parquet and Iceberg tables straight from S3 with Polars or DuckDB and returns Arrow.
 
 ## Install
 
 ```bash
-pip install datalake-medallion-sdk
+pip install datalake-medallion-sdk            # ingestion
+pip install "datalake-medallion-sdk[read]"    # + LakeReader with Polars (recommended)
 ```
 
-Wheels are `abi3` (one wheel per platform for CPython 3.12+) for Linux (glibc and musl, x86_64 and aarch64), macOS on Apple silicon and Windows x86_64. Other platforms, including Intel macOS, build from the source distribution and need a Rust toolchain. There are no mandatory Python dependencies: Arrow input uses the [PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html), so pyarrow and Polars are optional. Reading the lake uses the `[read]` extra (Polars, pyarrow, pyiceberg) or the `[duckdb]` extra.
-
-## What happens to a record
-
-| Level | Check | On failure |
+| Extra | Adds | For |
 |---|---|---|
-| 0 | Contracts compile at boot; hooks must target known contracts; contract fields may not use the envelope prefix | `ContractBootError` |
-| 1 | Tenant id: 3–63 chars of `[a-z0-9_-]`, no leading/trailing or doubled separators, not a reserved word | `TenantViolationError` |
-| 2 | Record is a JSON object, within the size limit (10 MiB default), without fields in the reserved envelope namespace | quarantined |
-| 3 | JSON Schema (formats asserted); in `strict` mode, no undeclared fields | quarantined |
-| 4 | Optional host hook may accept, rewrite or reject; rewritten records are validated again | quarantined |
-| 5 | `date-time` fields not more than 1 h (configurable) in the future | quarantined |
-| 6 | PII fields protected with the tenant's scheme: none by default; SHA-256, HMAC-SHA256, AES-256-GCM or your own | `ProtectionError` (nothing written) |
-| 7 | Each value fits the Parquet column type derived from the contract | quarantined |
-| 8 | Lineage columns appended | always applied |
+| *(none)* | nothing | ingestion of dicts, JSON and Arrow (via the [PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html)) |
+| `[read]` | Polars, pyarrow, pyiceberg | `LakeReader` with the default engine |
+| `[duckdb]` | DuckDB, pyarrow | `LakeReader(engine="duckdb")` |
+| `[pyarrow]`, `[polars]` | that library | building Arrow input yourself |
 
-With `on_invalid="raise"` the client writes nothing and raises the typed error (`SchemaViolationError`, `HookError`, …) for the first invalid record instead of quarantining.
+Wheels are `abi3` (one wheel per platform for CPython 3.12+) for Linux (glibc and musl, x86_64 and aarch64), macOS on Apple silicon and Windows x86_64. Other platforms build from the source distribution and need a Rust toolchain.
 
-Error messages and dead-letter entries never contain record values: schema errors are rendered with values masked, and hook exceptions are recorded by type name only.
+## Quickstart
 
-## Data contracts
-
-A contract is a JSON Schema document plus a few keywords under an extension prefix (`x-dl-` by default, configurable per registry):
+**1. Write a contract.** Save this as `contracts/security/login_event.schema.json` (a fuller version is in [`examples/contracts`](examples/contracts)). `ContractRegistry.from_directory` loads every `*.schema.json` below a folder.
 
 ```json
 {
@@ -77,73 +41,157 @@ A contract is a JSON Schema document plus a few keywords under an extension pref
   "x-dl-domain": "security",
   "x-dl-datatype": "login_event",
   "x-dl-schema_version": "1.0.0",
-  "x-dl-flexibility_mode": "strict",
-  "required": ["event_id", "occurred_at"],
+  "required": ["event_id", "occurred_at", "outcome"],
   "properties": {
-    "event_id":    {"type": "string"},
+    "event_id":    {"type": "string", "format": "uuid"},
     "occurred_at": {"type": "string", "format": "date-time"},
-    "attempts":    {"type": "integer", "minimum": 0},
-    "user_email":  {"type": "string", "x-dl-pii": true}
+    "outcome":     {"type": "string", "enum": ["SUCCESS", "FAILURE", "LOCKED"]},
+    "attempts":    {"type": "integer", "minimum": 1},
+    "user_email":  {"type": "string", "format": "email", "x-dl-pii": true}
   }
 }
 ```
 
-The key `domain/datatype/schema_version` (here `security/login_event/1.0.0`) selects the contract at ingest time. Flexibility modes:
+**2. Ingest.** Credentials come from the AWS default chain (environment, profile, SSO, role). The bucket must exist.
 
-- `strict` (default): schema enforced, undeclared fields rejected.
-- `permissive`: schema enforced, undeclared fields kept as JSON in `_dl_extra`.
-- `schema_on_read`: no schema enforcement; PII protection (when the tenant has one), type coercion and lineage still apply.
+```python
+import asyncio
 
-The Parquet schema comes from the contract, not from the data, so every object of a contract version has the same columns: `string` → utf8, `integer` → int64, `number` → float64, `boolean` → bool, anything else (objects, arrays, unions) → JSON text. When the tenant protects PII, PII fields are stored as utf8 (digest or token); otherwise they keep their declared type. Keep a tenant on one protection setting if a PII field is not a string, so the column type of its tables stays stable.
+from datalake_medallion_sdk import (
+    BronzeIngestionClient,
+    ContractRegistry,
+    TenantProfile,
+    TenantRegistry,
+)
 
-Contracts must be self-contained: `$ref` to remote URLs or files is not resolved, so loading contracts never performs network I/O.
+contracts = ContractRegistry.from_directory("contracts")  # compiles every contract, all-or-nothing
+tenants = TenantRegistry([TenantProfile.for_bucket("acme-001", "acme-lake")])
+client = BronzeIngestionClient(contracts, tenants=tenants)
+
+
+async def main() -> None:
+    report = await client.ingest(
+        [
+            {
+                "event_id": "0b7d6a52-3c1e-4f5e-9a4b-1f2d3c4b5a69",
+                "occurred_at": "2026-10-01T12:00:00Z",
+                "outcome": "SUCCESS",
+                "user_email": "ana@example.com",
+            },
+            {"event_id": 42},  # invalid: quarantined, not written to Bronze
+        ],
+        tenant="acme-001",
+        contract="security/login_event/1.0.0",
+    )
+    print(report.records_ok, report.records_quarantined, report.rejections)
+    # 1 1 {'ERR_SCHEMA_VIOLATION': 1}
+    print(report.data_uri)
+    # s3://acme-lake/bronze/tenant_id=acme-001/data_type=login_event/year=…/<batch_id>.parquet
+
+
+asyncio.run(main())
+```
+
+**3. Read it back** (`pip install "datalake-medallion-sdk[read]"`):
+
+```python
+from datalake_medallion_sdk import LakeReader, TableRef
+
+reader = LakeReader(tenants=tenants)
+events = reader.read("acme-001", TableRef.bronze("login_event"), columns=["event_id", "outcome"])
+print(events.num_rows)  # a pyarrow.Table
+```
+
+The rest of this page covers each piece in depth.
+
+## Data contracts
+
+A contract is a JSON Schema (draft 2020-12) document plus a few keywords under an extension prefix (`x-dl-` by default, configurable per registry):
+
+| Keyword | Required | Meaning |
+|---|---|---|
+| `x-dl-domain`, `x-dl-datatype`, `x-dl-schema_version` | yes | identify the contract; the key `domain/datatype/schema_version` (e.g. `security/login_event/1.0.0`) selects it at ingest time, and `datatype` names the Bronze table |
+| `x-dl-flexibility_mode` | no | `strict` (default): undeclared fields rejected. `permissive`: undeclared fields kept as JSON in `_dl_extra`. `schema_on_read`: no schema enforcement; PII protection, type coercion and lineage still apply |
+| `x-dl-pii` | no | on a property: the field holds personal data (see [PII protection](#pii-protection)) |
+| `x-dl-layer` | no | free label of the layer the contract describes |
+
+The Parquet schema comes from the contract, not from the data, so every object of a contract version has the same columns: `string` → utf8, `integer` → int64, `number` → float64, `boolean` → bool, anything else (objects, arrays, unions) → JSON text. When a tenant protects PII, PII fields are stored as utf8 (digest or token). Keep a tenant on one protection setting if a PII field is not a string, so its column type stays stable.
+
+Contracts must be self-contained: `$ref` to remote URLs or files is not resolved, so loading contracts never performs network I/O. `ContractRegistry.from_schemas([...])` builds a registry from dicts instead of files.
 
 ## Tenants and destinations
 
-The client holds contracts and a connection, never a destination. Each `ingest` names its tenant, and the tenant's `TenantProfile` fixes, for that tenant only:
+The client holds contracts and a connection, never a destination. Each `ingest` names its tenant, and the tenant's `TenantProfile` decides, for that tenant only:
 
-- an `s3://bucket/prefix` location per medallion layer: `bronze` and `quarantine` are required (ingestion writes them); `silver` and `gold` are optional and resolved the same way, so downstream jobs read their locations from the same profile (`profile.location("silver")`, `profile.table_uri("silver", "login_event")`);
+- an `s3://bucket/prefix` location per layer: `bronze` and `quarantine` are required (ingestion writes them); `silver` and `gold` are optional, so downstream jobs and `LakeReader` resolve them from the same profile;
 - the order of the `tenant_id`/`data_type` partitions;
 - the PII protection scheme, if any.
 
-Profiles are validated when they are built: bucket names follow the AWS rules, prefixes are safe key segments, and two layers may not share or nest a location. Every key still carries a `tenant_id=` partition, even in a tenant's own bucket.
+Profiles are validated when built: bucket names follow the AWS rules, prefixes are safe key segments, and two layers may not share or nest a location. Every key still carries a `tenant_id=` partition, even in a tenant's own bucket.
 
 ```python
+import os
+
 from datalake_medallion_sdk import PiiProtection, TenantProfile, TenantRegistry
 
 acme = TenantProfile.for_bucket("acme-001", "acme-lake")  # bronze/, quarantine/, silver/, gold/
 beta = TenantProfile(
     "beta-002",
     bronze="s3://beta-raw/landing",
-    quarantine="s3://beta-quarantine/dlq",
+    quarantine="s3://beta-quarantine/rejected",
     silver="s3://beta-curated/silver",
     partition_order="data_type_first",
-    pii_protection=PiiProtection.hmac_sha256(beta_key),
+    pii_protection=PiiProtection.hmac_sha256(os.environ["BETA_PII_KEY"].encode()),  # 16+ bytes
 )
+client = BronzeIngestionClient(contracts, tenants=TenantRegistry([acme, beta]))
 
-client = BronzeIngestionClient(registry, tenants=TenantRegistry([acme, beta]))
+# inside an async function:
 await client.ingest(rows, tenant="beta-002", contract="security/login_event/1.0.0")  # looked up
 await client.ingest(rows, tenant=acme, contract="security/login_event/1.0.0")  # passed directly
 ```
 
-`tenants=` also accepts a function `(tenant_id) -> TenantProfile`, to load profiles from your own configuration store; a profile returned for another tenant is rejected.
+`tenants=` also accepts a function `(tenant_id) -> TenantProfile` to load profiles from your own configuration store; a profile returned for another tenant is rejected. `profile.location("silver")` and `profile.table_uri("silver", "login_event")` give the resolved locations.
 
-Profiles can also come from a configuration document (a dict or a JSON file) with `TenantRegistry.from_config(...)`; unknown fields are rejected and secrets never live in it:
+Profiles can also come from a configuration document, a dict or the path of a JSON file, with `TenantRegistry.from_config(...)`. Unknown fields are rejected, so a typo cannot silently disable protection, and secrets never live in the document:
 
 ```json
-{"tenants": [{
-  "tenant_id": "acme-001",
-  "bronze": "s3://acme-lake/bronze", "quarantine": "s3://acme-lake/quarantine",
-  "pii_protection": {"scheme": "aes-256-gcm", "provider": "aws-kms",
-                     "kms_key_id": "alias/lake-acme-001", "data_key_max_age_seconds": 3600}
-}]}
+{"tenants": [
+  {"tenant_id": "acme-001", "bronze": "s3://acme-lake/bronze", "quarantine": "s3://acme-lake/quarantine"},
+  {"tenant_id": "beta-002", "bronze": "s3://beta-raw/landing", "quarantine": "s3://beta-quarantine/rejected",
+   "silver": "s3://beta-curated/silver", "partition_order": "data_type_first",
+   "pii_protection": {"scheme": "hmac-sha256", "key_env": "BETA_PII_KEY"}},
+  {"tenant_id": "gamma-003", "bronze": "s3://gamma-lake/bronze", "quarantine": "s3://gamma-lake/quarantine",
+   "pii_protection": {"scheme": "aes-256-gcm", "provider": "aws-kms", "kms_key_id": "alias/lake-gamma-003",
+                      "data_key_max_age_seconds": 3600, "max_nonce_prefixes_per_key": 32768,
+                      "region": "us-east-1"}}
+]}
 ```
 
-`pii_protection` is optional (`none`, `sha256`, `hmac-sha256` with `key_env` naming the environment variable that holds the key, or `aes-256-gcm` with `aws-kms`).
+`pii_protection.scheme` is one of `none`, `sha256`, `hmac-sha256` (`key_env` names the environment variable holding the key) or `aes-256-gcm` (`provider: "aws-kms"`; `endpoint_url` is optional).
+
+## What happens to a record
+
+| Level | Check | On failure |
+|---|---|---|
+| 0 | Contracts compile at boot; hooks must target known contracts; contract fields may not start with the lineage prefix (`_dl_`) | `ContractBootError` |
+| 1 | Tenant id: 3–63 chars of `[a-z0-9_-]`, no leading/trailing or doubled separators, not a reserved word | `TenantViolationError` |
+| 2 | Record is a JSON object, within the size limit (10 MiB default), without `_dl_` fields | quarantined |
+| 3 | JSON Schema (formats asserted); in `strict` mode, no undeclared fields | quarantined |
+| 4 | Optional [hook](#hooks) may accept, rewrite or reject; rewritten records are validated again | quarantined |
+| 5 | `date-time` fields not more than 1 h (configurable) in the future | quarantined |
+| 6 | PII fields protected with the tenant's scheme (none by default) | `ProtectionError` (nothing written) |
+| 7 | Each value fits the Parquet column type derived from the contract | quarantined |
+| 8 | Lineage columns appended | always applied |
+
+`IngestReport` tells what happened: `records_received`, `records_ok`, `records_quarantined`, `rejections` (count per error code), `data_uri` (the Bronze object, `None` if nothing was valid), `dlq_uris` (the quarantine objects), `batch_id`, `tenant_id` and `pii_protection`.
+
+With `on_invalid="raise"` the client writes nothing and raises the typed error (`SchemaViolationError`, `HookError`, …) for the first invalid record instead of quarantining. Error messages and quarantine entries never contain record values: schema errors are rendered with values masked, and hook exceptions are recorded by type name only.
+
+**Inputs.** `ingest` accepts a `dict`, a list of dicts, JSON `str`/`bytes`, or any Arrow object implementing the PyCapsule interface, such as a pyarrow `Table`/`RecordBatch` or a Polars `DataFrame`. Arrow input gets the same validation and results as JSON and is about 4x faster: when every rule of the contract applies to one field at a time, it is checked column by column and only rows that may be invalid are converted to JSON. Validation and encoding run in Rust outside the GIL.
 
 ## PII protection
 
-Off by default: PII fields keep their declared type and value. Set `pii_protection` on a tenant profile to protect them in Bronze and in the dead letters:
+Off by default: PII fields keep their declared type and value. Set `pii_protection` on a tenant profile to protect them in Bronze and in the quarantine entries:
 
 | Scheme | `PiiProtection.` | Output | Reversible |
 |---|---|---|---|
@@ -152,30 +200,85 @@ Off by default: PII fields keep their declared type and value. Set `pii_protecti
 | `aes-256-gcm` | `kms_envelope(kms_key_id)` (recommended) or `aes_256_gcm(data_key, key_ref=...)` | `v1:` + base64url token | yes, with the data key |
 | your own | `custom(obj)` | whatever `obj.protect_batch` returns | your choice |
 
-Per-tenant keys with AWS KMS (envelope encryption, recommended for reversible protection):
+**Per-tenant keys with AWS KMS** (envelope encryption, recommended for reversible protection):
 
 ```python
 protection = PiiProtection.kms_envelope("alias/lake-acme-001")  # the tenant's KMS key
 acme = TenantProfile.for_bucket("acme-001", "acme-lake", pii_protection=protection)
 ```
 
-The SDK asks KMS for a data key the first time a tenant needs one and reuses it until it is one hour old or has drawn 2^15 nonces (`data_key_max_age`, `max_nonce_prefixes_per_key`), refreshing it ahead of expiry. Keys are cached per tenant and never shared; if KMS fails and the current key has expired, the call fails with `ProtectionError` and nothing is written. Data keys carry the encryption context `{"tenant_id": <tenant>, "purpose": "datalake-medallion-sdk/pii"}`, so IAM can restrict each role to its tenant, CloudTrail shows which tenant every key belongs to, and a key reference copied to another tenant cannot be decrypted. The plaintext key lives only in memory; `_dl_pii_key_ref` stores `kms1:<key arn>:<encrypted key>`. Any other key service plugs in through the `DataKeyProvider` protocol (`generate`, `decrypt`) and `PiiProtection.envelope(provider)`.
+The SDK asks KMS for a data key the first time a tenant needs one and reuses it for that tenant until it is one hour old or has encrypted 2^15 batches (`data_key_max_age`, `max_nonce_prefixes_per_key`), refreshing it ahead of expiry. That is about one KMS call per tenant per hour instead of one per batch. Keys are never shared between tenants; if KMS fails and the current key has expired, the call fails with `ProtectionError` and nothing is written.
 
-Reading protected values back (one `Decrypt` per data key, not per value):
+Data keys carry the encryption context `{"tenant_id": <tenant>, "purpose": "datalake-medallion-sdk/pii"}`, so IAM can restrict each role to its tenant, CloudTrail shows which tenant every key belongs to, and a key copied to another tenant cannot be decrypted. The plaintext key lives only in memory; `_dl_pii_key_ref` stores `kms1:<key arn>:<encrypted key>`. Other key services (GCP KMS, Azure Key Vault, Vault, …) plug in through the `DataKeyProvider` protocol (`generate`, `decrypt`) and `PiiProtection.envelope(provider)`.
+
+**Reading protected values back** (one `Decrypt` per data key, not per value):
 
 ```python
-reader = PiiDecryptor.kms()
-emails = reader.decrypt_many(
+from datalake_medallion_sdk import PiiDecryptor
+
+table = reader.read("acme-001", TableRef.bronze("login_event"))  # see Reading the lake
+emails = PiiDecryptor.kms().decrypt_many(
     table.column("user_email").to_pylist(),
     tenant_id="acme-001",
     field="user_email",
-    key_ref=table.column("_dl_pii_key_ref")[0].as_py(),
+    key_ref=table.column("_dl_pii_key_ref")[0].as_py(),  # rows of one batch share a key
 )
 ```
 
-Least-privilege IAM for this scheme: the ingestion role needs `kms:GenerateDataKey` and readers `kms:Decrypt` on the tenant's key, both with the condition `"StringEquals": {"kms:EncryptionContext:tenant_id": "<tenant>"}`. Enable automatic rotation of the KMS key; old data keys keep working. Encrypt only what must be reversible: tokens do not compress, so encrypted columns cost more to store and scan; HMAC suits fields that only need to be joined.
+Grant the ingestion role `kms:GenerateDataKey` and readers `kms:Decrypt` on the tenant's key, both conditioned on `kms:EncryptionContext:tenant_id` ([policy examples](docs/iam.md)). Enable automatic rotation of the KMS key; old data keys keep working. Encrypt only what must be reversible: tokens do not compress, so encrypted columns cost more to store and scan; HMAC suits fields that only need to be joined.
 
-A custom scheme is any object with a `scheme` name, an optional `key_ref` and `protect_batch(tenant_id, field, values) -> list[str]` (the `FieldProtector` protocol). It is called once per field and batch, so it can reach a key service in bulk; if it raises, the call fails with `ProtectionError` and nothing is written.
+**Custom schemes** are any object with a `scheme` name, an optional `key_ref` and `protect_batch(tenant_id, field, values) -> list[str]` (the `FieldProtector` protocol). It is called once per field and batch, so it can reach a key service in bulk; if it raises, the call fails with `ProtectionError` and nothing is written.
+
+## Reading the lake
+
+`LakeReader` reads one tenant's Parquet and Iceberg tables directly from S3 with an in-process engine and returns Arrow. It needs no Athena query, no Glue table and no query queue.
+
+```python
+import polars as pl
+from datalake_medallion_sdk import LakeReader, TableRef
+
+reader = LakeReader(tenants=tenants, cache_mb=512)  # engine="polars" by default
+events = TableRef.bronze("login_event")
+
+# Keyset pagination: _dl_ingest_id is unique and increases with ingest time.
+cursor = ""
+while True:
+    page = reader.read(
+        "acme-001",
+        events,
+        columns=["_dl_ingest_id", "event_id", "occurred_at", "outcome"],
+        where=[("_dl_ingest_id", ">", cursor)],  # pushed down to the scan
+        order_by=["_dl_ingest_id"],
+        limit=1000,
+    )
+    if page.num_rows == 0:
+        break
+    cursor = page.column("_dl_ingest_id")[-1].as_py()
+
+# Filters: ==, !=, <, <=, >, >=, in, not in (combined with AND)
+recent = reader.read("acme-001", events, where=[("occurred_at", ">=", "2026-10-01T00:00:00Z")])
+some = reader.read(
+    "acme-001", events, where=[("event_id", "in", ["0b7d6a52-3c1e-4f5e-9a4b-1f2d3c4b5a69"])]
+)
+
+# Aggregations run in the engine on a scan already filtered to the tenant.
+summary = TableRef.iceberg("gold", "login_summary", location="s3://shared-gold/login_summary")
+by_outcome = (
+    reader.scan("acme-001", summary).group_by("outcome").agg(pl.col("total").sum()).collect()
+)
+```
+
+- **Tenant isolation.** Callers name a tenant and a table, never a bucket, a path or a tenant filter (filtering on `tenant_id` is rejected). Parquet objects are listed only below the tenant's prefix, a `tenant_id` filter is always applied when the data has that column, and a shared Iceberg table without a `tenant_id` column is refused.
+- **Tables.**
+  - `TableRef.bronze(data_type)`: the ingestion client's output.
+  - `TableRef.parquet(layer, name)`: Hive-partitioned Parquet in Silver or Gold, below `profile.table_uri(layer, name)`.
+  - `TableRef.iceberg(layer, name)`: an Iceberg table in the tenant's location, or a table shared by tenants named with `location=`, `metadata_location=` or `identifier=` (with `catalog=`, any [pyiceberg catalog](https://py.iceberg.apache.org/configuration/): REST, Glue, SQL, …). Without a catalog the current snapshot is the newest `metadata/*.metadata.json`; use a catalog when several writers commit concurrently.
+- **Caching.** Listings, Iceberg snapshots and scan plans are reused for `max_staleness` seconds (default 60); `reader.refresh(tenant)` makes new data visible at once. With `cache_mb=512` (off by default), the contents of Parquet objects stay in memory as well: the SDK never rewrites an object, so warm reads fetch only new ones. Use it in services that read Bronze repeatedly.
+- **Pruning.** Filters on `year`, `month` and `day` (the Bronze partition columns) skip whole objects.
+- **Engines.** `engine="polars"` (default, extra `[read]`) is the fastest for repeated reads. `engine="duckdb"` (extra `[duckdb]`) uses about half the memory, starts fastest (good for short-lived functions) and `scan()` returns a DuckDB relation that accepts SQL (`relation.query("t", "SELECT ...")`). DuckDB downloads its `httpfs` and `iceberg` extensions on first use; on AWS Lambda pass `duckdb_config={"home_directory": "/tmp"}`, or point `extension_directory` at pre-installed extensions for offline environments.
+- **Credentials.** The same options as the client (`aws_region`, `aws_endpoint_url`, keys) or the AWS default chain. The reader role needs `s3:ListBucket` and `s3:GetObject` on the tenant's locations only ([policy examples](docs/iam.md)).
+
+On AWS Lambda against S3, warm reads of one tenant out of 8 (3.16 M rows) take 5–27 ms from Bronze with `cache_mb` and 67–147 ms from Iceberg, against 0.9–2.1 s for the same queries in Athena. Details in [docs/performance.md](docs/performance.md).
 
 ## Object layout
 
@@ -184,9 +287,9 @@ A custom scheme is any object with a `scheme` name, an optional `key_ref` and `p
 <quarantine location>/tenant_id=<tenant>/data_type=<datatype>/error_code=<code>/year=YYYY/month=MM/day=DD/<batch_id>.jsonl
 ```
 
-Locations and the order of the `tenant_id`/`data_type` partitions (`partition_order="data_type_first"`) come from the tenant profile. Each ingest call writes at most one Parquet object plus one dead-letter object per error code. Dead letters are written first, so retrying a failed call never duplicates Bronze rows.
+With `partition_order="data_type_first"` the `data_type=` partition comes before `tenant_id=`. Each ingest call writes at most one Parquet object plus one quarantine object per error code. Quarantine objects are written first, so retrying a failed call never duplicates Bronze rows.
 
-Lineage columns (prefix `_dl_`, configurable):
+Lineage columns (prefix `_dl_`, configurable with `envelope_prefix`):
 
 | Column | Type | Content |
 |---|---|---|
@@ -199,76 +302,9 @@ Lineage columns (prefix `_dl_`, configurable):
 | `_dl_pii_key_ref` | utf8, nullable | key reference of reversible schemes (e.g. the KMS-encrypted data key) |
 | `_dl_sdk_version` | utf8 | SDK version |
 
-## Inputs
-
-`ingest` accepts a `dict`, a list of dicts, JSON `str`/`bytes`, or any object implementing the Arrow PyCapsule interface, such as a pyarrow `Table`/`RecordBatch` or a Polars `DataFrame`. Arrow rows get the same validation and the same results as JSON; when every rule of the contract applies to one field at a time, Arrow input is checked column by column and only rows that may be invalid are converted to JSON. Validation and encoding run in Rust outside the GIL.
-
-## Reading the lake
-
-`LakeReader` reads one tenant's Parquet and Iceberg tables directly from S3 with an in-process engine. It needs no Athena query, no Glue table and no query queue. Results are Arrow tables.
-
-```python
-import polars as pl
-from datalake_medallion_sdk import LakeReader, TableRef
-
-reader = LakeReader(tenants=tenants)  # pip install "datalake-medallion-sdk[read]"
-
-page = reader.read(
-    "acme-001",
-    TableRef.bronze("login_event"),
-    columns=["event_id", "occurred_at"],
-    where=[("occurred_at", ">", last_seen)],  # pushed down to the scan
-    order_by=["occurred_at", "event_id"],
-    limit=1000,  # keyset pagination
-)
-
-summary = TableRef.iceberg(
-    "gold", "compliance_summary", location="s3://lake-gold/compliance_summary"
-)
-by_framework = (
-    reader.scan("acme-001", summary).group_by("framework").agg(pl.col("total").sum()).collect()
-)
-```
-
-- **Tenant isolation.**
-  - Callers name a tenant and a table, never a bucket, a path or a tenant filter. Filtering on `tenant_id` is rejected.
-  - Parquet objects are listed only below the tenant's prefix (`TenantProfile.table_uri`).
-  - A `tenant_id` filter is always applied when the data has that column.
-  - A shared Iceberg table without a `tenant_id` column is refused.
-- **Tables.**
-  - `TableRef.bronze(data_type)` reads the ingestion client's output.
-  - `TableRef.parquet(layer, name)` reads Hive-partitioned Parquet in Silver or Gold.
-  - `TableRef.iceberg(layer, name)` reads an Iceberg table:
-    - by default, the table in the tenant's location;
-    - for a shared table, one of `location=`, `metadata_location=` or `identifier=` (with `catalog=`, any pyiceberg catalog: REST, Glue, SQL).
-  - Without a catalog, the current snapshot is the newest `metadata/*.metadata.json`. Use a catalog when several writers commit concurrently.
-- **Caching.**
-  - Listings, Iceberg snapshots and scan plans are reused for `max_staleness` seconds (default 60).
-  - `refresh(tenant)` makes new data visible at once.
-- **Engines.**
-  - `engine="polars"` (default, extra `[read]`) is the fastest for repeated reads.
-  - `engine="duckdb"` (extra `[duckdb]`) uses about half the memory, starts fastest and gives SQL over `scan()` (`relation.query(...)`).
-  - Pass `duckdb_config={"home_directory": "/tmp"}` on AWS Lambda.
-  - DuckDB installs its `httpfs` and `iceberg` extensions on first use, unless `extension_directory` points to pre-installed ones.
-- **Credentials:**
-  - The same options as the client (`aws_region`, `aws_endpoint_url`, keys) or the AWS default chain.
-  - The reader role needs `s3:ListBucket` and `s3:GetObject` on the tenant's locations only.
-
-Measured on 3.16 M rows in 8 tenants on local disk, warm reads of one tenant.
-
-| Query | polars, Bronze | DuckDB, Bronze | polars, Iceberg | DuckDB, Iceberg |
-|---|---|---|---|---|
-| Aggregate one month | 14 ms | 47 ms | 8 ms | 15 ms |
-| 3 ids | 19 ms | 63 ms | 14 ms | 29 ms |
-| Keyset page of 1,000 | 23 ms | 48 ms | 20 ms | 24 ms |
-| Export 395 k rows to Arrow | 69 ms | 227 ms | 25 ms | 69 ms |
-
-- Peak memory: 86–174 MiB with DuckDB and 113–398 MiB with polars.
-- First query: about 300 ms with DuckDB and 600–950 ms with polars.
-- Listing only the tenant's prefix instead of the whole lake made reads 6.5x faster.
-- For comparison, Athena takes 0.5–2.5 s per query on similar data, plus queueing.
-
 ## Hooks
+
+A hook runs your own rule on each record of one contract, after schema validation:
 
 ```python
 from datalake_medallion_sdk import HookRegistry, PreIngestHookResult
@@ -283,53 +319,70 @@ def drop_test_accounts(record: dict) -> PreIngestHookResult:
     return PreIngestHookResult.accept(record)
 
 
-client = BronzeIngestionClient(registry, tenants=tenants, hooks=hooks.as_mapping())
+client = BronzeIngestionClient(contracts, tenants=tenants, hooks=hooks.as_mapping())
 ```
 
 ## Operations
 
-- **Credentials**: the AWS default chain (environment, profile, SSO, web identity, ECS/EC2 roles) unless `aws_access_key_id`/`aws_secret_access_key` are passed. The SDK never creates buckets; the writer role needs `s3:PutObject` on each tenant's bronze and quarantine locations only.
-- **S3-compatible stores**: `aws_endpoint_url=` (path-style addressing is enabled automatically).
-- **PII**: stored as received unless the tenant profile sets `pii_protection`. `IngestReport.pii_protection`, the `_dl_pii_protection`/`_dl_pii_key_ref` columns and each dead letter's `pii_protection` record what was applied.
+- **Credentials**: the AWS default chain (environment, profile, SSO, web identity, ECS/EC2 roles) unless `aws_access_key_id`/`aws_secret_access_key` are passed. The SDK never creates buckets; the writer role needs `s3:PutObject` on each tenant's bronze and quarantine locations only. See [IAM policy examples](docs/iam.md).
+- **S3-compatible stores** (MinIO, LocalStack, …): `aws_endpoint_url=` (path-style addressing is enabled automatically).
+- **Client options**: `max_record_bytes` (default 10 MiB), `max_future_skew_seconds` (default 3600, `None` disables), `on_invalid` (`"quarantine"` or `"raise"`), `envelope_prefix` (default `"_dl_"`).
 - **Retries**: `@datalake_retry()` retries `StorageError` only, with exponential backoff and jitter.
 - **Metrics**: `@emit_metrics(sink)` records duration, failures and record counts to logging, CloudWatch Embedded Metric Format or any `MetricsSink`.
-- **Concurrency**: one client per process serves every tenant and bucket; the S3 connection is created once and reused. Buckets must be reachable in the client's region.
+- **Concurrency**: one client and one reader per process serve every tenant and bucket; connections are created once and reused. Buckets must be reachable in the client's region.
+
+## Errors
+
+All errors derive from `DatalakeError`.
+
+| Exception | Raised when | What to do |
+|---|---|---|
+| `ContractBootError` | a contract does not compile, or a hook targets an unknown contract | fix the contract; the registry loads all-or-nothing |
+| `ConfigurationError` | invalid options or profile, unknown contract, a tenant id without `tenants=`, a reader engine that is not installed | fix the configuration |
+| `TenantViolationError` | invalid or unknown tenant id, a resolver returned another tenant, a reader filter on `tenant_id` | check the tenant id and the registry |
+| `ProtectionError` | the tenant's PII protection or key service failed; nothing was written | check KMS permissions and availability, then retry |
+| `StorageError` | S3 failed | retry (`@datalake_retry`); quarantine objects are not duplicated |
+| `MalformedPayloadError` | the batch is not JSON or Arrow | fix the input |
+| `SchemaViolationError`, `HookError`, `SemanticViolationError`, `TypeCoercionError` | a record is invalid and `on_invalid="raise"` | fix the record, or quarantine instead |
+
+## Upgrading from 0.1
+
+- The client has no bucket or prefixes any more: pass `tenants=` to the client and `tenant=` to each `ingest`.
+- **PII is no longer hashed by default.** To keep 0.1 behaviour, set `pii_protection=PiiProtection.sha256()` (was `pii_masking=True`) or `PiiProtection.hmac_sha256(key)` (was `pii_hmac_key`) on each tenant profile.
+- The `_dl_pii_masking` column is now `_dl_pii_protection`; `IngestReport.pii_masking` is now `pii_protection`.
+- Rejected records go to the tenant's `quarantine` location (`quarantine/` by default, was `dlq/`).
+
+See the [changelog](CHANGELOG.md) for the full list.
 
 ## Performance
 
-One batch of about 200 MiB (868,961 records, 7 fields of which 1 is PII), measured on 2026-10-17 on a laptop (AMD Ryzen 7 7730U, 8 cores / 16 threads, Windows 11) with `examples/throughput.rs`, built with `opt-level = 3` and LTO disabled (published wheels use LTO). `prepare` covers every validation level, PII protection and Parquet encoding, without network I/O. Peak heap is the memory allocated on top of the input.
-
-| Input | PII protection | Time | Throughput | Records/s | Peak heap | Parquet |
-|---|---|---|---|---|---|---|
-| Arrow | none (default) | 0.64 s | 326 MiB/s | 1.35 M | 173 MiB | 18 MiB |
-| Arrow | `sha256` | 0.89 s | 236 MiB/s | 0.98 M | 254 MiB | 71 MiB |
-| Arrow | `aes-256-gcm` | 1.03 s | 204 MiB/s | 0.85 M | 242 MiB | 59 MiB |
-| JSON text | none (default) | 2.76 s | 76 MiB/s | 0.32 M | 784 MiB | 18 MiB |
-| JSON text | `sha256` | 3.36 s | 62 MiB/s | 0.26 M | 895 MiB | 71 MiB |
-| JSON text | `aes-256-gcm` | 3.38 s | 62 MiB/s | 0.26 M | 940 MiB | 59 MiB |
-
-Arrow input is about 4x faster than JSON and needs less extra memory than its own size: accepted columns are reused without copying and only rows that may be invalid are converted. Protection costs 40-60% more time on Arrow, and protected values compress far less than the originals.
-
-Reproduce with `DL_BENCH_MB=200 cargo run --release --example throughput`; `cargo bench` runs the Criterion micro-benchmarks (contract checks, PII schemes, Parquet encoding, `prepare` by input type). Upload time depends on the network and is not included.
+A 200 MiB batch (869 k records) is validated, protected and encoded in 0.64 s from Arrow (326 MiB/s, 173 MiB peak heap) and 2.76 s from JSON text, without PII protection; protection adds 40–60%. Benchmarks, methodology and reader numbers are in [docs/performance.md](docs/performance.md).
 
 ## Rust crate
 
-The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, `TenantProfile`, `FieldProtector`, the `ObjectStorage` port with S3 and in-memory adapters). Disable the default `python` feature (`default-features = false`) to build without Python, for example for an AWS Lambda.
+The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, `TenantProfile`, `FieldProtector`, `DataKeyProvider`, the `ObjectStorage` port with S3 and in-memory adapters). It is not published on crates.io yet; depend on it from Git:
+
+```toml
+[dependencies]
+datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc4", default-features = false, features = ["aws-kms"] }
+```
+
+The library is imported as `_core` (`use _core::pipeline::BronzePipeline;`). `default-features = false` builds without Python, for example for an AWS Lambda; the `aws-kms` feature adds the KMS data key provider. The Rust API may change before 1.0.
 
 ## Development
 
 ```bash
-cargo test --all-targets            # Rust unit tests
 pip install -e ".[dev]"             # builds the extension with maturin
-pytest pytests                      # Python tests, including end-to-end against an in-process S3 emulator (moto)
+pytest pytests                      # Python tests, end-to-end against an in-process S3 emulator (moto)
+cargo test --all-targets            # Rust tests
 cargo clippy --all-targets -- -D warnings && ruff check python pytests && mypy
 ```
 
-Minimum supported Rust version: 1.94.1.
+Minimum supported Rust version: 1.94.1. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Scope
 
-The SDK covers Bronze-layer ingestion to S3 and S3-compatible stores, and tenant-scoped reads of Parquet and Iceberg tables in every layer. Silver/Gold transformations, writing Iceberg or Delta tables, catalog registration and other object stores are not part of this release.
+The SDK covers Bronze ingestion to S3 and S3-compatible stores, and tenant-scoped reads of Parquet and Iceberg tables in every layer. Silver/Gold transformations, writing Iceberg or Delta tables, catalog registration and other object stores are not part of this release.
 
 ## License
 

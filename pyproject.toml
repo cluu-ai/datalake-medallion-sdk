@@ -4,14 +4,14 @@ build-backend = "maturin"
 
 [project]
 name = "datalake-medallion-sdk"
-version = "0.2.0rc4"
-description = "Contract-enforced Bronze-layer ingestion for medallion data lakes: JSON Schema validation, PII pseudonymization, dead-letter quarantine and Hive-partitioned Parquet on S3"
+version = "0.2.0rc5"
+description = "Contract-enforced ingestion and tenant-scoped reads for multi-tenant medallion data lakes on S3: JSON Schema validation, per-tenant locations, optional PII protection (hash, HMAC, AES-256-GCM with per-tenant KMS keys), quarantine of invalid records, and Parquet/Iceberg reads without Athena"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-APACHE", "LICENSE-MIT", "NOTICE"]
 authors = [{ name = "Igor Ramirez Almanza" }]
-keywords = ["datalake", "medallion", "bronze", "parquet", "arrow", "data-contracts", "json-schema", "pii", "s3"]
+keywords = ["datalake", "medallion", "bronze", "parquet", "iceberg", "arrow", "data-contracts", "json-schema", "pii", "kms", "multi-tenant", "s3", "polars", "duckdb"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

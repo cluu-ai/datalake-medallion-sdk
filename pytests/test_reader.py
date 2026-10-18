@@ -27,7 +27,8 @@ pytest.importorskip("pyiceberg")
 
 MakeClient = Callable[..., BronzeIngestionClient]
 EVENTS = TableRef.bronze("login_event")
-ENGINES = ["polars", "duckdb"]
+# Every engine, reading S3 directly and through the object cache.
+ENGINES = ["polars", "duckdb", "polars+cache", "duckdb+cache"]
 
 
 @pytest.fixture
@@ -43,10 +44,13 @@ def make_reader(
 ) -> Iterator[Callable[..., LakeReader]]:
     readers: list[LakeReader] = []
 
+    engine, _, cache = request.param.partition("+")
+
     def make(**kwargs: Any) -> LakeReader:
         kwargs.setdefault("tenants", tenants)
+        kwargs.setdefault("cache_mb", 64 if cache else 0)
         reader = LakeReader(
-            engine=request.param,
+            engine=engine,
             aws_region="us-east-1",
             aws_endpoint_url=s3_endpoint,
             aws_access_key_id="test",
@@ -279,3 +283,58 @@ def test_shared_iceberg_table_needs_a_tenant_column(
     table.append(pa.table({"score": [1]}, schema=schema))
     with pytest.raises(TenantViolationError, match="tenant_id column"):
         make_reader().read("acme-001", TableRef.iceberg("gold", "no_tenant", location=location))
+
+
+async def test_object_cache_fetches_only_new_objects(
+    make_client: MakeClient, s3_endpoint: str, tenants: TenantRegistry
+) -> None:
+    client = make_client()
+    await ingest(client, "acme-001", 4)
+    reader = LakeReader(
+        tenants,
+        aws_region="us-east-1",
+        aws_endpoint_url=s3_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        cache_mb=16,
+        max_staleness=0,
+    )
+    loads: list[str] = []
+    objects = reader._objects
+    assert objects is not None
+    original = objects._load
+    objects._load = lambda path: loads.append(path) or original(path)  # type: ignore[method-assign]
+
+    assert reader.read("acme-001", EVENTS).num_rows == 4
+    assert len(loads) == 1
+    await ingest(client, "acme-001", 3, start=4)
+    rows = reader.read("acme-001", EVENTS, order_by=["attempts"])
+    assert rows.column("attempts").to_pylist() == list(range(7))
+    assert len(loads) == 2, "the first object came from the cache"
+    assert rows.column("year").type == pa.int64() and rows.column("tenant_id").type in (
+        pa.string(),
+        pa.large_string(),
+        pa.string_view(),
+    )
+    reader.close()
+
+
+async def test_table_larger_than_the_cache_is_read_from_s3(
+    make_client: MakeClient, s3_endpoint: str, tenants: TenantRegistry
+) -> None:
+    await ingest(make_client(), "acme-001", 5)
+    reader = LakeReader(
+        tenants,
+        aws_region="us-east-1",
+        aws_endpoint_url=s3_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        cache_mb=1,
+    )
+    assert reader._objects is not None
+    reader._objects._capacity = 10  # bytes: nothing fits
+    assert reader.read("acme-001", EVENTS).num_rows == 5
+    assert reader._objects._size == 0
+    with pytest.raises(ConfigurationError, match="cache_mb"):
+        LakeReader(tenants, cache_mb=-1)
+    reader.close()

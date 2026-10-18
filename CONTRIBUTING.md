@@ -27,11 +27,11 @@ pytest pytests
 cargo deny check
 ```
 
-The Rust integration test against LocalStack is ignored by default: `AWS_ENDPOINT_URL=http://localhost:4566 cargo test --lib -- --ignored`.
+The Rust integration test against LocalStack (optional, needs Docker) is ignored by default: `AWS_ENDPOINT_URL=http://localhost:4566 cargo test --lib -- --ignored`.
 
 ## Standards
 
-- Every record must go through `BronzePipeline::prepare`. Changes that add a path to storage that skips validation, PII hashing or the dead-letter flow are not accepted.
+- Every record must go through `BronzePipeline::prepare`. Changes that add a path to storage that skips validation, PII protection or the quarantine flow are not accepted.
 - No placeholders in shipped code: no `todo!`, no stubbed return values, no test-only functions in the public API. Documented behaviour must have a test.
 - Library code does not use `unwrap`, `expect` or `panic!` (enforced by clippy); errors are typed (`DatalakeError`).
 - Error messages, logs and dead-letter entries never include record values.

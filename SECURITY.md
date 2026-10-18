@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | yes       |
+| 0.2.x (including pre-releases) | yes |
+| 0.1.x   | security fixes until 0.2.0 is released |
 
 ## Reporting a vulnerability
 
@@ -20,7 +21,8 @@ Include the affected version, a description, reproduction steps and the impact y
 - **Key management**: with `PiiProtection.kms_envelope`, data keys come from the tenant's AWS KMS key with the encryption context `{tenant_id, purpose}`, are cached per tenant for at most one hour or 2^15 nonces, are never written or logged in clear and are wiped from memory when retired. Restrict `kms:GenerateDataKey` and `kms:Decrypt` with the `kms:EncryptionContext:tenant_id` condition so a role can only use keys of its tenant.
 - **No values in diagnostics**: schema errors are rendered with instance values masked, hook exceptions are reported by type only, and logs contain counts and identifiers only.
 - **Contracts are offline**: `$ref` resolution over the network or the file system is disabled.
-- **Least privilege**: the SDK never creates buckets; the writer role needs `s3:PutObject` on each tenant's bronze and quarantine locations only. Credentials are never logged and are redacted from `repr`/`Debug`.
+- **Reads stay in the tenant**: `LakeReader` lists only the tenant's prefix, binds the `tenant_id` filter itself and refuses shared tables without a `tenant_id` column. With the DuckDB engine, the `httpfs` and `iceberg` extensions are downloaded from the DuckDB extension repository on first use unless `extension_directory` points to pre-installed copies.
+- **Least privilege**: the SDK never creates buckets; the writer role needs `s3:PutObject` on each tenant's bronze and quarantine locations only, and readers `s3:ListBucket`/`s3:GetObject` on the tenant's prefixes ([policy examples](docs/iam.md)). Credentials are never logged and are redacted from `repr`/`Debug`.
 
 ## Supply chain
 

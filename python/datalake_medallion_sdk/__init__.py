@@ -1,17 +1,31 @@
-"""Contract-enforced Bronze-layer ingestion for medallion data lakes.
+"""Contract-enforced ingestion and tenant-scoped reads for medallion data lakes.
 
-Quick start::
+Quick start (see the README for the contract file)::
 
+    import asyncio
     from datalake_medallion_sdk import BronzeIngestionClient, ContractRegistry, TenantProfile
 
-    registry = ContractRegistry.from_directory("contracts")
-    client = BronzeIngestionClient(registry)
+    client = BronzeIngestionClient(ContractRegistry.from_directory("contracts"))
     acme = TenantProfile.for_bucket("acme-001", "acme-lake")
-    report = await client.ingest(
-        [{"event_id": "e1", "user_email": "a@b.c"}],
-        tenant=acme,
-        contract="security/login_event/1.0.0",
-    )
+
+
+    async def main() -> None:
+        report = await client.ingest(
+            [{"event_id": "0b7d6a52-3c1e-4f5e-9a4b-1f2d3c4b5a69",
+              "occurred_at": "2026-10-01T12:00:00Z", "outcome": "SUCCESS"}],
+            tenant=acme,
+            contract="security/login_event/1.0.0",
+        )
+        print(report.records_ok, report.data_uri)
+
+
+    asyncio.run(main())
+
+Read it back with ``LakeReader`` (extra ``[read]``)::
+
+    from datalake_medallion_sdk import LakeReader, TableRef
+
+    table = LakeReader().read(acme, TableRef.bronze("login_event"))
 """
 
 from __future__ import annotations

@@ -25,7 +25,9 @@ tables, never buckets, paths or tenant filters.
 
 Listings, Iceberg metadata and scan plans are cached per tenant and table for
 ``max_staleness`` seconds (60 by default), so repeated reads skip S3 listing
-and footer reads; :meth:`LakeReader.refresh` drops them earlier.
+and footer reads; :meth:`LakeReader.refresh` drops them earlier. With
+``cache_mb``, the contents of Parquet objects are kept in memory too: objects
+the SDK writes never change, so warm reads only fetch objects that are new.
 
 Engines (choose with ``engine=``):
 
@@ -39,10 +41,13 @@ from __future__ import annotations
 
 import logging
 import operator
+import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 from urllib.parse import urlsplit
@@ -149,6 +154,7 @@ class _Source:
 
     files: tuple[str, ...] = ()
     metadata_location: str | None = None
+    table: Any = None  # pyarrow.Table of the objects, when served from the object cache
 
     @property
     def empty(self) -> bool:
@@ -279,6 +285,85 @@ class _S3:
         return {k: v for k, v in opts.items() if v}
 
 
+def _partition_values(path: str) -> dict[str, str]:
+    return dict(seg.split("=", 1) for seg in path.split("/") if "=" in seg)
+
+
+class _ObjectCache:
+    """Arrow contents of Parquet objects by path, least recently used out.
+
+    Safe because the objects are immutable: the ingestion client writes each
+    object once under a unique name (a retry rewrites identical content), so
+    a cached object never goes stale; new objects are found by the listing.
+    """
+
+    def __init__(self, capacity_bytes: int, s3: _S3) -> None:
+        self._capacity = capacity_bytes
+        self._s3 = s3
+        self._tables: OrderedDict[str, pa.Table] = OrderedDict()
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def _load(self, path: str) -> pa.Table:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(path.removeprefix("s3://"), filesystem=self._s3.filesystem())
+        for key, value in _partition_values(path).items():
+            if key in table.column_names:
+                continue
+            if key in _INTEGER_PARTITIONS and value.isdigit():
+                column = pa.array([int(value)] * table.num_rows, pa.int64())
+            else:
+                column = pa.array([value] * table.num_rows, pa.string())
+            table = table.append_column(key, column)
+        return table
+
+    def table(self, files: Sequence[str]) -> pa.Table | None:
+        """All ``files`` as one table, fetching only the missing ones; None when
+        they do not fit in the cache."""
+        import pyarrow as pa
+
+        with self._lock:
+            missing = [f for f in files if f not in self._tables]
+        if missing:
+            with ThreadPoolExecutor(min(32, len(missing))) as pool:
+                loaded = dict(zip(missing, pool.map(self._load, missing), strict=True))
+            with self._lock:
+                for path, table in loaded.items():
+                    if path not in self._tables:
+                        self._tables[path] = table
+                        self._size += table.nbytes
+        with self._lock:
+            parts = []
+            for path in files:
+                cached = self._tables.get(path)
+                if cached is None:
+                    return None
+                self._tables.move_to_end(path)
+                parts.append(cached)
+            wanted = set(files)
+            while self._size > self._capacity and self._tables:
+                oldest = next(iter(self._tables))
+                if oldest in wanted:
+                    break
+                self._size -= self._tables.pop(oldest).nbytes
+            if self._size > self._capacity:
+                # This table alone does not fit: do not keep it.
+                for path in files:
+                    dropped = self._tables.pop(path, None)
+                    if dropped is not None:
+                        self._size -= dropped.nbytes
+                logger.warning("table larger than the reader cache; reading it from S3")
+                return None
+        return pa.concat_tables(parts, promote_options="permissive")
+
+    def clear(self) -> None:
+        with self._lock:
+            self._tables.clear()
+            self._size = 0
+
+
 def _require(module: str, extra: str) -> None:
     import importlib.util
 
@@ -299,7 +384,9 @@ class _PolarsEngine:
     def base(self, source: _Source, tenant_id: str, shared: bool) -> pl.LazyFrame:
         import polars as pl
 
-        if source.metadata_location is not None:
+        if source.table is not None:
+            frame = cast("pl.DataFrame", pl.from_arrow(source.table, rechunk=False)).lazy()
+        elif source.metadata_location is not None:
             _require("pyiceberg", "read")
             from pyiceberg.table import StaticTable
 
@@ -378,8 +465,19 @@ class _DuckDbEngine:
         _require("pyarrow", "duckdb")
         import duckdb
 
-        self._con = duckdb.connect(config=dict(config or {}))
+        settings = dict(config or {})
+        # Remote Parquet is I/O bound: more threads than cores keep more S3
+        # requests in flight.
+        settings.setdefault("threads", max(16, 4 * (os.cpu_count() or 1)))
+        self._con = duckdb.connect(config=settings)
         self._con.execute("INSTALL httpfs; LOAD httpfs;")
+        if "parquet_metadata_cache" not in settings:
+            # Reuse footers of objects already read; needs the parquet
+            # extension, which some builds load only on demand.
+            try:
+                self._con.execute("SET parquet_metadata_cache = true")
+            except duckdb.Error:
+                logger.debug("parquet_metadata_cache unavailable")
         secret = ["TYPE s3"]
         if s3.access_key_id and s3.secret_access_key:
             secret += [f"KEY_ID {_sql_literal(s3.access_key_id)}"]
@@ -409,28 +507,59 @@ class _DuckDbEngine:
                 self._iceberg = True
 
     def base(self, source: _Source, tenant_id: str, shared: bool) -> _DuckDbBase:
-        if source.metadata_location is not None:
+        if source.table is not None:
+            base = _DuckDbBase("arrow", source.table, None)
+        elif source.metadata_location is not None:
             self._ensure_iceberg()
-            relation = "iceberg_scan($source)"
-            params: dict[str, Any] = {"source": source.metadata_location}
+            sql = f"SELECT * FROM iceberg_scan({_sql_literal(source.metadata_location)})"  # noqa: S608
+            base = _DuckDbBase("sql", sql, None)
         else:
-            keys = {seg.split("=", 1)[0] for seg in source.files[0].split("/") if "=" in seg}
+            keys = _partition_values(source.files[0])
             types = ", ".join(f"'{k}': BIGINT" for k in _INTEGER_PARTITIONS if k in keys)
             hive = f", hive_types={{{types}}}" if types else ""
-            relation = f"read_parquet($source, hive_partitioning=true{hive})"
-            params = {"source": list(source.files)}
-        names = [
-            row[0]
-            for row in self._cursor()
-            .execute(f"DESCRIBE SELECT * FROM {relation}", params)  # noqa: S608
-            .fetchall()
-        ]
-        if TENANT_COLUMN in names:
-            params["tenant"] = tenant_id
-            return _DuckDbBase(relation, f'"{TENANT_COLUMN}" = $tenant', params)
+            files = ", ".join(_sql_literal(f) for f in source.files)
+            sql = f"SELECT * FROM read_parquet([{files}], hive_partitioning=true{hive})"  # noqa: S608
+            base = _DuckDbBase("sql", sql, None)
+        if TENANT_COLUMN in self._relation(base).columns:
+            return _DuckDbBase(base.kind, base.source, tenant_id)
         if shared:
             raise TenantViolationError("a shared table must have a tenant_id column")
-        return _DuckDbBase(relation, "true", params)
+        return base
+
+    def _relation(self, base: _DuckDbBase) -> duckdb.DuckDBPyRelation:
+        from duckdb import ColumnExpression, ConstantExpression
+
+        cursor = self._cursor()
+        if base.kind == "arrow":
+            relation = cursor.from_arrow(base.source)
+        else:
+            # Object paths are quoted literals; no caller value reaches SQL text.
+            relation = cursor.sql(base.source)
+        if base.tenant_id is not None:
+            # A constant, not a bound parameter, so DuckDB prunes Hive and
+            # Iceberg partitions with it.
+            relation = relation.filter(
+                ColumnExpression(TENANT_COLUMN) == ConstantExpression(base.tenant_id)
+            )
+        return relation
+
+    @staticmethod
+    def _expr(column: str, op: str, value: Any) -> Any:
+        from duckdb import ColumnExpression, ConstantExpression
+
+        col = ColumnExpression(column)
+        if op in ("in", "not in"):
+            member = col.isin(*(ConstantExpression(v) for v in value))
+            return member if op == "in" else ~member
+        compare: dict[str, Callable[[Any, Any], Any]] = {
+            "==": operator.eq,
+            "!=": operator.ne,
+            "<": operator.lt,
+            "<=": operator.le,
+            ">": operator.gt,
+            ">=": operator.ge,
+        }
+        return compare[op](col, ConstantExpression(value))
 
     def read(
         self,
@@ -440,31 +569,25 @@ class _DuckDbEngine:
         order: list[tuple[str, bool]],
         limit: int | None,
     ) -> pa.Table:
-        params = dict(base.params)
-        conditions = [base.condition]
-        sql_ops = {"==": "=", "!=": "<>"}
-        for i, (column, op, value) in enumerate(where):
-            name = f"p{i}"
-            params[name] = value
-            if op == "in":
-                conditions.append(f'"{column}" IN (SELECT unnest(${name}))')
-            elif op == "not in":
-                conditions.append(f'"{column}" NOT IN (SELECT unnest(${name}))')
-            else:
-                conditions.append(f'"{column}" {sql_ops.get(op, op)} ${name}')
-        select = ", ".join(f'"{c}"' for c in columns) if columns is not None else "*"
-        # Identifiers are validated and quoted; every value is a bound parameter.
-        sql = f"SELECT {select} FROM {base.relation} WHERE {' AND '.join(conditions)}"  # noqa: S608
+        from duckdb import ColumnExpression
+
+        relation = self._relation(base)
+        for column, op, value in where:
+            relation = relation.filter(self._expr(column, op, value))
         if order:
-            sql += " ORDER BY " + ", ".join(f'"{c}" {"DESC" if d else "ASC"}' for c, d in order)
+            # Identifiers are validated; values are expression constants.
+            relation = relation.order(
+                ", ".join(f'"{c}" {"DESC" if d else "ASC"}' for c, d in order)
+            )
+        if columns is not None:
+            relation = relation.project(*(ColumnExpression(c) for c in columns))
         if limit is not None:
-            sql += f" LIMIT {int(limit)}"
-        result = self._cursor().execute(sql, params).arrow()
+            relation = relation.limit(limit)
+        result = relation.arrow()
         return cast("pa.Table", result.read_all() if hasattr(result, "read_all") else result)
 
     def scan(self, base: _DuckDbBase) -> duckdb.DuckDBPyRelation:
-        sql = f"SELECT * FROM {base.relation} WHERE {base.condition}"  # noqa: S608
-        return self._cursor().sql(sql, params=dict(base.params))
+        return self._relation(base)
 
     def empty(self) -> duckdb.DuckDBPyRelation:
         return self._cursor().sql("SELECT NULL AS empty WHERE false")
@@ -475,9 +598,9 @@ class _DuckDbEngine:
 
 @dataclass(frozen=True, slots=True)
 class _DuckDbBase:
-    relation: str
-    condition: str
-    params: dict[str, Any]
+    kind: Literal["sql", "arrow"]
+    source: Any  # SQL of the scan, or a pyarrow.Table
+    tenant_id: str | None  # tenant filter, when the data has a tenant_id column
 
 
 class LakeReader:
@@ -502,6 +625,11 @@ class LakeReader:
             ``identifier`` (REST, Glue, SQL, ...); optional.
         duckdb_config: DuckDB settings such as ``memory_limit``, ``threads``,
             ``home_directory`` or ``extension_directory``.
+        cache_mb: memory for the contents of Parquet objects already read (0,
+            the default, disables it). Objects written by the ingestion
+            client never change, so warm reads fetch only objects that are new
+            since the last listing. A table larger than the cache is read from
+            S3; Iceberg tables are not cached.
 
     Raises:
         ConfigurationError: unknown engine, engine not installed, or invalid
@@ -521,6 +649,7 @@ class LakeReader:
         max_staleness: float = 60.0,
         catalog: Catalog | None = None,
         duckdb_config: dict[str, Any] | None = None,
+        cache_mb: int = 0,
     ) -> None:
         if (
             tenants is not None
@@ -547,6 +676,9 @@ class LakeReader:
             self._engine = _DuckDbEngine(self._s3, duckdb_config)
         else:
             raise ConfigurationError(f"engine must be 'polars' or 'duckdb', got {engine!r}")
+        if isinstance(cache_mb, bool) or not isinstance(cache_mb, int) or cache_mb < 0:
+            raise ConfigurationError("cache_mb must be a non-negative integer")
+        self._objects = _ObjectCache(cache_mb << 20, self._s3) if cache_mb else None
         self._max_staleness = max_staleness
         self._catalog = catalog
         self._cache: dict[tuple[str, TableRef], _Entry] = {}
@@ -636,6 +768,8 @@ class LakeReader:
         """Release the engine (DuckDB connection) and caches."""
         with self._lock:
             self._cache.clear()
+        if self._objects is not None:
+            self._objects.clear()
         if isinstance(self._engine, _DuckDbEngine):
             self._engine.close()
 
@@ -691,7 +825,8 @@ class LakeReader:
                 for info in self._s3.list(self._prefix(profile, table))
                 if info.path.endswith(".parquet") and info.size
             )
-            return _Source(files=tuple(files))
+            cached = self._objects.table(files) if self._objects is not None and files else None
+            return _Source(files=tuple(files), table=cached)
         if table.metadata_location is not None:
             return _Source(metadata_location=table.metadata_location)
         if table.identifier is not None:
