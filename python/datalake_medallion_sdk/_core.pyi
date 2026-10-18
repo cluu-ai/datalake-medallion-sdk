@@ -15,6 +15,7 @@ __all__ = [
     "HookError",
     "IngestReport",
     "MalformedPayloadError",
+    "PiiDecryptor",
     "PiiProtection",
     "ProtectionError",
     "RecordRejectedError",
@@ -83,6 +84,24 @@ class PiiProtection:
         ``CiphertextBlob`` returned by AWS KMS ``GenerateDataKey``.
         """
     @staticmethod
+    def kms_envelope(
+        kms_key_id: str,
+        *,
+        data_key_max_age: float = 3600.0,
+        max_nonce_prefixes_per_key: int = 32768,
+        region: str | None = None,
+        endpoint_url: str | None = None,
+    ) -> PiiProtection:
+        """AES-256-GCM with a data key per tenant from an AWS KMS key, cached and
+        reused until it is ``data_key_max_age`` seconds old (default 1 hour, 60 s
+        to 24 h) or has drawn ``max_nonce_prefixes_per_key`` nonces (default 2^15).
+        Data keys carry the encryption context ``{tenant_id, purpose}``."""
+    @staticmethod
+    def envelope(
+        provider: Any, *, data_key_max_age: float = 3600.0, max_nonce_prefixes_per_key: int = 32768
+    ) -> PiiProtection:
+        """AES-256-GCM with data keys from any ``DataKeyProvider`` object, cached per tenant."""
+    @staticmethod
     def custom(protector: Any) -> PiiProtection:
         """Wrap an object implementing :class:`datalake_medallion_sdk.FieldProtector`."""
     @property
@@ -143,6 +162,13 @@ class TenantRegistry:
     """Immutable directory of tenant profiles, looked up by tenant id."""
 
     def __new__(cls, profiles: Iterable[TenantProfile]) -> TenantRegistry: ...
+    @staticmethod
+    def from_config(config: Mapping[str, Any] | str | PathLike[str]) -> TenantRegistry:
+        """Registry from a configuration document: a dict, or the path of a JSON file.
+
+        Unknown fields are rejected; secrets never live in the document (HMAC keys
+        come from the environment variable named by ``key_env``).
+        """
     def get(self, tenant_id: str) -> TenantProfile:
         """Profile of ``tenant_id``; raises :class:`TenantViolationError` when unknown."""
     def tenant_ids(self) -> list[str]: ...
@@ -257,3 +283,28 @@ class BronzeIngestionClient:
     def tenant_ids(self) -> list[str]: ...
     @property
     def hooked_contracts(self) -> list[str]: ...
+
+@final
+class PiiDecryptor:
+    """Reads AES-256-GCM PII values back, recovering each data key once and caching it."""
+
+    @staticmethod
+    def kms(
+        *,
+        region: str | None = None,
+        endpoint_url: str | None = None,
+        cache_size: int = 1024,
+        max_age: float = 3600.0,
+    ) -> PiiDecryptor:
+        """Decryptor for keys issued by AWS KMS (``kms1:`` key references)."""
+    @staticmethod
+    def from_provider(
+        provider: Any, *, cache_size: int = 1024, max_age: float = 3600.0
+    ) -> PiiDecryptor:
+        """Decryptor for keys from a ``DataKeyProvider`` object."""
+    def decrypt(self, token: str, *, tenant_id: str, field: str, key_ref: str) -> str:
+        """Decrypt one token written for ``tenant_id`` and ``field`` with ``key_ref``."""
+    def decrypt_many(
+        self, tokens: Iterable[str | None], *, tenant_id: str, field: str, key_ref: str
+    ) -> list[str | None]:
+        """Decrypt a column (``None`` stays ``None``) without holding the GIL."""

@@ -464,6 +464,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-kms"
+version = "1.123.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bbe8833a7ad3b970f2a6a856939c9cb171942dcdfd2ab65f2db3a8baaf73cc1"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.152.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1204,12 +1229,13 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "datalake-medallion-sdk"
-version = "0.2.0-rc.3"
+version = "0.2.0-rc.4"
 dependencies = [
  "aes-gcm",
  "arrow",
  "async-trait",
  "aws-config",
+ "aws-sdk-kms",
  "aws-sdk-s3",
  "base64",
  "bytes",
@@ -1229,6 +1255,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "zeroize",
 ]
 
 [[package]]

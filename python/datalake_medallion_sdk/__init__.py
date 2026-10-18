@@ -26,6 +26,7 @@ from ._core import (
     HookError,
     IngestReport,
     MalformedPayloadError,
+    PiiDecryptor,
     PiiProtection,
     ProtectionError,
     RecordRejectedError,
@@ -54,7 +55,7 @@ from .metrics import (
     Metric,
     MetricsSink,
 )
-from .tenancy import FieldProtector, TenantResolver
+from .tenancy import DataKeyProvider, FieldProtector, TenantResolver
 
 # PEP 440 version of the installed distribution (the Rust crate uses SemVer,
 # e.g. 0.1.0-rc.1 for 0.1.0rc1).
@@ -66,6 +67,7 @@ __all__ = [
     "ConfigurationError",
     "ContractBootError",
     "ContractRegistry",
+    "DataKeyProvider",
     "DatalakeError",
     "EmfMetricsSink",
     "FieldProtector",
@@ -79,6 +81,7 @@ __all__ = [
     "MalformedPayloadError",
     "Metric",
     "MetricsSink",
+    "PiiDecryptor",
     "PiiProtection",
     "PreIngestHookResult",
     "ProtectionError",

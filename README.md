@@ -128,6 +128,19 @@ await client.ingest(rows, tenant=acme, contract="security/login_event/1.0.0")  #
 
 `tenants=` also accepts a function `(tenant_id) -> TenantProfile`, to load profiles from your own configuration store; a profile returned for another tenant is rejected.
 
+Profiles can also come from a configuration document (a dict or a JSON file) with `TenantRegistry.from_config(...)`; unknown fields are rejected and secrets never live in it:
+
+```json
+{"tenants": [{
+  "tenant_id": "acme-001",
+  "bronze": "s3://acme-lake/bronze", "quarantine": "s3://acme-lake/quarantine",
+  "pii_protection": {"scheme": "aes-256-gcm", "provider": "aws-kms",
+                     "kms_key_id": "alias/lake-acme-001", "data_key_max_age_seconds": 3600}
+}]}
+```
+
+`pii_protection` is optional (`none`, `sha256`, `hmac-sha256` with `key_env` naming the environment variable that holds the key, or `aes-256-gcm` with `aws-kms`).
+
 ## PII protection
 
 Off by default: PII fields keep their declared type and value. Set `pii_protection` on a tenant profile to protect them in Bronze and in the dead letters:
@@ -136,31 +149,31 @@ Off by default: PII fields keep their declared type and value. Set `pii_protecti
 |---|---|---|---|
 | `sha256` | `sha256()` | 64 hex chars | no; low-entropy values can be guessed |
 | `hmac-sha256` | `hmac_sha256(key)` | 64 hex chars, equal values still join | no; keep the 16+ byte key outside the lake |
-| `aes-256-gcm` | `aes_256_gcm(data_key, key_ref=...)` | `v1:` + base64url token | yes, with the data key |
+| `aes-256-gcm` | `kms_envelope(kms_key_id)` (recommended) or `aes_256_gcm(data_key, key_ref=...)` | `v1:` + base64url token | yes, with the data key |
 | your own | `custom(obj)` | whatever `obj.protect_batch` returns | your choice |
 
-Per-tenant keys with AWS KMS (envelope encryption): the SDK encrypts locally and never calls KMS or stores the plaintext key.
+Per-tenant keys with AWS KMS (envelope encryption, recommended for reversible protection):
 
 ```python
-import base64
-
-import boto3
-
-kms = boto3.client("kms")
-
-
-def load_profile(tenant_id: str) -> TenantProfile:
-    key = kms.generate_data_key(KeyId=f"alias/lake-{tenant_id}", KeySpec="AES_256")
-    protection = PiiProtection.aes_256_gcm(
-        key["Plaintext"], key_ref=base64.b64encode(key["CiphertextBlob"]).decode()
-    )
-    return TenantProfile.for_bucket(tenant_id, "acme-lake", pii_protection=protection)
-
-
-client = BronzeIngestionClient(registry, tenants=load_profile)
+protection = PiiProtection.kms_envelope("alias/lake-acme-001")  # the tenant's KMS key
+acme = TenantProfile.for_bucket("acme-001", "acme-lake", pii_protection=protection)
 ```
 
-Cache the profiles (and so the data keys) for as long as your key policy allows. Each value is authenticated with its tenant and field, so it cannot be moved to another tenant or column. To read it back, decrypt the `_dl_pii_key_ref` value with KMS and call `PiiProtection.aes_256_gcm(plaintext_key, key_ref=...).decrypt(token, tenant_id=..., field=...)`.
+The SDK asks KMS for a data key the first time a tenant needs one and reuses it until it is one hour old or has drawn 2^15 nonces (`data_key_max_age`, `max_nonce_prefixes_per_key`), refreshing it ahead of expiry. Keys are cached per tenant and never shared; if KMS fails and the current key has expired, the call fails with `ProtectionError` and nothing is written. Data keys carry the encryption context `{"tenant_id": <tenant>, "purpose": "datalake-medallion-sdk/pii"}`, so IAM can restrict each role to its tenant, CloudTrail shows which tenant every key belongs to, and a key reference copied to another tenant cannot be decrypted. The plaintext key lives only in memory; `_dl_pii_key_ref` stores `kms1:<key arn>:<encrypted key>`. Any other key service plugs in through the `DataKeyProvider` protocol (`generate`, `decrypt`) and `PiiProtection.envelope(provider)`.
+
+Reading protected values back (one `Decrypt` per data key, not per value):
+
+```python
+reader = PiiDecryptor.kms()
+emails = reader.decrypt_many(
+    table.column("user_email").to_pylist(),
+    tenant_id="acme-001",
+    field="user_email",
+    key_ref=table.column("_dl_pii_key_ref")[0].as_py(),
+)
+```
+
+Least-privilege IAM for this scheme: the ingestion role needs `kms:GenerateDataKey` and readers `kms:Decrypt` on the tenant's key, both with the condition `"StringEquals": {"kms:EncryptionContext:tenant_id": "<tenant>"}`. Enable automatic rotation of the KMS key; old data keys keep working. Encrypt only what must be reversible: tokens do not compress, so encrypted columns cost more to store and scan; HMAC suits fields that only need to be joined.
 
 A custom scheme is any object with a `scheme` name, an optional `key_ref` and `protect_batch(tenant_id, field, values) -> list[str]` (the `FieldProtector` protocol). It is called once per field and batch, so it can reach a key service in bulk; if it raises, the call fails with `ProtectionError` and nothing is written.
 

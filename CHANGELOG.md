@@ -23,6 +23,9 @@ Breaking changes to the client API: the next release is 0.2.0.
 - `TenantRegistry`, `TenantProfile.location()` and `TenantProfile.table_uri()` for resolving tenant locations, including Silver and Gold.
 - `examples/throughput.rs`: end-to-end throughput and peak heap on a large batch for each input type and protection scheme.
 - `PreparedBatch::encoded_bytes()`: size of the objects a commit will upload.
+- PII envelope encryption with cached data keys: `PiiProtection.kms_envelope(kms_key_id)` (AWS KMS, Rust feature `aws-kms`) and `PiiProtection.envelope(provider)` for any `DataKeyProvider`. One data key per tenant, reused until it is 1 hour old or has drawn 2^15 nonces, refreshed ahead of expiry, never shared between tenants; failures with an expired key write nothing. KMS data keys carry the encryption context `{tenant_id, purpose}` and key references record the key ARN (`kms1:`). Protection stays optional.
+- `PiiDecryptor` (`.kms()`, `.from_provider()`) to read protected values back, with `decrypt_many` for whole columns outside the GIL.
+- `TenantRegistry.from_config(dict | path)`: tenant profiles from a strict configuration document (unknown fields rejected, HMAC keys from environment variables).
 - Rust: `BronzePipeline::commit` takes `&PreparedBatch`, so a failed upload can be retried without re-validating or re-encoding; the retry rewrites the same keys and duplicates neither Bronze rows nor dead letters.
 - Rust: the Python bindings are behind the default `python` feature. Rust applications (for example an AWS Lambda) can depend on the crate with `default-features = false` and need no Python interpreter or `libpython`.
 

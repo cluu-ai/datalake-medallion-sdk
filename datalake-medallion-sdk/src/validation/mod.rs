@@ -16,7 +16,10 @@
 //! the dead-letter prefix (with PII fields hashed when masking is on), unless the
 //! pipeline runs with [`crate::pipeline::InvalidRecordPolicy::Reject`].
 
+#[cfg(feature = "aws-kms")]
+pub mod aws_kms;
 pub mod hooks;
+pub mod keys;
 pub mod pii;
 pub mod semantic;
 

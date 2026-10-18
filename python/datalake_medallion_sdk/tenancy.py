@@ -7,7 +7,7 @@ from typing import Protocol, runtime_checkable
 
 from ._core import TenantProfile
 
-__all__ = ["FieldProtector", "TenantResolver"]
+__all__ = ["DataKeyProvider", "FieldProtector", "TenantResolver"]
 
 TenantResolver = Callable[[str], TenantProfile]
 """Host function returning the :class:`TenantProfile` of a tenant id.
@@ -35,4 +35,23 @@ class FieldProtector(Protocol):
 
     def protect_batch(self, tenant_id: str, field: str, values: list[str]) -> list[str]:
         """Protect ``values`` of ``field`` for ``tenant_id``."""
+        ...
+
+
+@runtime_checkable
+class DataKeyProvider(Protocol):
+    """Issues and recovers data keys for ``PiiProtection.envelope`` and ``PiiDecryptor``.
+
+    Implement it to use a key service other than AWS KMS (GCP KMS, Azure Key
+    Vault, HashiCorp Vault, ...). The SDK caches data keys per tenant, so these
+    methods are called about once per tenant and cache period. Raise to fail:
+    nothing is written, and only the exception type is reported.
+    """
+
+    def generate(self, tenant_id: str) -> tuple[bytes, str]:
+        """Return a new 32-byte data key for ``tenant_id`` and its key reference."""
+        ...
+
+    def decrypt(self, tenant_id: str, key_ref: str) -> bytes:
+        """Return the 32-byte data key behind ``key_ref`` (issued for ``tenant_id``)."""
         ...

@@ -221,6 +221,11 @@ impl TenantProfile {
         self.protector.as_deref()
     }
 
+    /// Shared handle on the PII protector, for binding it to one call.
+    pub(crate) fn protector_arc(&self) -> Option<Arc<dyn FieldProtector>> {
+        self.protector.clone()
+    }
+
     /// Scheme name of the PII protector, or `none`.
     #[must_use]
     pub fn pii_scheme(&self) -> &str {

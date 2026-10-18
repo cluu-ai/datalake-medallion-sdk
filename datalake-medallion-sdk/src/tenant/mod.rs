@@ -5,6 +5,7 @@
 //! medallion layer and how its PII is protected, and every object key keeps
 //! the tenant in a `tenant_id=` Hive partition.
 
+pub mod config;
 pub mod id;
 pub mod path;
 pub mod profile;
