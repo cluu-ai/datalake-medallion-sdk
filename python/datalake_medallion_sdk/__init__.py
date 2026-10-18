@@ -55,6 +55,7 @@ from .metrics import (
     Metric,
     MetricsSink,
 )
+from .reader import LakeReader, TableRef
 from .tenancy import DataKeyProvider, FieldProtector, TenantResolver
 
 # PEP 440 version of the installed distribution (the Rust crate uses SemVer,
@@ -77,6 +78,7 @@ __all__ = [
     "HookStatus",
     "InMemoryMetricsSink",
     "IngestReport",
+    "LakeReader",
     "LoggingMetricsSink",
     "MalformedPayloadError",
     "Metric",
@@ -89,6 +91,7 @@ __all__ = [
     "SchemaViolationError",
     "SemanticViolationError",
     "StorageError",
+    "TableRef",
     "TenantProfile",
     "TenantRegistry",
     "TenantResolver",

@@ -7,7 +7,7 @@
 
 Contract-enforced Bronze-layer ingestion for medallion data lakes, with a Rust core and a Python API.
 
-Every record is checked against a JSON Schema data contract before anything is written. Valid records become one Hive-partitioned Parquet object with lineage columns; invalid records go to a dead-letter prefix with the reason attached. Every call names its tenant, and the tenant's profile decides where its data goes. Fields the contract marks as PII are stored as received by default; a tenant profile can protect them with SHA-256, HMAC-SHA256, AES-256-GCM envelope encryption (for example a KMS data key per tenant) or a scheme of your own, in the data and in the dead letters alike.
+Every record is checked against a JSON Schema data contract before anything is written. Valid records become one Hive-partitioned Parquet object with lineage columns; invalid records go to a dead-letter prefix with the reason attached. Every call names its tenant, and the tenant's profile decides where its data goes. Fields the contract marks as PII are stored as received by default; a tenant profile can protect them with SHA-256, HMAC-SHA256, AES-256-GCM envelope encryption (for example a KMS data key per tenant) or a scheme of your own, in the data and in the dead letters alike. `LakeReader` reads a tenant's Parquet and Iceberg tables back straight from S3, without Athena or Glue.
 
 ```python
 import asyncio
@@ -46,7 +46,7 @@ print(report.records_ok, report.records_quarantined, report.rejections)
 pip install datalake-medallion-sdk
 ```
 
-Wheels are `abi3` (one wheel per platform for CPython 3.12+) for Linux (glibc and musl, x86_64 and aarch64), macOS on Apple silicon and Windows x86_64. Other platforms, including Intel macOS, build from the source distribution and need a Rust toolchain. There are no mandatory Python dependencies: Arrow input uses the [PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html), so pyarrow and Polars are optional.
+Wheels are `abi3` (one wheel per platform for CPython 3.12+) for Linux (glibc and musl, x86_64 and aarch64), macOS on Apple silicon and Windows x86_64. Other platforms, including Intel macOS, build from the source distribution and need a Rust toolchain. There are no mandatory Python dependencies: Arrow input uses the [PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html), so pyarrow and Polars are optional. Reading the lake uses the `[read]` extra (Polars, pyarrow, pyiceberg) or the `[duckdb]` extra.
 
 ## What happens to a record
 
@@ -203,6 +203,71 @@ Lineage columns (prefix `_dl_`, configurable):
 
 `ingest` accepts a `dict`, a list of dicts, JSON `str`/`bytes`, or any object implementing the Arrow PyCapsule interface, such as a pyarrow `Table`/`RecordBatch` or a Polars `DataFrame`. Arrow rows get the same validation and the same results as JSON; when every rule of the contract applies to one field at a time, Arrow input is checked column by column and only rows that may be invalid are converted to JSON. Validation and encoding run in Rust outside the GIL.
 
+## Reading the lake
+
+`LakeReader` reads one tenant's Parquet and Iceberg tables directly from S3 with an in-process engine. It needs no Athena query, no Glue table and no query queue. Results are Arrow tables.
+
+```python
+import polars as pl
+from datalake_medallion_sdk import LakeReader, TableRef
+
+reader = LakeReader(tenants=tenants)  # pip install "datalake-medallion-sdk[read]"
+
+page = reader.read(
+    "acme-001",
+    TableRef.bronze("login_event"),
+    columns=["event_id", "occurred_at"],
+    where=[("occurred_at", ">", last_seen)],  # pushed down to the scan
+    order_by=["occurred_at", "event_id"],
+    limit=1000,  # keyset pagination
+)
+
+summary = TableRef.iceberg(
+    "gold", "compliance_summary", location="s3://lake-gold/compliance_summary"
+)
+by_framework = (
+    reader.scan("acme-001", summary).group_by("framework").agg(pl.col("total").sum()).collect()
+)
+```
+
+- **Tenant isolation.**
+  - Callers name a tenant and a table, never a bucket, a path or a tenant filter. Filtering on `tenant_id` is rejected.
+  - Parquet objects are listed only below the tenant's prefix (`TenantProfile.table_uri`).
+  - A `tenant_id` filter is always applied when the data has that column.
+  - A shared Iceberg table without a `tenant_id` column is refused.
+- **Tables.**
+  - `TableRef.bronze(data_type)` reads the ingestion client's output.
+  - `TableRef.parquet(layer, name)` reads Hive-partitioned Parquet in Silver or Gold.
+  - `TableRef.iceberg(layer, name)` reads an Iceberg table:
+    - by default, the table in the tenant's location;
+    - for a shared table, one of `location=`, `metadata_location=` or `identifier=` (with `catalog=`, any pyiceberg catalog: REST, Glue, SQL).
+  - Without a catalog, the current snapshot is the newest `metadata/*.metadata.json`. Use a catalog when several writers commit concurrently.
+- **Caching.**
+  - Listings, Iceberg snapshots and scan plans are reused for `max_staleness` seconds (default 60).
+  - `refresh(tenant)` makes new data visible at once.
+- **Engines.**
+  - `engine="polars"` (default, extra `[read]`) is the fastest for repeated reads.
+  - `engine="duckdb"` (extra `[duckdb]`) uses about half the memory, starts fastest and gives SQL over `scan()` (`relation.query(...)`).
+  - Pass `duckdb_config={"home_directory": "/tmp"}` on AWS Lambda.
+  - DuckDB installs its `httpfs` and `iceberg` extensions on first use, unless `extension_directory` points to pre-installed ones.
+- **Credentials:**
+  - The same options as the client (`aws_region`, `aws_endpoint_url`, keys) or the AWS default chain.
+  - The reader role needs `s3:ListBucket` and `s3:GetObject` on the tenant's locations only.
+
+Measured on 3.16 M rows in 8 tenants on local disk, warm reads of one tenant.
+
+| Query | polars, Bronze | DuckDB, Bronze | polars, Iceberg | DuckDB, Iceberg |
+|---|---|---|---|---|
+| Aggregate one month | 14 ms | 47 ms | 8 ms | 15 ms |
+| 3 ids | 19 ms | 63 ms | 14 ms | 29 ms |
+| Keyset page of 1,000 | 23 ms | 48 ms | 20 ms | 24 ms |
+| Export 395 k rows to Arrow | 69 ms | 227 ms | 25 ms | 69 ms |
+
+- Peak memory: 86–174 MiB with DuckDB and 113–398 MiB with polars.
+- First query: about 300 ms with DuckDB and 600–950 ms with polars.
+- Listing only the tenant's prefix instead of the whole lake made reads 6.5x faster.
+- For comparison, Athena takes 0.5–2.5 s per query on similar data, plus queueing.
+
 ## Hooks
 
 ```python
@@ -264,7 +329,7 @@ Minimum supported Rust version: 1.94.1.
 
 ## Scope
 
-The SDK covers Bronze-layer ingestion to S3 and S3-compatible stores. Tenant profiles already define Silver and Gold locations for downstream readers; Silver/Gold transformations, table formats (Iceberg/Delta), catalog registration and other object stores are not part of this release.
+The SDK covers Bronze-layer ingestion to S3 and S3-compatible stores, and tenant-scoped reads of Parquet and Iceberg tables in every layer. Silver/Gold transformations, writing Iceberg or Delta tables, catalog registration and other object stores are not part of this release.
 
 ## License
 
