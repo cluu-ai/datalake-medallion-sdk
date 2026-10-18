@@ -6,24 +6,38 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-Breaking changes to the client API: the next release is 0.2.0.
+## [0.2.0rc5] - 2026-10-18
+
+### Added
+
+- `LakeReader(cache_mb=...)`: keeps the contents of Parquet objects in memory (least recently used out). Objects written by the ingestion client never change, so warm reads fetch only new objects. On AWS Lambda against S3, warm Bronze reads of one tenant went from 0.9-1.1 s to 5-27 ms with Polars.
+- Documentation: quickstart-first README, IAM policy examples (`docs/iam.md`), performance on AWS (`docs/performance.md`), an errors table and upgrade notes from 0.1.
+
+### Changed
+
+- `LakeReader` with DuckDB builds filters with DuckDB expressions instead of bound parameters, so tenant and caller filters prune Hive and Iceberg partitions (an Iceberg aggregate went from 3.1 s to 71 ms on S3), and uses more threads than cores for S3 reads.
+- Package description and keywords cover reads and per-tenant keys; SECURITY.md lists 0.2.x as supported.
+
+## [0.2.0rc4] - 2026-10-18
+
+Pre-release on TestPyPI (0.2.0rc1 to rc4 were published as the work progressed). Breaking changes to the client API; see *Upgrading from 0.1* in the README.
 
 ### Changed (breaking)
 
 - Micro-tenancy: the client no longer has a bucket or prefixes. Each `ingest(batch, tenant=..., contract=...)` names its tenant, as a `TenantProfile` or as an id resolved through `tenants=` (a `TenantRegistry` or a function `(tenant_id) -> TenantProfile`). The profile fixes the tenant's Bronze and quarantine locations (`s3://bucket/prefix`, any bucket), optional Silver and Gold locations, the partition order and the PII protection. Profiles are validated when built: required layers, safe prefixes, valid buckets, and no two layers sharing or nesting a location.
-- PII is stored as received by default. Protection is set per tenant with `PiiProtection.sha256()`, `.hmac_sha256(key)`, `.aes_256_gcm(data_key, key_ref=...)` or `.custom(obj)`. The `pii_masking` and `pii_hmac_key` client options and the per-call `pii_masking` override are removed.
+- PII is stored as received by default (it was hashed by default in 0.1). Protection is set per tenant with `PiiProtection.sha256()`, `.hmac_sha256(key)`, `.kms_envelope(kms_key_id)`, `.envelope(provider)`, `.aes_256_gcm(data_key, key_ref=...)` or `.custom(obj)`. The `pii_masking` and `pii_hmac_key` client options and the per-call `pii_masking` override are removed.
 - `_dl_pii_masking` is renamed `_dl_pii_protection`; `IngestReport.pii_masking` is renamed `pii_protection`; `IngestReport.tenant_id` is new. Dead letters record `pii_protection`.
 - Dead letters go to the tenant's `quarantine` location (`quarantine/` by default, was `dlq/`).
 - Rust: `BronzePipeline::new` no longer takes a path resolver, `IngestRequest` carries an `Arc<TenantProfile>`, and `ObjectStorage::put` receives the full object path including the bucket. `BronzePathResolver` and `PiiHasher` are replaced by `TenantProfile` and `FieldProtector`.
 
 ### Added
 
-- AES-256-GCM envelope encryption for PII with a host-provided data key (for example an AWS KMS data key per tenant). Values are authenticated with their tenant and field; the key reference is stored in the new `_dl_pii_key_ref` column. `PiiProtection.decrypt` reads values back.
+- AES-256-GCM encryption for PII. Values are authenticated with their tenant and field; the key reference is stored in the new `_dl_pii_key_ref` column. `PiiProtection.decrypt` reads values back with a known data key.
 - `FieldProtector` (Rust trait and Python protocol) for custom protection schemes, called once per field and batch. A failing protector raises `ProtectionError` and nothing is written.
 - `TenantRegistry`, `TenantProfile.location()` and `TenantProfile.table_uri()` for resolving tenant locations, including Silver and Gold.
-- `examples/throughput.rs`: end-to-end throughput and peak heap on a large batch for each input type and protection scheme.
+- `datalake-medallion-sdk/examples/throughput.rs`: end-to-end throughput and peak heap on a large batch for each input type and protection scheme.
 - `PreparedBatch::encoded_bytes()`: size of the objects a commit will upload.
-- PII envelope encryption with cached data keys: `PiiProtection.kms_envelope(kms_key_id)` (AWS KMS, Rust feature `aws-kms`) and `PiiProtection.envelope(provider)` for any `DataKeyProvider`. One data key per tenant, reused until it is 1 hour old or has drawn 2^15 nonces, refreshed ahead of expiry, never shared between tenants; failures with an expired key write nothing. KMS data keys carry the encryption context `{tenant_id, purpose}` and key references record the key ARN (`kms1:`). Protection stays optional.
+- Envelope encryption with cached data keys: `PiiProtection.kms_envelope(kms_key_id)` (AWS KMS, Rust feature `aws-kms`) and `PiiProtection.envelope(provider)` for any `DataKeyProvider`. One data key per tenant, reused until it is 1 hour old or has drawn 2^15 nonces, refreshed ahead of expiry, never shared between tenants; failures with an expired key write nothing. KMS data keys carry the encryption context `{tenant_id, purpose}` and key references record the key ARN (`kms1:`). Protection stays optional.
 - `PiiDecryptor` (`.kms()`, `.from_provider()`) to read protected values back, with `decrypt_many` for whole columns outside the GIL.
 - `LakeReader` and `TableRef`: tenant-scoped reads of Bronze Parquet and of Silver/Gold Parquet or Iceberg tables straight from S3, without Athena or Glue. `read()` (projection, pushed-down filters, ordering, keyset pages) returns Arrow; `scan()` returns a tenant-filtered Polars `LazyFrame` or DuckDB relation. Objects are listed only below the tenant's prefix, `tenant_id` filters are bound by the reader, and listings and snapshots are cached for `max_staleness`. Engines: Polars (default, extra `[read]`) or DuckDB (extra `[duckdb]`).
 - `TenantRegistry.from_config(dict | path)`: tenant profiles from a strict configuration document (unknown fields rejected, HMAC keys from environment variables).
