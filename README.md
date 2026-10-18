@@ -7,7 +7,7 @@
 
 Contract-enforced Bronze-layer ingestion for medallion data lakes, with a Rust core and a Python API.
 
-Every record is checked against a JSON Schema data contract before anything is written. Valid records become one Hive-partitioned Parquet object with lineage columns; invalid records go to a dead-letter prefix with the reason attached. Every call names its tenant, and the tenant's profile decides where its data goes. Fields the contract marks as PII are stored as received by default; a tenant profile can protect them with SHA-256, HMAC-SHA256, AES-256-GCM envelope encryption (for example a KMS data key per tenant) or a scheme of your own, in the data and in the dead letters alike.
+Every record is checked against a JSON Schema data contract before anything is written. Valid records become one Hive-partitioned Parquet object with lineage columns; invalid records go to a dead-letter prefix with the reason attached. Every call names its tenant, and the tenant's profile decides where its data goes. Fields the contract marks as PII are stored as received by default; a tenant profile can protect them with SHA-256, HMAC-SHA256, AES-256-GCM envelope encryption (for example a KMS data key per tenant) or a scheme of your own, in the data and in the dead letters alike. `LakeReader` reads a tenant's Parquet and Iceberg tables back straight from S3, without Athena or Glue.
 
 ```python
 import asyncio
@@ -46,7 +46,7 @@ print(report.records_ok, report.records_quarantined, report.rejections)
 pip install datalake-medallion-sdk
 ```
 
-Wheels are `abi3` (one wheel per platform for CPython 3.12+) for Linux (glibc and musl, x86_64 and aarch64), macOS on Apple silicon and Windows x86_64. Other platforms, including Intel macOS, build from the source distribution and need a Rust toolchain. There are no mandatory Python dependencies: Arrow input uses the [PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html), so pyarrow and Polars are optional.
+Wheels are `abi3` (one wheel per platform for CPython 3.12+) for Linux (glibc and musl, x86_64 and aarch64), macOS on Apple silicon and Windows x86_64. Other platforms, including Intel macOS, build from the source distribution and need a Rust toolchain. There are no mandatory Python dependencies: Arrow input uses the [PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html), so pyarrow and Polars are optional. Reading the lake uses the `[read]` extra (Polars, pyarrow, pyiceberg) or the `[duckdb]` extra.
 
 ## What happens to a record
 
@@ -128,6 +128,19 @@ await client.ingest(rows, tenant=acme, contract="security/login_event/1.0.0")  #
 
 `tenants=` also accepts a function `(tenant_id) -> TenantProfile`, to load profiles from your own configuration store; a profile returned for another tenant is rejected.
 
+Profiles can also come from a configuration document (a dict or a JSON file) with `TenantRegistry.from_config(...)`; unknown fields are rejected and secrets never live in it:
+
+```json
+{"tenants": [{
+  "tenant_id": "acme-001",
+  "bronze": "s3://acme-lake/bronze", "quarantine": "s3://acme-lake/quarantine",
+  "pii_protection": {"scheme": "aes-256-gcm", "provider": "aws-kms",
+                     "kms_key_id": "alias/lake-acme-001", "data_key_max_age_seconds": 3600}
+}]}
+```
+
+`pii_protection` is optional (`none`, `sha256`, `hmac-sha256` with `key_env` naming the environment variable that holds the key, or `aes-256-gcm` with `aws-kms`).
+
 ## PII protection
 
 Off by default: PII fields keep their declared type and value. Set `pii_protection` on a tenant profile to protect them in Bronze and in the dead letters:
@@ -136,31 +149,31 @@ Off by default: PII fields keep their declared type and value. Set `pii_protecti
 |---|---|---|---|
 | `sha256` | `sha256()` | 64 hex chars | no; low-entropy values can be guessed |
 | `hmac-sha256` | `hmac_sha256(key)` | 64 hex chars, equal values still join | no; keep the 16+ byte key outside the lake |
-| `aes-256-gcm` | `aes_256_gcm(data_key, key_ref=...)` | `v1:` + base64url token | yes, with the data key |
+| `aes-256-gcm` | `kms_envelope(kms_key_id)` (recommended) or `aes_256_gcm(data_key, key_ref=...)` | `v1:` + base64url token | yes, with the data key |
 | your own | `custom(obj)` | whatever `obj.protect_batch` returns | your choice |
 
-Per-tenant keys with AWS KMS (envelope encryption): the SDK encrypts locally and never calls KMS or stores the plaintext key.
+Per-tenant keys with AWS KMS (envelope encryption, recommended for reversible protection):
 
 ```python
-import base64
-
-import boto3
-
-kms = boto3.client("kms")
-
-
-def load_profile(tenant_id: str) -> TenantProfile:
-    key = kms.generate_data_key(KeyId=f"alias/lake-{tenant_id}", KeySpec="AES_256")
-    protection = PiiProtection.aes_256_gcm(
-        key["Plaintext"], key_ref=base64.b64encode(key["CiphertextBlob"]).decode()
-    )
-    return TenantProfile.for_bucket(tenant_id, "acme-lake", pii_protection=protection)
-
-
-client = BronzeIngestionClient(registry, tenants=load_profile)
+protection = PiiProtection.kms_envelope("alias/lake-acme-001")  # the tenant's KMS key
+acme = TenantProfile.for_bucket("acme-001", "acme-lake", pii_protection=protection)
 ```
 
-Cache the profiles (and so the data keys) for as long as your key policy allows. Each value is authenticated with its tenant and field, so it cannot be moved to another tenant or column. To read it back, decrypt the `_dl_pii_key_ref` value with KMS and call `PiiProtection.aes_256_gcm(plaintext_key, key_ref=...).decrypt(token, tenant_id=..., field=...)`.
+The SDK asks KMS for a data key the first time a tenant needs one and reuses it until it is one hour old or has drawn 2^15 nonces (`data_key_max_age`, `max_nonce_prefixes_per_key`), refreshing it ahead of expiry. Keys are cached per tenant and never shared; if KMS fails and the current key has expired, the call fails with `ProtectionError` and nothing is written. Data keys carry the encryption context `{"tenant_id": <tenant>, "purpose": "datalake-medallion-sdk/pii"}`, so IAM can restrict each role to its tenant, CloudTrail shows which tenant every key belongs to, and a key reference copied to another tenant cannot be decrypted. The plaintext key lives only in memory; `_dl_pii_key_ref` stores `kms1:<key arn>:<encrypted key>`. Any other key service plugs in through the `DataKeyProvider` protocol (`generate`, `decrypt`) and `PiiProtection.envelope(provider)`.
+
+Reading protected values back (one `Decrypt` per data key, not per value):
+
+```python
+reader = PiiDecryptor.kms()
+emails = reader.decrypt_many(
+    table.column("user_email").to_pylist(),
+    tenant_id="acme-001",
+    field="user_email",
+    key_ref=table.column("_dl_pii_key_ref")[0].as_py(),
+)
+```
+
+Least-privilege IAM for this scheme: the ingestion role needs `kms:GenerateDataKey` and readers `kms:Decrypt` on the tenant's key, both with the condition `"StringEquals": {"kms:EncryptionContext:tenant_id": "<tenant>"}`. Enable automatic rotation of the KMS key; old data keys keep working. Encrypt only what must be reversible: tokens do not compress, so encrypted columns cost more to store and scan; HMAC suits fields that only need to be joined.
 
 A custom scheme is any object with a `scheme` name, an optional `key_ref` and `protect_batch(tenant_id, field, values) -> list[str]` (the `FieldProtector` protocol). It is called once per field and batch, so it can reach a key service in bulk; if it raises, the call fails with `ProtectionError` and nothing is written.
 
@@ -189,6 +202,71 @@ Lineage columns (prefix `_dl_`, configurable):
 ## Inputs
 
 `ingest` accepts a `dict`, a list of dicts, JSON `str`/`bytes`, or any object implementing the Arrow PyCapsule interface, such as a pyarrow `Table`/`RecordBatch` or a Polars `DataFrame`. Arrow rows get the same validation and the same results as JSON; when every rule of the contract applies to one field at a time, Arrow input is checked column by column and only rows that may be invalid are converted to JSON. Validation and encoding run in Rust outside the GIL.
+
+## Reading the lake
+
+`LakeReader` reads one tenant's Parquet and Iceberg tables directly from S3 with an in-process engine. It needs no Athena query, no Glue table and no query queue. Results are Arrow tables.
+
+```python
+import polars as pl
+from datalake_medallion_sdk import LakeReader, TableRef
+
+reader = LakeReader(tenants=tenants)  # pip install "datalake-medallion-sdk[read]"
+
+page = reader.read(
+    "acme-001",
+    TableRef.bronze("login_event"),
+    columns=["event_id", "occurred_at"],
+    where=[("occurred_at", ">", last_seen)],  # pushed down to the scan
+    order_by=["occurred_at", "event_id"],
+    limit=1000,  # keyset pagination
+)
+
+summary = TableRef.iceberg(
+    "gold", "compliance_summary", location="s3://lake-gold/compliance_summary"
+)
+by_framework = (
+    reader.scan("acme-001", summary).group_by("framework").agg(pl.col("total").sum()).collect()
+)
+```
+
+- **Tenant isolation.**
+  - Callers name a tenant and a table, never a bucket, a path or a tenant filter. Filtering on `tenant_id` is rejected.
+  - Parquet objects are listed only below the tenant's prefix (`TenantProfile.table_uri`).
+  - A `tenant_id` filter is always applied when the data has that column.
+  - A shared Iceberg table without a `tenant_id` column is refused.
+- **Tables.**
+  - `TableRef.bronze(data_type)` reads the ingestion client's output.
+  - `TableRef.parquet(layer, name)` reads Hive-partitioned Parquet in Silver or Gold.
+  - `TableRef.iceberg(layer, name)` reads an Iceberg table:
+    - by default, the table in the tenant's location;
+    - for a shared table, one of `location=`, `metadata_location=` or `identifier=` (with `catalog=`, any pyiceberg catalog: REST, Glue, SQL).
+  - Without a catalog, the current snapshot is the newest `metadata/*.metadata.json`. Use a catalog when several writers commit concurrently.
+- **Caching.**
+  - Listings, Iceberg snapshots and scan plans are reused for `max_staleness` seconds (default 60).
+  - `refresh(tenant)` makes new data visible at once.
+- **Engines.**
+  - `engine="polars"` (default, extra `[read]`) is the fastest for repeated reads.
+  - `engine="duckdb"` (extra `[duckdb]`) uses about half the memory, starts fastest and gives SQL over `scan()` (`relation.query(...)`).
+  - Pass `duckdb_config={"home_directory": "/tmp"}` on AWS Lambda.
+  - DuckDB installs its `httpfs` and `iceberg` extensions on first use, unless `extension_directory` points to pre-installed ones.
+- **Credentials:**
+  - The same options as the client (`aws_region`, `aws_endpoint_url`, keys) or the AWS default chain.
+  - The reader role needs `s3:ListBucket` and `s3:GetObject` on the tenant's locations only.
+
+Measured on 3.16 M rows in 8 tenants on local disk, warm reads of one tenant.
+
+| Query | polars, Bronze | DuckDB, Bronze | polars, Iceberg | DuckDB, Iceberg |
+|---|---|---|---|---|
+| Aggregate one month | 14 ms | 47 ms | 8 ms | 15 ms |
+| 3 ids | 19 ms | 63 ms | 14 ms | 29 ms |
+| Keyset page of 1,000 | 23 ms | 48 ms | 20 ms | 24 ms |
+| Export 395 k rows to Arrow | 69 ms | 227 ms | 25 ms | 69 ms |
+
+- Peak memory: 86–174 MiB with DuckDB and 113–398 MiB with polars.
+- First query: about 300 ms with DuckDB and 600–950 ms with polars.
+- Listing only the tenant's prefix instead of the whole lake made reads 6.5x faster.
+- For comparison, Athena takes 0.5–2.5 s per query on similar data, plus queueing.
 
 ## Hooks
 
@@ -251,7 +329,7 @@ Minimum supported Rust version: 1.94.1.
 
 ## Scope
 
-The SDK covers Bronze-layer ingestion to S3 and S3-compatible stores. Tenant profiles already define Silver and Gold locations for downstream readers; Silver/Gold transformations, table formats (Iceberg/Delta), catalog registration and other object stores are not part of this release.
+The SDK covers Bronze-layer ingestion to S3 and S3-compatible stores, and tenant-scoped reads of Parquet and Iceberg tables in every layer. Silver/Gold transformations, writing Iceberg or Delta tables, catalog registration and other object stores are not part of this release.
 
 ## License
 

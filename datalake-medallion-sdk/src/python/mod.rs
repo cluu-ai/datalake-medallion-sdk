@@ -18,5 +18,6 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<tenancy::PyPiiProtection>()?;
     m.add_class::<tenancy::PyTenantProfile>()?;
     m.add_class::<tenancy::PyTenantRegistry>()?;
+    m.add_class::<tenancy::PyPiiDecryptor>()?;
     Ok(())
 }

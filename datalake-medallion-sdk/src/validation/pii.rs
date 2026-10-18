@@ -21,6 +21,8 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use aes_gcm::aead::{Aead, Nonce, Payload};
 use aes_gcm::Aes256Gcm;
@@ -71,6 +73,20 @@ pub trait FieldProtector: Send + Sync + fmt::Debug {
     /// `<envelope-prefix>pii_key_ref` column; `None` for one-way schemes.
     fn key_ref(&self) -> Option<&str> {
         None
+    }
+
+    /// Fixes the protector for one ingest call of `tenant_id`, so every field
+    /// and the `<envelope-prefix>pii_key_ref` column of the call use the same
+    /// key. Schemes with a key per tenant and period (such as
+    /// [`EnvelopeProtector`](super::keys::EnvelopeProtector)) return the
+    /// current one; `None` (the default) means this protector is used as is.
+    ///
+    /// # Errors
+    ///
+    /// [`DatalakeError::Protection`] when no usable key can be obtained; the
+    /// call then fails before anything is written.
+    fn bind(&self, _tenant_id: &str) -> Result<Option<Arc<dyn FieldProtector>>, DatalakeError> {
+        Ok(None)
     }
 
     /// Protects one value.
@@ -272,6 +288,9 @@ impl FieldProtector for HmacSha256Hasher {
 pub struct Aes256GcmEncryptor {
     cipher: Aes256Gcm,
     key_ref: String,
+    /// Random nonce draws so far: one per `protect` call and one 64-bit
+    /// prefix per `protect_batch` call. Key caches rotate on it.
+    nonces: AtomicU64,
 }
 
 impl Aes256GcmEncryptor {
@@ -295,7 +314,17 @@ impl Aes256GcmEncryptor {
         }
         let cipher = Aes256Gcm::new_from_slice(data_key)
             .map_err(|_| DatalakeError::config("invalid AES-256-GCM data key"))?;
-        Ok(Self { cipher, key_ref })
+        Ok(Self {
+            cipher,
+            key_ref,
+            nonces: AtomicU64::new(0),
+        })
+    }
+
+    /// Random nonce values drawn with this key so far.
+    #[must_use]
+    pub fn nonces_used(&self) -> u64 {
+        self.nonces.load(Ordering::Relaxed)
     }
 
     fn aad(ctx: &ProtectionContext<'_>) -> Vec<u8> {
@@ -385,6 +414,7 @@ impl FieldProtector for Aes256GcmEncryptor {
     }
 
     fn protect(&self, ctx: &ProtectionContext<'_>, value: &str) -> Result<String, DatalakeError> {
+        self.nonces.fetch_add(1, Ordering::Relaxed);
         self.seal(random_bytes::<12>()?, &Self::aad(ctx), value)
     }
 
@@ -398,6 +428,7 @@ impl FieldProtector for Aes256GcmEncryptor {
                 "AES-256-GCM batches are limited to 2^32 values per field",
             ));
         }
+        self.nonces.fetch_add(1, Ordering::Relaxed);
         let prefix = random_bytes::<8>()?;
         let aad = Self::aad(ctx);
         let seal = |(i, v): (usize, &&str)| {

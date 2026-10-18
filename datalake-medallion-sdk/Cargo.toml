@@ -32,6 +32,8 @@ async-trait = "0.1"
 aws-config = "1"
 # Without the legacy `rustls` feature (hyper 0.14 + rustls 0.21 stack).
 aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+# Optional (feature `aws-kms`): data keys for PII envelope encryption.
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio"], optional = true }
 bytes = "1"
 
 # Columnar data
@@ -56,6 +58,7 @@ hex = "0.4"
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
 base64 = "0.23"
 getrandom = "0.4"
+zeroize = "1"
 
 # Identifiers and time
 ulid = "3"
@@ -69,7 +72,9 @@ thiserror = "2"
 tracing = "0.1"
 
 [features]
-default = ["python"]
+default = ["python", "aws-kms"]
+# AWS KMS adapter for `DataKeyProvider` (PII envelope encryption with a KMS key per tenant).
+aws-kms = ["dep:aws-sdk-kms"]
 # Python bindings (the `datalake_medallion_sdk._core` extension module). Rust
 # applications can use `default-features = false` and need no Python at all.
 python = ["dep:pyo3", "dep:pyo3-async-runtimes", "arrow/pyarrow"]

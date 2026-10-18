@@ -298,11 +298,16 @@ impl BronzePipeline {
     /// when encoding fails.
     pub fn prepare(&self, request: IngestRequest) -> Result<PreparedBatch, DatalakeError> {
         let contract = Arc::clone(self.registry.get(&request.contract)?);
+        // One key for the whole call: every field and the key_ref column agree.
+        let bound = match request.tenant.protector_arc() {
+            None => None,
+            Some(p) => Some(p.bind(request.tenant.tenant_id().as_str())?.unwrap_or(p)),
+        };
         let call = CallContext {
             tenant: &request.tenant,
             batch_id: Ulid::generate().to_string(),
             now: Utc::now(),
-            protector: request.tenant.protector(),
+            protector: bound.as_deref(),
         };
         let Decoded {
             received,
@@ -1406,6 +1411,92 @@ mod tests {
             .filter(|k| k.starts_with("beta-lake/"))
             .count();
         assert_eq!((acme_keys, beta_keys), (2, 2));
+    }
+
+    /// Provider that counts issued keys; key n has bytes n+1.
+    #[derive(Debug, Default)]
+    struct CountingProvider(std::sync::atomic::AtomicUsize);
+
+    impl crate::validation::keys::DataKeyProvider for CountingProvider {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn name(&self) -> &str {
+            "counting"
+        }
+        fn generate(
+            &self,
+            tenant_id: &str,
+        ) -> Result<crate::validation::keys::DataKey, DatalakeError> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            #[allow(clippy::cast_possible_truncation)]
+            Ok(crate::validation::keys::DataKey {
+                plaintext: zeroize::Zeroizing::new(vec![n as u8 + 1; 32]),
+                key_ref: format!("count:{tenant_id}:{n}"),
+            })
+        }
+        fn decrypt(
+            &self,
+            _: &str,
+            key_ref: &str,
+        ) -> Result<zeroize::Zeroizing<Vec<u8>>, DatalakeError> {
+            let n: u8 = key_ref.rsplit(':').next().unwrap().parse().unwrap();
+            Ok(zeroize::Zeroizing::new(vec![n + 1; 32]))
+        }
+    }
+
+    #[tokio::test]
+    async fn envelope_protection_reuses_one_data_key_per_tenant() {
+        use crate::validation::keys::{EnvelopeProtector, KeyCachePolicy, PiiDecryptor};
+        let storage = InMemoryStorage::new();
+        let p = pipeline(&storage);
+        let provider = Arc::new(CountingProvider::default());
+        let envelope = Arc::new(
+            EnvelopeProtector::new(
+                Arc::clone(&provider) as Arc<dyn crate::validation::keys::DataKeyProvider>,
+                KeyCachePolicy::default(),
+            )
+            .unwrap(),
+        );
+        let tenant = profile(Some(envelope as Arc<dyn FieldProtector>));
+        let mut key_refs = Vec::new();
+        let mut tokens = Vec::new();
+        for i in 0..3 {
+            let report = p
+                .ingest(IngestRequest::new(
+                    Arc::clone(&tenant),
+                    CONTRACT,
+                    RecordSource::Values(vec![
+                        json!({"event_id": format!("e{i}"), "user_email": EMAIL}),
+                        json!({"event_id": i, "user_email": EMAIL}),
+                    ]),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(report.pii_protection, "aes-256-gcm");
+            let batch = read_parquet(&storage, report.data_uri.as_ref().unwrap());
+            key_refs.extend(string_column(&batch, "_dl_pii_key_ref"));
+            tokens.extend(string_column(&batch, "user_email"));
+            let dead = read_dlq(&storage, &report.dlq_uris[0]);
+            assert!(dead[0].payload.as_ref().unwrap()["user_email"]
+                .as_str()
+                .unwrap()
+                .starts_with("v1:"));
+        }
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one data key for three calls"
+        );
+        assert!(key_refs.iter().all(|k| k == &key_refs[0]));
+        assert!(!contains(&all_bytes(&storage), EMAIL));
+        let reader = PiiDecryptor::new(provider, 4, std::time::Duration::from_secs(60)).unwrap();
+        for token in &tokens {
+            assert_eq!(
+                reader
+                    .decrypt("acme-001", "user_email", &key_refs[0], token)
+                    .unwrap(),
+                EMAIL
+            );
+        }
     }
 
     #[derive(Debug)]
