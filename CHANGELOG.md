@@ -23,6 +23,7 @@ Breaking changes to the client API: the next release is 0.2.0.
 - `TenantRegistry`, `TenantProfile.location()` and `TenantProfile.table_uri()` for resolving tenant locations, including Silver and Gold.
 - `examples/throughput.rs`: end-to-end throughput and peak heap on a large batch for each input type and protection scheme.
 - `PreparedBatch::encoded_bytes()`: size of the objects a commit will upload.
+- Rust: `BronzePipeline::commit` takes `&PreparedBatch`, so a failed upload can be retried without re-validating or re-encoding; the retry rewrites the same keys and duplicates neither Bronze rows nor dead letters.
 - Rust: the Python bindings are behind the default `python` feature. Rust applications (for example an AWS Lambda) can depend on the crate with `default-features = false` and need no Python interpreter or `libpython`.
 
 ### Performance
