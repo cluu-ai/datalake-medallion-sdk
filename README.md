@@ -236,7 +236,7 @@ Reproduce with `DL_BENCH_MB=200 cargo run --release --example throughput`; `carg
 
 ## Rust crate
 
-The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, the `ObjectStorage` port with S3 and in-memory adapters). See the crate documentation.
+The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, `TenantProfile`, `FieldProtector`, the `ObjectStorage` port with S3 and in-memory adapters). Disable the default `python` feature (`default-features = false`) to build without Python, for example for an AWS Lambda.
 
 ## Development
 

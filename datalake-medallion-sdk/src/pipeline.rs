@@ -284,7 +284,7 @@ impl BronzePipeline {
     /// See [`prepare`](Self::prepare) and [`commit`](Self::commit).
     pub async fn ingest(&self, request: IngestRequest) -> Result<IngestReport, DatalakeError> {
         let prepared = self.prepare(request)?;
-        self.commit(prepared).await
+        self.commit(&prepared).await
     }
 
     /// Runs Levels 2 to 8 and encodes the output. Performs no I/O.
@@ -368,11 +368,15 @@ impl BronzePipeline {
 
     /// Uploads a prepared batch: dead-letter objects first, then data.
     ///
+    /// The batch is not consumed, so a failed upload can be retried with the
+    /// same `prepared` value: it writes the same object keys again, without
+    /// re-validating or re-encoding and without duplicating Bronze rows or
+    /// dead letters.
+    ///
     /// # Errors
     ///
-    /// [`DatalakeError::Storage`] from the storage adapter. Retrying the same
-    /// records is safe for the Bronze layer; dead-letter entries may repeat.
-    pub async fn commit(&self, prepared: PreparedBatch) -> Result<IngestReport, DatalakeError> {
+    /// [`DatalakeError::Storage`] from the storage adapter.
+    pub async fn commit(&self, prepared: &PreparedBatch) -> Result<IngestReport, DatalakeError> {
         for object in prepared.dead_letters.iter().chain(prepared.data.iter()) {
             self.storage
                 .put(&object.path, object.body.clone(), object.content_type)
@@ -387,7 +391,7 @@ impl BronzePipeline {
             quarantined = r.records_quarantined,
             "bronze batch committed"
         );
-        Ok(prepared.report)
+        Ok(prepared.report.clone())
     }
 
     /// Decodes the input. Arrow input is screened column by column first when
@@ -1490,6 +1494,50 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// Fails the first `failures` writes, then stores.
+    struct FailFirst {
+        failures: Mutex<usize>,
+        inner: InMemoryStorage,
+    }
+
+    #[async_trait]
+    impl ObjectStorage for FailFirst {
+        async fn put(
+            &self,
+            path: &ObjectPath,
+            body: Bytes,
+            content_type: &str,
+        ) -> Result<(), DatalakeError> {
+            {
+                let mut left = self.failures.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(DatalakeError::storage("s3", "throttled"));
+                }
+            }
+            self.inner.put(path, body, content_type).await
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_can_be_retried_without_duplicates() {
+        let inner = InMemoryStorage::new();
+        let storage = Arc::new(FailFirst {
+            failures: Mutex::new(1),
+            inner: inner.clone(),
+        });
+        let p = pipeline_with(storage, PipelineConfig::default(), &[schema()]);
+        let prepared = p
+            .prepare(request(vec![json!({"event_id": "ok"}), json!({})]))
+            .unwrap();
+        assert!(p.commit(&prepared).await.is_err());
+        let report = p.commit(&prepared).await.unwrap();
+        assert_eq!(&report, prepared.report());
+        // Same keys rewritten: one dead-letter object and one data object.
+        assert_eq!(inner.len(), 2);
+        assert_eq!(read_dlq(&inner, &report.dlq_uris[0]).len(), 1);
     }
 
     #[tokio::test]

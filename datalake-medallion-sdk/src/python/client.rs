@@ -248,7 +248,7 @@ impl PyBronzeIngestionClient {
                 .map_err(|e| {
                     DatalakeError::storage("runtime", format!("validation task failed: {e}"))
                 })??;
-            let report = pipeline.commit(prepared).await?;
+            let report = pipeline.commit(&prepared).await?;
             Ok(PyIngestReport::from(report))
         })
     }

@@ -49,6 +49,7 @@
 // pyo3's build script passes /fuse-ld=lld, which link.exe reports as LNK4044.
 #![cfg_attr(target_env = "msvc", allow(linker_messages))]
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 mod codec;
@@ -58,6 +59,7 @@ pub mod dlq;
 pub mod envelope;
 pub mod error;
 pub mod pipeline;
+#[cfg(feature = "python")]
 mod python;
 pub mod storage;
 pub mod tenant;
@@ -66,6 +68,7 @@ pub mod validation;
 pub use error::DatalakeError;
 
 /// Native module `datalake_medallion_sdk._core`.
+#[cfg(feature = "python")]
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     python::register(m)

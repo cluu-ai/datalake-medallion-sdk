@@ -4,10 +4,13 @@
 //! instance values masked, and PII fields are hashed before any record is
 //! serialized into a dead-letter entry.
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use thiserror::Error;
 
-use crate::validation::{level, Rejection};
+#[cfg(any(feature = "python", test))]
+use crate::validation::level;
+use crate::validation::Rejection;
 
 /// Every error the SDK can return.
 #[derive(Debug, Error)]
@@ -117,6 +120,7 @@ impl DatalakeError {
 }
 
 /// Python exception classes exposed by the native module.
+#[cfg(feature = "python")]
 pub mod exceptions {
     use pyo3::create_exception;
     use pyo3::exceptions::PyException;
@@ -195,6 +199,7 @@ pub mod exceptions {
     );
 }
 
+#[cfg(feature = "python")]
 impl From<DatalakeError> for PyErr {
     fn from(err: DatalakeError) -> Self {
         use exceptions as ex;
@@ -221,6 +226,7 @@ impl From<DatalakeError> for PyErr {
 }
 
 /// Registers the exception classes on the native module.
+#[cfg(feature = "python")]
 pub(crate) fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     use exceptions as ex;
     let py = m.py();
