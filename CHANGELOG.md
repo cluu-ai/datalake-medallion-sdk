@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0rc8] - 2026-10-19
+
+### Changed
+
+- `ingest_file` reads S3 objects with parallel ranged requests: 4 ranges of 8 MiB in flight, about 32 MiB of buffer. Compressed files are decompressed on the fly. Inside a Lambda a single S3 stream reached about 37 MiB/s; on AWS `ingest_file` went from 11.9 to 5.5 s for 468 MB of CSV and from 20.6 to 10.2 s for 793 MB of JSON Lines.
+- `PiiDecryptor.decrypt_column` processes the token column chunk by chunk (no combined copy) and takes key references as a dictionary: an index per row plus the distinct references, instead of a long string per row. Memory added for 3.1 M values with real KMS references: +934 MiB with `decrypt_many`, +91 MiB with `decrypt_column`. Rust: `KeyRefs::Indexed`.
+
 ## [0.2.0rc7] - 2026-10-19
 
 ### Added

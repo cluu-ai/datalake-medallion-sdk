@@ -256,19 +256,22 @@ The SDK asks KMS for a data key the first time a tenant needs one and reuses it 
 
 Data keys carry the encryption context `{"tenant_id": <tenant>, "purpose": "datalake-medallion-sdk/pii"}`, so IAM can restrict each role to its tenant, CloudTrail shows which tenant every key belongs to, and a key copied to another tenant cannot be decrypted. The plaintext key lives only in memory; `_dl_pii_key_ref` stores `kms1:<key arn>:<encrypted key>`. Other key services (GCP KMS, Azure Key Vault, Vault, …) plug in through the `DataKeyProvider` protocol (`generate`, `decrypt`) and `PiiProtection.envelope(provider)`.
 
-**Reading protected values back** (one `Decrypt` per data key, not per value):
+**Reading protected values back** (one `Decrypt` per data key, not per value). Prefer `decrypt_column`: Arrow in and out, in parallel. Read `_dl_pii_key_ref` as a dictionary so the long key reference is not repeated per row:
 
 ```python
+import pyarrow.parquet as pq
 from datalake_medallion_sdk import PiiDecryptor
 
-table = reader.read("acme-001", TableRef.bronze("login_event"))  # see Reading the lake
-emails = PiiDecryptor.kms().decrypt_many(
-    table.column("user_email").to_pylist(),
+table = pq.read_table(uri, read_dictionary=["_dl_pii_key_ref"])  # or reader.read(...)
+emails = PiiDecryptor.kms().decrypt_column(  # a pyarrow StringArray
+    table.column("user_email"),
     tenant_id="acme-001",
     field="user_email",
-    key_ref=table.column("_dl_pii_key_ref")[0].as_py(),  # rows of one batch share a key
+    key_refs=table.column("_dl_pii_key_ref"),  # rows may use different data keys
 )
 ```
+
+`decrypt_many(list, key_ref=...)` remains for small lists of Python strings.
 
 Grant the ingestion role `kms:GenerateDataKey` and readers `kms:Decrypt` on the tenant's key, both conditioned on `kms:EncryptionContext:tenant_id` ([policy examples](docs/iam.md)). Enable automatic rotation of the KMS key; old data keys keep working. Encrypt only what must be reversible: tokens do not compress, so encrypted columns cost more to store and scan; HMAC suits fields that only need to be joined.
 
@@ -410,7 +413,7 @@ The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, `TenantProfi
 
 ```toml
 [dependencies]
-datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc7", default-features = false, features = ["aws-kms"] }
+datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc8", default-features = false, features = ["aws-kms"] }
 ```
 
 The library is imported as `_core` (`use _core::pipeline::BronzePipeline;`). `default-features = false` builds without Python, for example for an AWS Lambda; the `aws-kms` feature adds the KMS data key provider. The Rust API may change before 1.0.

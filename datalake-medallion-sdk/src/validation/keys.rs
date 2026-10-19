@@ -416,6 +416,21 @@ impl PiiDecryptor {
                 }
                 column.iter().collect()
             }
+            KeyRefs::Indexed { indices, values } => {
+                if indices.len() != tokens.len() {
+                    return Err(DatalakeError::protection(
+                        "key_refs and tokens must have the same length",
+                    ));
+                }
+                indices
+                    .iter()
+                    .map(|i| {
+                        i.and_then(|i| usize::try_from(i).ok())
+                            .filter(|&i| i < values.len() && values.is_valid(i))
+                            .map(|i| values.value(i))
+                    })
+                    .collect()
+            }
         };
         for (token, key_ref) in tokens.iter().zip(&refs) {
             if let (Some(_), Some(r)) = (token, key_ref) {
@@ -465,6 +480,14 @@ pub enum KeyRefs<'a> {
     One(&'a str),
     /// One reference per value (the `_dl_pii_key_ref` column).
     PerRow(&'a StringArray),
+    /// One reference per value as dictionary indices into `values`: the same
+    /// column without a copy of the reference per row.
+    Indexed {
+        /// Index of each row's reference in `values`.
+        indices: &'a arrow::array::Int32Array,
+        /// The distinct references.
+        values: &'a StringArray,
+    },
 }
 
 #[cfg(test)]

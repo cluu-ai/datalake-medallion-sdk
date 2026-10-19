@@ -234,3 +234,20 @@ async def test_ingest_with_a_batch_id_rewrites_the_same_keys(
     assert store.keys() == keys
     with pytest.raises(ConfigurationError, match="ULID"):
         await client.ingest(rows(0, 1), tenant="acme-001", contract=CONTRACT, batch_id="nope")
+
+
+async def test_s3_files_are_read_with_parallel_ranges(
+    make_client: MakeClient, store: Bucket, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import datalake_medallion_sdk.client as client_module
+
+    # Small ranges so a test-sized file goes through the ranged reader.
+    monkeypatch.setattr(client_module, "_RANGE_BYTES", 4096)
+    files = write_files(tmp_path)
+    for name, local in (("events.jsonl", files["jsonl"]), ("events.jsonl.gz", files["gz"])):
+        store.s3.put_object(Bucket=store.name, Key=f"landing/{name}", Body=local.read_bytes())
+        report = await make_client().ingest_file(
+            f"s3://{store.name}/landing/{name}", tenant="acme-001", contract=CONTRACT, block_mb=1
+        )
+        assert report.records_received == 3_001, name
+        assert report.records_ok == 2_700, name
