@@ -219,6 +219,19 @@ def _temporal(value: Any, kind: str) -> Any:
     return value
 
 
+def _maybe_temporal(where: list[Predicate]) -> bool:
+    """Whether a filter value could need :func:`_temporal` (text or dates);
+    other filters skip the schema lookup."""
+    import datetime as dt
+
+    def temporal(v: Any) -> bool:
+        return isinstance(v, str | dt.date)
+
+    return any(
+        temporal(v) or (isinstance(v, list) and any(temporal(x) for x in v)) for _, _, v in where
+    )
+
+
 def _order(order_by: Iterable[OrderBy]) -> list[tuple[str, bool]]:
     """``(column, descending)`` pairs."""
     out: list[tuple[str, bool]] = []
@@ -491,7 +504,7 @@ class _PolarsEngine:
         limit: int | None,
     ) -> pa.Table:
         frame = base
-        if where:
+        if _maybe_temporal(where):
             import polars as pl
 
             schema = base.collect_schema()
@@ -654,7 +667,7 @@ class _DuckDbEngine:
         from duckdb import ColumnExpression
 
         relation = self._relation(base)
-        if where:
+        if _maybe_temporal(where):
             kinds = {}
             for name, dtype in zip(relation.columns, relation.types, strict=True):
                 text = str(dtype).upper()

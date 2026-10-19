@@ -145,6 +145,45 @@ impl IngestRequest {
     }
 }
 
+/// Objects written at once by one batch (one per event day or error code);
+/// their bodies are already in memory, so concurrency adds no memory.
+const PUT_CONCURRENCY: usize = 16;
+
+/// Writes `objects` concurrently; the first error is returned and the other
+/// requests are cancelled (the batch can be committed again).
+async fn put_all(
+    storage: &Arc<dyn ObjectStorage>,
+    objects: &[PendingObject],
+) -> Result<(), DatalakeError> {
+    if let [object] = objects {
+        return storage
+            .put(&object.path, object.body.clone(), object.content_type)
+            .await;
+    }
+    let mut running = tokio::task::JoinSet::new();
+    let finished = |r: Result<Result<(), DatalakeError>, tokio::task::JoinError>| {
+        r.map_err(|e| DatalakeError::storage("commit", format!("upload failed: {e}")))?
+    };
+    for object in objects {
+        while running.len() >= PUT_CONCURRENCY {
+            if let Some(r) = running.join_next().await {
+                finished(r)?;
+            }
+        }
+        let storage = Arc::clone(storage);
+        let (path, body, content_type) = (
+            object.path.clone(),
+            object.body.clone(),
+            object.content_type,
+        );
+        running.spawn(async move { storage.put(&path, body, content_type).await });
+    }
+    while let Some(r) = running.join_next().await {
+        finished(r)?;
+    }
+    Ok(())
+}
+
 /// Outcome of an ingest call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestReport {
@@ -487,11 +526,10 @@ impl BronzePipeline {
     ///
     /// [`DatalakeError::Storage`] from the storage adapter.
     pub async fn commit(&self, prepared: &PreparedBatch) -> Result<IngestReport, DatalakeError> {
-        for object in prepared.dead_letters.iter().chain(prepared.data.iter()) {
-            self.storage
-                .put(&object.path, object.body.clone(), object.content_type)
-                .await?;
-        }
+        // Every dead letter is stored before any data object, so a failure
+        // never leaves Bronze rows whose rejected siblings were lost.
+        put_all(&self.storage, &prepared.dead_letters).await?;
+        put_all(&self.storage, &prepared.data).await?;
         let r = &prepared.report;
         tracing::info!(
             batch_id = %r.batch_id,
