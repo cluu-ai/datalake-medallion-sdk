@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0rc7] - 2026-10-19
+
+### Added
+
+- `PiiDecryptor.decrypt_column(tokens, tenant_id=, field=, key_refs=)`: decrypts an Arrow column (pyarrow, Polars) into a pyarrow `StringArray`, in parallel and without Python strings. `key_refs` can be the `_dl_pii_key_ref` column, so rows encrypted with different data keys decrypt in one call. On 3.1 M values: 0.34 s and +252 MiB, against 2.34 s and +945 MiB for `decrypt_many`. Rust: `PiiDecryptor::decrypt_array` with `KeyRefs`.
+- Streams read the next chunk on a separate thread (2 chunks ahead), so storage I/O, decompression and parsing overlap with validation and encoding. Rust: `stream::prefetch`.
+
+### Changed
+
+- JSON Lines parsed into typed columns in parallel parts, without copying the chunk when every line takes the typed path. Streaming 500 MB without network: JSON Lines 5.65 → 3.61 s, CSV 5.30 → 3.53 s, Parquet 4.60 → 3.68 s.
+- `LakeReader`: both engines sort nulls last.
+
+### Fixed
+
+- `LakeReader(cache_mb=...)` discarded large tables as too big for the cache, because the constant lineage columns were expanded to one value per row. These columns are now kept as dictionaries, and results still return plain strings. With Polars, warm reads of 3.1 M rows on AWS went from 1.4 s to 20–60 ms.
+
 ## [0.2.0rc6] - 2026-10-18
 
 ### Added

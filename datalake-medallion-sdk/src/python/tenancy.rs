@@ -16,12 +16,14 @@ use crate::tenant::{
     TenantRegistry,
 };
 use crate::validation::keys::{
-    DataKey, DataKeyProvider, EnvelopeProtector, KeyCachePolicy, PiiDecryptor,
+    DataKey, DataKeyProvider, EnvelopeProtector, KeyCachePolicy, KeyRefs, PiiDecryptor,
 };
 use crate::validation::pii::{
     validate_scheme, Aes256GcmEncryptor, FieldProtector, HmacSha256Hasher, ProtectionContext,
     Sha256Hasher,
 };
+use arrow::array::{Array, StringArray};
+use arrow::pyarrow::ToPyArrow;
 
 /// Adapts a Python object with `generate(tenant_id) -> (bytes, str)` and
 /// `decrypt(tenant_id, key_ref) -> bytes` to [`DataKeyProvider`]. Called about
@@ -430,6 +432,26 @@ impl PyTenantProfile {
     }
 }
 
+/// A Python column as one Arrow `StringArray` (chunks combined, other
+/// string types cast).
+fn string_array(py: Python<'_>, values: &Bound<'_, PyAny>) -> PyResult<StringArray> {
+    use arrow::array::{make_array, ArrayData};
+    use arrow::pyarrow::FromPyArrow;
+
+    let pa = py.import("pyarrow")?;
+    let combined = pa
+        .call_method1("chunked_array", (values,))?
+        .call_method0("combine_chunks")?;
+    let array = make_array(ArrayData::from_pyarrow_bound(&combined)?);
+    let utf8 = arrow::compute::cast(&array, &arrow::datatypes::DataType::Utf8)
+        .map_err(|e| PyTypeError::new_err(format!("expected a column of strings: {e}")))?;
+    Ok(utf8
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .cloned()
+        .unwrap_or_else(|| StringArray::from(Vec::<Option<&str>>::new())))
+}
+
 /// Immutable directory of tenant profiles, resolved by tenant id on each call.
 #[pyclass(
     name = "TenantRegistry",
@@ -569,6 +591,39 @@ impl PyPiiDecryptor {
     ) -> PyResult<String> {
         let inner = Arc::clone(&self.inner);
         Ok(py.detach(|| inner.decrypt(tenant_id, field, key_ref, token))?)
+    }
+
+    /// Decrypts an Arrow column (pyarrow ``Array``/``ChunkedArray``, Polars
+    /// ``Series``, or anything ``pyarrow.chunked_array`` accepts) into a
+    /// pyarrow ``StringArray``, in parallel and without the GIL. ``key_refs``
+    /// is one key reference, or the ``_dl_pii_key_ref`` column of the same
+    /// rows (rows encrypted with different data keys decrypt in one call).
+    #[pyo3(signature = (tokens, *, tenant_id, field, key_refs))]
+    fn decrypt_column(
+        &self,
+        py: Python<'_>,
+        tokens: &Bound<'_, PyAny>,
+        tenant_id: &str,
+        field: &str,
+        key_refs: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let tokens = string_array(py, tokens)?;
+        let per_row = if key_refs.extract::<String>().is_ok() {
+            None
+        } else {
+            Some(string_array(py, key_refs)?)
+        };
+        let one = key_refs.extract::<String>().ok();
+        let inner = Arc::clone(&self.inner);
+        let clear = py.detach(|| {
+            let refs = match (&one, &per_row) {
+                (Some(r), _) => KeyRefs::One(r),
+                (None, Some(column)) => KeyRefs::PerRow(column),
+                (None, None) => unreachable!("one of them is set"),
+            };
+            inner.decrypt_array(tenant_id, field, &tokens, refs)
+        })?;
+        Ok(clear.into_data().to_pyarrow(py)?.unbind())
     }
 
     /// Decrypts a column (``None`` stays ``None``) without holding the GIL.

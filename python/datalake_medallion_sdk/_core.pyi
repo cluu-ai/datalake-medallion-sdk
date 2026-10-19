@@ -352,6 +352,20 @@ class PiiDecryptor:
         """Decryptor for keys from a ``DataKeyProvider`` object."""
     def decrypt(self, token: str, *, tenant_id: str, field: str, key_ref: str) -> str:
         """Decrypt one token written for ``tenant_id`` and ``field`` with ``key_ref``."""
+    def decrypt_column(
+        self,
+        tokens: Any,
+        *,
+        tenant_id: str,
+        field: str,
+        key_refs: str | Any,
+    ) -> Any:
+        """Decrypt an Arrow column (pyarrow, Polars...) into a pyarrow ``StringArray``.
+
+        ``key_refs`` is one key reference or the ``_dl_pii_key_ref`` column of
+        the same rows. Runs in parallel without the GIL and creates no Python
+        strings, so memory stays close to the column sizes.
+        """
     def decrypt_many(
         self, tokens: Iterable[str | None], *, tenant_id: str, field: str, key_ref: str
     ) -> list[str | None]:

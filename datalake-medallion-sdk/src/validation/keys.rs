@@ -10,6 +10,7 @@
 //! Everything here is optional: a tenant profile without PII protection never
 //! touches a provider.
 
+use arrow::array::{Array, StringArray};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -383,6 +384,87 @@ impl PiiDecryptor {
             .map(|t| t.map(|t| key.decrypt(&ctx, t)).transpose())
             .collect()
     }
+
+    /// Decrypts an Arrow column of tokens into a column of clear values, in
+    /// parallel. `key_refs` is one reference for the whole column, or the
+    /// `_dl_pii_key_ref` column (one per row, as written), so a column whose
+    /// rows were encrypted with several data keys decrypts in one call; each
+    /// distinct key is looked up once. Null tokens stay null.
+    ///
+    /// # Errors
+    ///
+    /// As [`decrypt`](Self::decrypt), for the first value that fails, or a
+    /// non-null token without a key reference.
+    pub fn decrypt_array(
+        &self,
+        tenant_id: &str,
+        field: &str,
+        tokens: &StringArray,
+        key_refs: KeyRefs<'_>,
+    ) -> Result<StringArray, DatalakeError> {
+        use rayon::prelude::*;
+
+        let ctx = ProtectionContext { tenant_id, field };
+        let mut keys: HashMap<&str, Arc<Aes256GcmEncryptor>> = HashMap::new();
+        let refs: Vec<Option<&str>> = match key_refs {
+            KeyRefs::One(r) => vec![Some(r); tokens.len()],
+            KeyRefs::PerRow(column) => {
+                if column.len() != tokens.len() {
+                    return Err(DatalakeError::protection(
+                        "key_refs and tokens must have the same length",
+                    ));
+                }
+                column.iter().collect()
+            }
+        };
+        for (token, key_ref) in tokens.iter().zip(&refs) {
+            if let (Some(_), Some(r)) = (token, key_ref) {
+                if !keys.contains_key(r) {
+                    keys.insert(r, self.key(tenant_id, r)?);
+                }
+            }
+        }
+        // Each task turns its rows into a finished StringArray, so only one
+        // chunk of decrypted strings exists per task at a time.
+        let parts: Vec<StringArray> = (0..tokens.len())
+            .collect::<Vec<_>>()
+            .par_chunks(DECRYPT_CHUNK)
+            .map(|rows| {
+                rows.iter()
+                    .map(|&i| match (tokens.is_valid(i), refs[i]) {
+                        (false, _) => Ok(None),
+                        (true, None) => Err(DatalakeError::protection(
+                            "a protected value has no key reference",
+                        )),
+                        (true, Some(r)) => keys[r].decrypt(&ctx, tokens.value(i)).map(Some),
+                    })
+                    .collect::<Result<StringArray, _>>()
+            })
+            .collect::<Result<_, _>>()?;
+        let arrays: Vec<&dyn Array> = parts.iter().map(|a| a as &dyn Array).collect();
+        if arrays.is_empty() {
+            return Ok(StringArray::from(Vec::<Option<&str>>::new()));
+        }
+        let joined = arrow::compute::concat(&arrays)
+            .map_err(|e| DatalakeError::protection(format!("cannot combine values: {e}")))?;
+        Ok(joined
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .cloned()
+            .unwrap_or_else(|| StringArray::from(Vec::<Option<&str>>::new())))
+    }
+}
+
+/// Values per parallel decryption task.
+const DECRYPT_CHUNK: usize = 16_384;
+
+/// Key references for [`PiiDecryptor::decrypt_array`].
+#[derive(Debug, Clone, Copy)]
+pub enum KeyRefs<'a> {
+    /// One reference for every value.
+    One(&'a str),
+    /// One reference per value (the `_dl_pii_key_ref` column).
+    PerRow(&'a StringArray),
 }
 
 #[cfg(test)]
@@ -547,6 +629,56 @@ mod tests {
             .is_err());
         assert!(reader
             .decrypt("acme-001", "phone", &key_ref, &tokens[0])
+            .is_err());
+    }
+
+    #[test]
+    fn arrow_columns_decrypt_across_rotated_keys() {
+        let (provider, _clock, p) = setup(KeyCachePolicy {
+            max_nonces: 1,
+            ..KeyCachePolicy::default()
+        });
+        let first = p.bind("acme-001").unwrap().unwrap();
+        let a = first
+            .protect_batch(&ctx("acme-001"), &["ana@x.io", "cy@z.io"])
+            .unwrap();
+        // One nonce prefix per key: the next bind rotates to a new data key.
+        let second = p.bind("acme-001").unwrap().unwrap();
+        let b = second
+            .protect_batch(&ctx("acme-001"), &["bo@y.io"])
+            .unwrap();
+        let (r1, r2) = (first.key_ref().unwrap(), second.key_ref().unwrap());
+        assert_ne!(r1, r2);
+        let reader = PiiDecryptor::new(
+            provider as Arc<dyn DataKeyProvider>,
+            8,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let tokens = StringArray::from(vec![
+            Some(a[0].as_str()),
+            None,
+            Some(b[0].as_str()),
+            Some(a[1].as_str()),
+        ]);
+        let refs = StringArray::from(vec![Some(r1), None, Some(r2), Some(r1)]);
+        let clear = reader
+            .decrypt_array("acme-001", "email", &tokens, KeyRefs::PerRow(&refs))
+            .unwrap();
+        assert_eq!(
+            clear.iter().collect::<Vec<_>>(),
+            vec![Some("ana@x.io"), None, Some("bo@y.io"), Some("cy@z.io")]
+        );
+        // One reference for every row: the row of the other key fails.
+        assert!(reader
+            .decrypt_array("acme-001", "email", &tokens, KeyRefs::One(r1))
+            .is_err());
+        let short = StringArray::from(vec![Some(r1)]);
+        assert!(reader
+            .decrypt_array("acme-001", "email", &tokens, KeyRefs::PerRow(&short))
+            .is_err());
+        assert!(reader
+            .decrypt_array("beta-002", "email", &tokens, KeyRefs::PerRow(&refs))
             .is_err());
     }
 

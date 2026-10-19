@@ -289,6 +289,29 @@ def _partition_values(path: str) -> dict[str, str]:
     return dict(seg.split("=", 1) for seg in path.split("/") if "=" in seg)
 
 
+def _constant_columns(handle: Any) -> list[str]:
+    """Lineage columns stored as Parquet dictionaries in every row group.
+
+    They hold one value per object (batch id, tenant, schema hash...), so
+    reading them as Arrow dictionaries keeps them at a few bytes instead of a
+    copy per row. Columns with delta-encoded pages are left as they are
+    (pyarrow cannot decode those into a dictionary).
+    """
+    meta = handle.metadata
+    out = []
+    for i in range(meta.num_columns):
+        name = meta.schema.column(i).name
+        if not name.startswith("_dl_"):
+            continue
+        chunks = [meta.row_group(r).column(i) for r in range(meta.num_row_groups)]
+        if chunks and all(
+            c.has_dictionary_page and not any(e.startswith("DELTA") for e in c.encodings)
+            for c in chunks
+        ):
+            out.append(name)
+    return out
+
+
 class _ObjectCache:
     """Arrow contents of Parquet objects by path, least recently used out.
 
@@ -310,7 +333,12 @@ class _ObjectCache:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        table = pq.read_table(path.removeprefix("s3://"), filesystem=self._s3.filesystem())
+        handle = pq.ParquetFile(path.removeprefix("s3://"), filesystem=self._s3.filesystem())
+        table = pq.read_table(
+            path.removeprefix("s3://"),
+            filesystem=self._s3.filesystem(),
+            read_dictionary=_constant_columns(handle) or None,
+        )
         for key, value in _partition_values(path).items():
             if key in table.column_names:
                 continue
@@ -442,12 +470,16 @@ class _PolarsEngine:
         for column, op, value in where:
             frame = frame.filter(self._expr(column, op, value))
         if order:
-            frame = frame.sort([c for c, _ in order], descending=[d for _, d in order])
+            by = [c for c, _ in order]
+            descending = [d for _, d in order]
+            # With a limit, Polars plans sort + head as a top-k on its own
+            # (measured faster than an explicit bottom_k when scanning S3).
+            frame = frame.sort(by, descending=descending, nulls_last=True)
         if columns is not None:
             frame = frame.select(list(columns))
         if limit is not None:
             frame = frame.head(limit)
-        return frame.collect().to_arrow()
+        return _plain_strings(frame.collect().to_arrow())
 
     def scan(self, base: pl.LazyFrame) -> pl.LazyFrame:
         return base
@@ -456,6 +488,17 @@ class _PolarsEngine:
         import polars as pl
 
         return pl.LazyFrame()
+
+
+def _plain_strings(table: pa.Table) -> pa.Table:
+    """Dictionary (categorical) columns as plain strings, so results have the
+    same types whether or not they came from the object cache."""
+    import pyarrow as pa
+
+    for i, field in enumerate(table.schema):
+        if pa.types.is_dictionary(field.type):
+            table = table.set_column(i, field.name, table.column(i).cast(field.type.value_type))
+    return table
 
 
 def _sql_literal(value: str) -> str:
@@ -589,7 +632,8 @@ class _DuckDbEngine:
         if limit is not None:
             relation = relation.limit(limit)
         result = relation.arrow()
-        return cast("pa.Table", result.read_all() if hasattr(result, "read_all") else result)
+        table = result.read_all() if hasattr(result, "read_all") else result
+        return _plain_strings(cast("pa.Table", table))
 
     def scan(self, base: _DuckDbBase) -> duckdb.DuckDBPyRelation:
         return self._relation(base)
@@ -709,7 +753,8 @@ class LakeReader:
         ``where`` predicates are combined with AND and pushed down to the
         scan (partition and row-group pruning); ``tenant_id`` is bound by the
         reader and may not be filtered on. ``order_by`` takes column names or
-        ``(column, "asc" | "desc")``; with ``limit`` it gives keyset pages.
+        ``(column, "asc" | "desc")``, nulls last with every engine; with ``limit``
+        it gives keyset pages.
         A table without objects yet reads as an empty table.
 
         Raises:

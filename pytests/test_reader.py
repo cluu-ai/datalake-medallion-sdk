@@ -338,3 +338,23 @@ async def test_table_larger_than_the_cache_is_read_from_s3(
     with pytest.raises(ConfigurationError, match="cache_mb"):
         LakeReader(tenants, cache_mb=-1)
     reader.close()
+
+
+async def test_pages_sort_nulls_last_with_every_engine(
+    make_client: MakeClient, make_reader: Callable[..., LakeReader]
+) -> None:
+    rows = [{"event_id": f"n{i}"} for i in range(3)]  # no attempts: null
+    rows += [{"event_id": f"v{i}", "attempts": 10 - i} for i in range(6)]
+    await make_client().ingest(rows, tenant="acme-001", contract=CONTRACT)
+    reader = make_reader()
+    for direction, expected in (("asc", [5, 6, 7, 8]), ("desc", [10, 9, 8, 7])):
+        page = reader.read(
+            "acme-001",
+            EVENTS,
+            columns=["attempts"],
+            order_by=[("attempts", direction), "event_id"],
+            limit=4,
+        )
+        assert page.column("attempts").to_pylist() == expected, direction
+    tail = reader.read("acme-001", EVENTS, columns=["attempts"], order_by=["attempts"], limit=9)
+    assert tail.column("attempts").to_pylist()[-3:] == [None, None, None]

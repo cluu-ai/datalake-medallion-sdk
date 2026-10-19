@@ -460,26 +460,25 @@ fn drive(
     parse_text_columns: bool,
     json_lines: bool,
 ) -> PyResult<StreamReport> {
-    match input {
-        StreamInput::Arrow(reader) => {
-            for batch in reader {
-                let batch = batch.map_err(|e| DatalakeError::MalformedPayload {
-                    reason: format!("cannot read Arrow stream: {e}"),
-                })?;
-                stream.push(if parse_text_columns {
-                    RecordSource::ArrowText(vec![batch])
-                } else {
-                    RecordSource::Arrow(vec![batch])
-                })?;
-            }
-        }
-        StreamInput::Iter(iterator) => {
-            while let Some(records) = Python::attach(|py| {
-                next_chunk(py, iterator.bind(py), parse_text_columns, json_lines)
-            })? {
-                stream.push(records)?;
-            }
-        }
+    // Chunks are read on another thread, ahead of validation and encoding.
+    let chunks: Box<dyn Iterator<Item = PyResult<RecordSource>> + Send> = match input {
+        StreamInput::Arrow(reader) => Box::new(reader.map(move |batch| {
+            let batch = batch.map_err(|e| DatalakeError::MalformedPayload {
+                reason: format!("cannot read Arrow stream: {e}"),
+            })?;
+            Ok(if parse_text_columns {
+                RecordSource::ArrowText(vec![batch])
+            } else {
+                RecordSource::Arrow(vec![batch])
+            })
+        })),
+        StreamInput::Iter(iterator) => Box::new(std::iter::from_fn(move || {
+            Python::attach(|py| next_chunk(py, iterator.bind(py), parse_text_columns, json_lines))
+                .transpose()
+        })),
+    };
+    for records in &crate::stream::prefetch(chunks) {
+        stream.push(records?)?;
     }
     Ok(stream.finish()?)
 }
