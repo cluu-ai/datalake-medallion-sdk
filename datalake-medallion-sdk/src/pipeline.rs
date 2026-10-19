@@ -2689,6 +2689,14 @@ mod storage_option_tests {
             r.get(CONTRACT).unwrap().compression(),
             crate::contracts::BronzeCompression::Zstd(7)
         );
+        let mut r = ContractRegistry::default();
+        r.register(&schema(&json!({"x-dl-compression": "zstd"})))
+            .unwrap();
+        assert_eq!(
+            r.get(CONTRACT).unwrap().compression(),
+            crate::contracts::BronzeCompression::Zstd(1),
+            "zstd defaults to level 1"
+        );
     }
 
     #[tokio::test]

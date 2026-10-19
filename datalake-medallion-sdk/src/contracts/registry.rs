@@ -602,7 +602,8 @@ fn parse_fields(
 }
 
 /// `x-dl-compression` (`snappy`, `zstd`, `lz4`, `none`) and
-/// `x-dl-compression_level` (zstd only, 1 to 22, default 3).
+/// `x-dl-compression_level` (zstd only, 1 to 22). The zstd default is level 1:
+/// on log data it is as small as level 3 and faster to write and read.
 fn parse_compression(
     root: &Map<String, Value>,
     kw: &dyn Fn(&str) -> String,
@@ -629,7 +630,7 @@ fn parse_compression(
     };
     match (codec, level) {
         (None | Some("snappy"), None) => Ok(BronzeCompression::Snappy),
-        (Some("zstd"), level) => Ok(BronzeCompression::Zstd(level.unwrap_or(3))),
+        (Some("zstd"), level) => Ok(BronzeCompression::Zstd(level.unwrap_or(1))),
         (Some("lz4"), None) => Ok(BronzeCompression::Lz4),
         (Some("none"), None) => Ok(BronzeCompression::None),
         (_, Some(_)) => Err(ctx(format!(

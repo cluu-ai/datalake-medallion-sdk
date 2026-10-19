@@ -154,3 +154,35 @@ async def test_old_objects_are_closed_between_chunks(make_client: MakeClient) ->
     assert len(report.data_uris) == 3
     with pytest.raises(ConfigurationError):
         await c.ingest_stream([], tenant="acme-001", contract=LOG, max_object_seconds=-1)
+
+
+@pytest.mark.parametrize("engine", ["polars", "duckdb"])
+async def test_typed_timestamps_filter_with_text_dates_and_datetimes(
+    make_client: MakeClient, s3_endpoint: str, bucket: str, engine: str
+) -> None:
+    import datetime as dt
+
+    await client(make_client).ingest(logs(0, 24), tenant="acme-001", contract=LOG)
+    reader = LakeReader(
+        TenantRegistry([TenantProfile.for_bucket("acme-001", bucket)]),
+        engine=engine,
+        aws_region="us-east-1",
+        aws_endpoint_url=s3_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        max_staleness=0,
+    )
+    noon = dt.datetime(2026, 3, 1, 12, tzinfo=dt.UTC)
+    try:
+        for value in (
+            "2026-03-01T12:00:00Z",
+            "2026-03-01 12:00:00",
+            noon,
+            noon.replace(tzinfo=None),
+        ):
+            got = reader.read("acme-001", TableRef.bronze("log"), where=[("at", ">=", value)])
+            assert got.num_rows == 12, (engine, value, got.num_rows)
+        day = reader.read("acme-001", TableRef.bronze("log"), where=[("at", ">=", "2026-03-01")])
+        assert day.num_rows == 24, (engine, day.num_rows)
+    finally:
+        reader.close()

@@ -195,6 +195,30 @@ def _predicates(where: Iterable[Predicate]) -> list[Predicate]:
     return out
 
 
+def _temporal(value: Any, kind: str) -> Any:
+    """A filter value for a ``timestamp`` or ``date`` column.
+
+    ISO text, dates and datetimes are accepted; values without a zone are UTC,
+    as every lake timestamp is. Lists (``in``) are converted item by item.
+    """
+    import datetime as dt
+
+    if isinstance(value, list):
+        return [_temporal(v, kind) for v in value]
+    if isinstance(value, str):
+        try:
+            value = dt.datetime.fromisoformat(value)
+        except ValueError as e:
+            raise ConfigurationError(f"{value!r} is not an ISO date or date-time") from e
+    if kind == "date":
+        return value.date() if isinstance(value, dt.datetime) else value
+    if isinstance(value, dt.date) and not isinstance(value, dt.datetime):
+        value = dt.datetime.combine(value, dt.time())
+    if isinstance(value, dt.datetime) and value.tzinfo is None:
+        value = value.replace(tzinfo=dt.UTC)
+    return value
+
+
 def _order(order_by: Iterable[OrderBy]) -> list[tuple[str, bool]]:
     """``(column, descending)`` pairs."""
     out: list[tuple[str, bool]] = []
@@ -467,6 +491,16 @@ class _PolarsEngine:
         limit: int | None,
     ) -> pa.Table:
         frame = base
+        if where:
+            import polars as pl
+
+            schema = base.collect_schema()
+            kinds = {
+                name: "timestamp" if isinstance(dtype, pl.Datetime) else "date"
+                for name, dtype in schema.items()
+                if isinstance(dtype, pl.Datetime) or dtype == pl.Date
+            }
+            where = [(c, op, _temporal(v, kinds[c]) if c in kinds else v) for c, op, v in where]
         for column, op, value in where:
             frame = frame.filter(self._expr(column, op, value))
         if order:
@@ -620,6 +654,15 @@ class _DuckDbEngine:
         from duckdb import ColumnExpression
 
         relation = self._relation(base)
+        if where:
+            kinds = {}
+            for name, dtype in zip(relation.columns, relation.types, strict=True):
+                text = str(dtype).upper()
+                if text.startswith("TIMESTAMP"):
+                    kinds[name] = "timestamp"
+                elif text == "DATE":
+                    kinds[name] = "date"
+            where = [(c, op, _temporal(v, kinds[c]) if c in kinds else v) for c, op, v in where]
         for column, op, value in where:
             relation = relation.filter(self._expr(column, op, value))
         if order:

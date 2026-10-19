@@ -134,8 +134,27 @@ A contract is a JSON Schema (draft 2020-12) document plus a few keywords under a
 | `x-dl-flexibility_mode` | no | `strict` (default): undeclared fields rejected. `permissive`: undeclared fields kept as JSON in `_dl_extra`. `schema_on_read`: no schema enforcement; PII protection, type coercion and lineage still apply |
 | `x-dl-pii` | no | on a property: the field holds personal data (see [PII protection](#pii-protection)) |
 | `x-dl-layer` | no | free label of the layer the contract describes |
+| `x-dl-compression` | no | Parquet codec of the contract's Bronze objects: `snappy` (default), `zstd`, `lz4` or `none`. Readers need no setting: the codec is recorded in each file |
+| `x-dl-compression_level` | no | zstd level, 1 to 22 (default 1) |
+| `x-dl-type: "timestamp"` | no | on a `date-time` string property: store it as `timestamp(µs, UTC)` instead of text, so engines filter and sort it as time. A value that does not parse quarantines its record |
+| `x-dl-partition_by` | no | name of a `date-time` property: partition Bronze by the day of that event time instead of the ingest day (see [Object layout](#object-layout)) |
 
-The Parquet schema comes from the contract, not from the data, so every object of a contract version has the same columns: `string` → utf8, `integer` → int64, `number` → float64, `boolean` → bool, anything else (objects, arrays, unions) → JSON text. When a tenant protects PII, PII fields are stored as utf8 (digest or token). Keep a tenant on one protection setting if a PII field is not a string, so its column type stays stable.
+**Choosing a codec.** Snappy is the default because it is the fastest to write. For logs and other text-heavy data, `"x-dl-compression": "zstd"` makes objects about 40% smaller (less storage, upload and scan) for about 20% more encoding CPU; higher levels cost much more CPU for almost no gain. Measured on 1 M log rows: Snappy 74 MiB, zstd level 1 43 MiB, zstd level 6 43 MiB at 3.5× the encoding time of level 1.
+
+```json
+{
+  "x-dl-domain": "app", "x-dl-datatype": "request_log", "x-dl-schema_version": "1.0.0",
+  "x-dl-compression": "zstd",
+  "x-dl-partition_by": "timestamp",
+  "properties": {
+    "timestamp": {"type": "string", "format": "date-time", "x-dl-type": "timestamp"},
+    "level": {"type": "string"},
+    "message": {"type": "string"}
+  }
+}
+```
+
+The Parquet schema comes from the contract, not from the data, so every object of a contract version has the same columns: `string` → utf8 (`timestamp(µs, UTC)` with `x-dl-type: "timestamp"`), `integer` → int64, `number` → float64, `boolean` → bool, anything else (objects, arrays, unions) → JSON text. When a tenant protects PII, PII fields are stored as utf8 (digest or token). Keep a tenant on one protection setting if a PII field is not a string, so its column type stays stable.
 
 Contracts must be self-contained: `$ref` to remote URLs or files is not resolved, so loading contracts never performs network I/O. `ContractRegistry.from_schemas([...])` builds a registry from dicts instead of files.
 
@@ -246,6 +265,10 @@ report = await client.ingest_stream(
   - **CSV and TSV** are read as text and each value is parsed with the contract's type; empty cells are absent values, and a value that does not parse quarantines its record with the original text.
   - **JSON Lines** are parsed straight into typed columns when they fit the contract. Lines with `null` or that do not fit take the row path; either way a malformed line quarantines only itself.
   - **Parquet** is read one row group at a time.
+- **Continuous sources (logs, events).**
+  - `max_object_seconds` closes an object once it is that old, so records become visible within a bounded time even when traffic is low. It is checked as chunks arrive.
+  - With `x-dl-partition_by`, rows go to one object per event day, and at most `max_open_days` (default 4) are open at once. Late events for a day already closed start a new object for that day.
+  - From Rust, `BronzeStream::flush()` completes the open objects and waits until they are uploaded, so the input can be checkpointed.
 - **Reports.** `StreamReport` gives `records_received`, `records_ok`, `records_quarantined`, `rejections`, `data_uris`, `dlq_uris`, `bytes_written` and `stream_id`.
 
 `ingest_file` needs pyarrow (`pip install "datalake-medallion-sdk[pyarrow]"`).
@@ -355,6 +378,8 @@ On AWS Lambda against S3, warm queries over 3.1 M rows take 22–67 ms with Pola
 <quarantine location>/tenant_id=<tenant>/data_type=<datatype>/error_code=<code>/year=YYYY/month=MM/day=DD/<batch_id>.jsonl
 ```
 
+The date is the ingest day, or the event day when the contract sets `x-dl-partition_by`. Then each object is named `<batch_id>-YYYYMMDD.parquet` (`<stream_id>-YYYYMMDD-00000.parquet` for streams), one per event day in the batch, and rows without a usable event time go to the ingest day. `IngestReport.data_uris` lists every object.
+
 With `partition_order="data_type_first"` the `data_type=` partition comes before `tenant_id=`. Each `ingest` call writes at most one Parquet object plus one quarantine object per error code (streams write one object per `target_object_mb`). Quarantine objects are written first, so retrying a failed call never duplicates Bronze rows.
 
 Lineage columns (prefix `_dl_`, configurable with `envelope_prefix`):
@@ -437,7 +462,7 @@ The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, `TenantProfi
 
 ```toml
 [dependencies]
-datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc8", default-features = false, features = ["aws-kms"] }
+datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc9", default-features = false, features = ["aws-kms"] }
 ```
 
 The library is imported as `_core` (`use _core::pipeline::BronzePipeline;`). `default-features = false` builds without Python, for example for an AWS Lambda; the `aws-kms` feature adds the KMS data key provider. The Rust API may change before 1.0.
