@@ -199,3 +199,35 @@ def test_expire_snapshots_keeps_the_latest(writer: LakeWriter, catalog: Any) -> 
     # Batches of expired snapshots are no longer recognized.
     assert not writer.append("acme-001", SHARED, rows([0], "a"), batch_id="B-0").skipped
     assert writer.append("acme-001", SHARED, rows([4], "a"), batch_id="B-4").skipped
+
+
+def test_upserts_with_thousands_of_composite_keys(
+    writer: LakeWriter, catalog: Any, reader: LakeReader
+) -> None:
+    """PyIceberg's own upsert nests one Or per composite key and overflows the
+    stack with thousands of keys; the writer builds a shallow filter."""
+    multi = TableRef.iceberg("silver", "pairs", identifier="silver.pairs")
+    schema = pa.schema([("a", pa.int64()), ("b", pa.int64()), ("v", pa.string())])
+    writer.create_table("acme-001", multi, schema, keys=["a", "b"])
+    n = 3_000
+    base = pa.table({"a": [i % 50 for i in range(n)], "b": list(range(n)), "v": ["old"] * n})
+    writer.append("acme-001", multi, base)
+    change = pa.table(
+        {
+            "a": [i % 50 for i in range(n - 1_000, n + 1_000)],
+            "b": list(range(n - 1_000, n + 1_000)),
+            "v": ["new"] * 2_000,
+        }
+    )
+    result = writer.upsert("acme-001", multi, change)
+    assert (result.rows_updated, result.rows_inserted) == (1_000, 1_000)
+    t = reader.read("acme-001", multi)
+    assert t.num_rows == n + 1_000
+    assert t.column("v").to_pylist().count("new") == 2_000
+
+
+def test_upsert_rejects_duplicate_keys(writer: LakeWriter) -> None:
+    from datalake_medallion_sdk import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="duplicate keys"):
+        writer.upsert("acme-001", SHARED, rows([1, 1], "dup"))

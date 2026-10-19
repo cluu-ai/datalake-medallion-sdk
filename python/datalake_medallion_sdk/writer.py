@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -100,6 +101,43 @@ def _expressions() -> Any:
     import pyiceberg.expressions
 
     return pyiceberg.expressions
+
+
+def _key_filter(rows: pa.Table, keys: Sequence[str]) -> BooleanExpression:
+    """Exact filter of the rows whose ``keys`` equal a row of ``rows``.
+
+    Columns with one value become ``EqualTo``, a single remaining column an
+    ``In``; several remaining columns a balanced ``Or`` of ``And`` terms, so
+    the expression is log(n) deep (PyIceberg's own upsert nests one ``Or`` per
+    key and overflows the stack with thousands of composite keys).
+    """
+    import pyarrow.compute as pc
+
+    ex = _expressions()
+    constant = [k for k in keys if pc.count_distinct(rows.column(k)).as_py() == 1]
+    varying = [k for k in keys if k not in constant]
+    terms: list[Any] = [ex.EqualTo(k, rows.column(k)[0].as_py()) for k in constant]
+    if len(varying) == 1:
+        values = pc.unique(rows.column(varying[0])).to_pylist()
+        terms.append(ex.In(varying[0], values))
+    elif varying:
+        combos = rows.select(varying).group_by(varying).aggregate([]).to_pylist()
+        ands = [
+            ex.And(*[ex.EqualTo(k, row[k]) for k in varying]) if len(varying) > 1 else None
+            for row in combos
+        ]
+
+        def balanced(items: list[Any]) -> Any:
+            if len(items) == 1:
+                return items[0]
+            mid = len(items) // 2
+            return ex.Or(balanced(items[:mid]), balanced(items[mid:]))
+
+        terms.append(balanced(ands))
+    out: Any = terms[0]
+    for term in terms[1:]:
+        out = ex.And(out, term)
+    return cast("BooleanExpression", out)
 
 
 def _require_pyiceberg() -> None:
@@ -441,11 +479,17 @@ class LakeWriter:
                 totals[key] += int(summary.get(key, 0))
             parent = current.parent_snapshot_id
             current = None if parent is None else iceberg.snapshot_by_id(parent)
-        inserted, updated = logical if logical is not None else (len(rows), 0)
-        # Copy-on-write rewrites unchanged rows of touched files: they are in
-        # both added and deleted records, and are not deletions.
-        rewritten = totals["added-records"] - inserted - updated
-        deleted = totals["deleted-records"] - rewritten - updated
+        # Copy-on-write rewrites the untouched rows of every file it changes:
+        # they appear in both added and deleted records.
+        rewritten = totals["added-records"] - len(rows)
+        removed = totals["deleted-records"] - rewritten
+        if logical is not None:
+            inserted, updated = logical
+            deleted = 0
+        elif operation == "upsert":  # replaced rows are the updated ones
+            inserted, updated, deleted = len(rows) - removed, removed, 0
+        else:
+            inserted, updated, deleted = len(rows), 0, removed
         return WriteResult(
             operation,
             profile.tenant_id,
@@ -491,19 +535,40 @@ class LakeWriter:
         keys: Sequence[str] | None = None,
         batch_id: str | None = None,
     ) -> WriteResult:
-        """Updates rows of ``tenant`` matching ``keys`` and inserts the others.
+        """Updates rows of ``tenant`` matching ``keys`` and inserts the others,
+        in one commit.
 
         ``keys`` default to the table's identifier fields; in a shared table
-        ``tenant_id`` is always part of them. Rows are rewritten copy-on-write:
-        upsert batches that touch few partitions.
+        ``tenant_id`` is always part of them. The rows whose keys appear in
+        ``data`` are replaced by ``data`` (copy-on-write: the files holding
+        them are rewritten), so upsert batches that touch few partitions.
+        Keys must be unique within ``data``.
         """
-        join = list(keys) if keys else None
-        if join is not None and table.shared and TENANT_COLUMN not in join:
-            join.insert(0, TENANT_COLUMN)
 
-        def apply(t: Table, rows: pa.Table, props: dict[str, str], _: Any) -> tuple[int, int]:
-            result = t.upsert(rows, join_cols=join, snapshot_properties=props)
-            return result.rows_inserted, result.rows_updated
+        def apply(t: Table, rows: pa.Table, props: dict[str, str], _: Any) -> None:
+            join = (
+                list(keys)
+                if keys
+                else [str(t.schema().find_column_name(i)) for i in t.schema().identifier_field_ids]
+            )
+            if not join:
+                raise ConfigurationError("upsert needs keys= or a table with identifier fields")
+            if table.shared and TENANT_COLUMN not in join:
+                join.insert(0, TENANT_COLUMN)
+            if len(rows) and rows.select(join).group_by(join).aggregate([]).num_rows != len(rows):
+                raise ConfigurationError(f"duplicate keys {join} in the upsert data")
+            if not len(rows):
+                return None
+            for k in join:
+                if rows.column(k).null_count:
+                    raise ConfigurationError(f"upsert key {k!r} has null values")
+            with warnings.catch_warnings():
+                # New keys only: nothing to replace is the normal case here.
+                warnings.filterwarnings("ignore", "Delete operation did not match any records")
+                t.overwrite(
+                    rows, overwrite_filter=_key_filter(rows, join), snapshot_properties=props
+                )
+            return None
 
         return self._write("upsert", tenant, table, data, batch_id, apply)
 
