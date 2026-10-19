@@ -102,6 +102,10 @@ class ClientOptions(TypedDict, total=False):
     aws_secret_access_key: str | None
     aws_session_token: str | None
     force_path_style: bool | None
+    manifests: bool
+    """Write a commit manifest entry after each batch (and each flushed part of
+    a stream), so consumers can read changes with
+    :meth:`LakeReader.changes` instead of listing data objects. Default off."""
 
 
 class BronzeIngestionClient:

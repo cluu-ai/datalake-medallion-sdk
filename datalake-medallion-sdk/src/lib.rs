@@ -58,6 +58,7 @@ pub mod contracts;
 pub mod dlq;
 pub mod envelope;
 pub mod error;
+pub mod manifest;
 pub mod otel;
 pub mod pipeline;
 #[cfg(feature = "python")]

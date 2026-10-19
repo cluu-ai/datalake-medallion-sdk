@@ -23,8 +23,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use super::path::{
-    data_key, data_type_slug, dlq_key, validate_bucket_name, validate_prefix, ObjectPath,
-    PartitionOrder,
+    data_key, data_type_slug, dlq_key, manifest_key, manifest_prefix, validate_bucket_name,
+    validate_prefix, ObjectPath, PartitionOrder,
 };
 use super::TenantId;
 use crate::error::DatalakeError;
@@ -260,6 +260,34 @@ impl TenantProfile {
             file_id,
         )?;
         Ok(ObjectPath::new(&loc.bucket, key))
+    }
+
+    /// Path of a commit manifest entry of `data_type` (see
+    /// [`crate::manifest`]).
+    ///
+    /// # Errors
+    ///
+    /// [`DatalakeError::Configuration`] for an invalid data type.
+    pub fn manifest_path(
+        &self,
+        data_type: &str,
+        at: &DateTime<Utc>,
+        file_id: &str,
+    ) -> Result<ObjectPath, DatalakeError> {
+        let loc = self.required(Layer::Bronze);
+        let key = manifest_key(&loc.prefix, &self.tenant_id, data_type, at, file_id)?;
+        Ok(ObjectPath::new(&loc.bucket, key))
+    }
+
+    /// `s3://` prefix of the commit manifests of `data_type`.
+    ///
+    /// # Errors
+    ///
+    /// [`DatalakeError::Configuration`] for an invalid data type.
+    pub fn manifest_prefix(&self, data_type: &str) -> Result<String, DatalakeError> {
+        let loc = self.required(Layer::Bronze);
+        let prefix = manifest_prefix(&loc.prefix, &self.tenant_id, data_type)?;
+        Ok(format!("s3://{}/{prefix}", loc.bucket))
     }
 
     /// Location of a dead-letter object.

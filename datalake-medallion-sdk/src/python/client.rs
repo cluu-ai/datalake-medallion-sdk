@@ -202,6 +202,7 @@ impl PyBronzeIngestionClient {
         aws_secret_access_key = None,
         aws_session_token = None,
         force_path_style = None,
+        manifests = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -218,6 +219,7 @@ impl PyBronzeIngestionClient {
         aws_secret_access_key: Option<String>,
         aws_session_token: Option<String>,
         force_path_style: Option<bool>,
+        manifests: bool,
     ) -> PyResult<Self> {
         let invalid_records = match on_invalid {
             "quarantine" => InvalidRecordPolicy::Quarantine,
@@ -234,6 +236,7 @@ impl PyBronzeIngestionClient {
             max_record_bytes,
             max_future_skew: max_future_skew_seconds.map(Duration::seconds),
             invalid_records,
+            manifests,
             ..PipelineConfig::default()
         };
 

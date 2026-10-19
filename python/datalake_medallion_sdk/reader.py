@@ -39,6 +39,7 @@ Engines (choose with ``engine=``):
 
 from __future__ import annotations
 
+import json
 import logging
 import operator
 import os
@@ -62,7 +63,7 @@ if TYPE_CHECKING:
     import pyarrow.fs as pafs
     from pyiceberg.catalog import Catalog
 
-__all__ = ["Engine", "LakeReader", "Predicate", "TableRef"]
+__all__ = ["ChangeSet", "Engine", "LakeReader", "Predicate", "TableRef"]
 
 Engine = Literal["polars", "duckdb"]
 Layer = Literal["bronze", "silver", "gold"]
@@ -83,6 +84,37 @@ _INTEGER_PARTITIONS = ("year", "month", "day")
 _MAX_STALENESS = 3600.0
 
 logger = logging.getLogger(__name__)
+
+
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def _ulid_ms(text: str) -> int:
+    """Milliseconds since the epoch encoded in a ULID."""
+    value = 0
+    for char in text[:10]:
+        value = value * 32 + _CROCKFORD.index(char)
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ChangeSet:
+    """Commit manifest entries of a table after a watermark; see :meth:`LakeReader.changes`."""
+
+    entries: list[dict[str, Any]]
+    """Entries in commit order (``batch_id``, ``data``, ``dead_letters``,
+    ``records_ok``, ``event_time``... as written by the client)."""
+    watermark: str | None
+    """Pass as ``since=`` to get only later entries; unchanged when there are none."""
+
+    @property
+    def data_uris(self) -> list[str]:
+        """Parquet objects of the entries, each once, in commit order."""
+        seen: dict[str, None] = {}
+        for entry in self.entries:
+            for obj in entry["data"]:
+                seen.setdefault(obj["uri"], None)
+        return list(seen)
 
 
 @dataclass(frozen=True, slots=True)
@@ -856,6 +888,72 @@ class LakeReader:
         if entry.source.empty:
             return self._engine.empty()
         return self._engine.scan(entry.base)
+
+    def changes(
+        self,
+        tenant: TenantProfile | str,
+        table: TableRef,
+        *,
+        since: str | None = None,
+        settle_seconds: float = 120.0,
+        limit: int | None = None,
+    ) -> ChangeSet:
+        """Commit manifest entries of a Bronze table written after ``since``.
+
+        Needs a client created with ``manifests=True``. Entries are returned in
+        commit order with a new watermark to pass as ``since=`` next time, so
+        an incremental job (Silver, an indexer) processes each committed batch
+        once without listing data objects. Only complete batches have entries.
+
+        Entries younger than ``settle_seconds`` are left for the next call, so
+        a writer whose clock is behind cannot commit an entry before the
+        watermark; keep it above the clock skew between writers. An entry may
+        repeat the ``batch_id`` of an earlier one (the same batch ingested
+        again): treat ``batch_id`` or the object URI as the unit to replace.
+        """
+        if table.layer != "bronze":
+            raise ConfigurationError("changes() reads the manifests of Bronze tables")
+        profile = self._profile(tenant)
+        prefix = profile.manifest_prefix(table.name).removeprefix("s3://").rstrip("/")
+        fs = self._s3.filesystem()
+        import pyarrow.fs as pafs
+
+        since_day = ""
+        if since:
+            day = time.gmtime(_ulid_ms(since) / 1000)
+            since_day = f"date={day.tm_year:04d}-{day.tm_mon:02d}-{day.tm_mday:02d}"
+        days = sorted(
+            info.base_name
+            for info in fs.get_file_info(pafs.FileSelector(prefix, allow_not_found=True))
+            if info.type == pafs.FileType.Directory and info.base_name >= since_day
+        )
+        cutoff_ms = int((time.time() - settle_seconds) * 1000)
+        names: list[str] = []
+        for day in days:
+            listed = fs.get_file_info(pafs.FileSelector(f"{prefix}/{day}", allow_not_found=True))
+            names.extend(
+                f"{day}/{info.base_name}" for info in listed if info.base_name.endswith(".json")
+            )
+        names.sort(key=lambda n: n.split("/", 1)[1])
+        chosen: list[str] = []
+        for name in names:
+            stem = name.split("/", 1)[1].removesuffix(".json")
+            if since is not None and stem <= since:
+                continue
+            if _ulid_ms(stem) > cutoff_ms:
+                break  # later entries are younger still
+            chosen.append(name)
+            if limit is not None and len(chosen) >= limit:
+                break
+
+        def load(name: str) -> dict[str, Any]:
+            with fs.open_input_stream(f"{prefix}/{name}") as handle:
+                return cast("dict[str, Any]", json.loads(handle.read()))
+
+        with ThreadPoolExecutor(min(16, max(1, len(chosen)))) as pool:
+            entries = list(pool.map(load, chosen))
+        watermark = chosen[-1].split("/", 1)[1].removesuffix(".json") if chosen else since
+        return ChangeSet(entries, watermark)
 
     def files(self, tenant: TenantProfile | str, table: TableRef) -> list[str]:
         """Objects (Parquet) or the metadata file (Iceberg) a read of ``table`` scans."""

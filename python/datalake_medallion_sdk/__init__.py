@@ -70,7 +70,7 @@ from .metrics import (
     Metric,
     MetricsSink,
 )
-from .reader import LakeReader, TableRef
+from .reader import ChangeSet, LakeReader, TableRef
 from .tenancy import DataKeyProvider, FieldProtector, TenantResolver
 
 # PEP 440 version of the installed distribution (the Rust crate uses SemVer,
@@ -79,6 +79,7 @@ __version__: str = _dist_version("datalake-medallion-sdk")
 
 __all__ = [
     "BronzeIngestionClient",
+    "ChangeSet",
     "ClientOptions",
     "ConfigurationError",
     "ContractBootError",
