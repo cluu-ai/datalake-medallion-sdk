@@ -322,3 +322,17 @@ def test_partition_scoped_upserts_leave_other_partitions_alone(
     }
     assert after == before, "the other day's files were not rewritten"
     assert values(reader, "acme-001")[1] == "new"
+
+
+def test_compaction_stops_within_its_budget_and_resumes(
+    writer: LakeWriter, reader: LakeReader
+) -> None:
+    for day in ("2026-10-01", "2026-10-02", "2026-10-03"):
+        for i in range(4):
+            writer.append("acme-001", SHARED, rows([i], "a", day=day))
+    maintenance = LakeMaintenance(writer)
+    first = maintenance.compact("acme-001", SHARED, max_groups=1)
+    assert (first.partitions, first.remaining) == (1, 2)
+    rest = maintenance.compact("acme-001", SHARED)
+    assert (rest.partitions, rest.remaining) == (2, 0)
+    assert len(reader.read("acme-001", SHARED).column("id")) == 12

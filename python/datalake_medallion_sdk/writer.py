@@ -95,12 +95,15 @@ class CompactionResult:
 
     table: str
     partitions: int
-    """Partitions rewritten."""
+    """Groups of files rewritten (one commit each, within one partition)."""
     files_removed: int
     files_added: int
     bytes_rewritten: int
     conflicts: int
-    """Partitions left for the next run because a writer changed them meanwhile."""
+    """Groups left for the next run because a writer changed them meanwhile."""
+    remaining: int = 0
+    """Groups not reached within ``max_seconds`` / ``max_groups``: the next
+    run continues with them."""
 
 
 def _expressions() -> Any:
@@ -676,61 +679,97 @@ class LakeMaintenance:
         *,
         target_file_mb: int = 128,
         min_files: int = 4,
+        max_seconds: float = 600.0,
+        max_groups: int | None = None,
+        read_threads: int = 16,
     ) -> CompactionResult:
-        """Rewrites the tenant's partitions that have at least ``min_files``
-        files smaller than ``target_file_mb`` into files of about that size."""
-        from pyiceberg.exceptions import ValidationException
+        """Rewrites the tenant's small files (under ``target_file_mb``) into
+        files of about that size, partition by partition.
+
+        Partitions with at least ``min_files`` small files are taken most
+        fragmented first, in groups of at most about twice the target size
+        (memory stays bounded), files read ``read_threads`` at a time. The run
+        stops after ``max_seconds`` or ``max_groups`` and reports what is left
+        in ``CompactionResult.remaining``, so a scheduled run fits its time
+        limit and the next one continues. A group a writer changed meanwhile
+        is skipped (writers win)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from pyiceberg.exceptions import CommitFailedException, ValidationException
         from pyiceberg.io.pyarrow import _dataframe_to_data_files
 
+        started = time.monotonic()
         writer = self._writer
         profile = writer._profile(tenant)
         identifier = writer.identifier(profile, table)
         iceberg = writer._load(identifier)
         ex = _expressions()
         scope = ex.EqualTo(TENANT_COLUMN, profile.tenant_id) if table.shared else ex.AlwaysTrue()
-        small = target_file_mb * 1024 * 1024 * 3 // 4
+        target = target_file_mb * 1024 * 1024
+        small = target * 3 // 4
         by_partition: dict[Any, list[Any]] = {}
         for task in iceberg.scan(row_filter=scope).plan_files():
             if task.delete_files:
                 continue  # merge-on-read files are left to engines that write them
             if task.file.file_size_in_bytes < small:
                 by_partition.setdefault(task.file.partition, []).append(task.file)
-        result = {"partitions": 0, "removed": 0, "added": 0, "bytes": 0, "conflicts": 0}
-        for files in by_partition.values():
+        groups: list[list[Any]] = []
+        for files in sorted(by_partition.values(), key=len, reverse=True):
             if len(files) < min_files:
                 continue
-            iceberg = writer._load(identifier)
-            import pyarrow.parquet as pq
+            group: list[Any] = []
+            size = 0
+            for f in sorted(files, key=lambda f: f.file_size_in_bytes):
+                if group and size + f.file_size_in_bytes > 2 * target:
+                    groups.append(group)
+                    group, size = [], 0
+                group.append(f)
+                size += f.file_size_in_bytes
+            if len(group) > 1:
+                groups.append(group)
+        result = {"partitions": 0, "removed": 0, "added": 0, "bytes": 0, "conflicts": 0}
+        done = 0
+        with ThreadPoolExecutor(max(1, read_threads)) as pool:
+            for files in groups:
+                if time.monotonic() - started > max_seconds or (
+                    max_groups is not None and done >= max_groups
+                ):
+                    break
+                done += 1
+                iceberg = writer._load(identifier)
+                io = iceberg.io
 
-            arrays = [pq.read_table(iceberg.io.new_input(f.file_path).open()) for f in files]
-            import pyarrow as pa
+                def read(f: Any, io: Any = io) -> pa.Table:
+                    return pq.read_table(io.new_input(f.file_path).open())
 
-            rows = pa.concat_tables(arrays, promote_options="default").cast(
-                iceberg.schema().as_arrow()
-            )
-            try:
-                tx = iceberg.transaction()
-                with tx.update_snapshot(
-                    snapshot_properties={OPERATION_PROPERTY: "compact"}
-                ).overwrite() as rewrite:
-                    for f in files:
-                        rewrite.delete_data_file(f)
-                    added = list(
-                        _dataframe_to_data_files(
-                            table_metadata=tx.table_metadata, df=rows, io=iceberg.io
+                rows = pa.concat_tables(
+                    list(pool.map(read, files)), promote_options="default"
+                ).cast(iceberg.schema().as_arrow())
+                try:
+                    tx = iceberg.transaction()
+                    with tx.update_snapshot(
+                        snapshot_properties={OPERATION_PROPERTY: "compact"}
+                    ).overwrite() as rewrite:
+                        for f in files:
+                            rewrite.delete_data_file(f)
+                        added = list(
+                            _dataframe_to_data_files(
+                                table_metadata=tx.table_metadata, df=rows, io=iceberg.io
+                            )
                         )
-                    )
-                    for f in added:
-                        rewrite.append_data_file(f)
-                tx.commit_transaction()
-            except ValidationException:
-                result["conflicts"] += 1
-                logger.info("compaction of %s skipped a partition changed meanwhile", identifier)
-                continue
-            result["partitions"] += 1
-            result["removed"] += len(files)
-            result["added"] += len(added)
-            result["bytes"] += sum(f.file_size_in_bytes for f in files)
+                        for f in added:
+                            rewrite.append_data_file(f)
+                    tx.commit_transaction()
+                except (ValidationException, CommitFailedException):
+                    result["conflicts"] += 1
+                    logger.info("compaction of %s skipped a group changed meanwhile", identifier)
+                    continue
+                result["partitions"] += 1
+                result["removed"] += len(files)
+                result["added"] += len(added)
+                result["bytes"] += sum(f.file_size_in_bytes for f in files)
         return CompactionResult(
             identifier,
             result["partitions"],
@@ -738,6 +777,7 @@ class LakeMaintenance:
             result["added"],
             result["bytes"],
             result["conflicts"],
+            remaining=len(groups) - done,
         )
 
     @traced("maintenance.expire_snapshots")
