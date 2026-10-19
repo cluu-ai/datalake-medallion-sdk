@@ -104,6 +104,26 @@ print(events.num_rows)  # a pyarrow.Table
 
 The rest of this page covers each piece in depth.
 
+## Which client do I use?
+
+| You have… | Use | Measured on AWS¹ |
+|---|---|---|
+| Micro-batches: an API call, a queue message, a Lambda batch | `client.ingest(batch, tenant=, contract=)` with dicts, JSON or Arrow | 200 k records in 1.4–2.2 s (SDK part) |
+| A file, local or on S3: CSV, TSV, JSON Lines, Parquet, gz/zst | `client.ingest_file("s3://…")` | 3.16 M records: Parquet **4.0 s**, CSV 5.6 s, JSONL 10.2 s; **0.5–0.9 GB** of memory |
+| An Arrow stream: pyarrow dataset, DuckDB result, Polars, Kafka batches… | `client.ingest_stream(reader)` | 0.7–0.8 M records/s with bounded memory |
+| A DataFrame already in memory | `client.ingest(df)` | 0.5 M records/s (one object) |
+| Repeated per-tenant reads: APIs, dashboards | `LakeReader(cache_mb=1024)` (Polars) | **22–67 ms** per query on 3.1 M rows |
+| One-off or low-memory reads, SQL | `LakeReader(engine="duckdb")` | 100–950 ms, 0.3–0.7 GB |
+| Encrypted PII to read back | `PiiDecryptor.decrypt_column(...)` | 3.1 M values in **1.1 s** |
+
+¹ AWS Lambda with 10 GB / 6 vCPU, reading from and writing to S3 in the same region. Methodology, local numbers and every configuration are in [docs/performance.md](docs/performance.md).
+
+Rules of thumb:
+- **Columnar input** (Parquet, Arrow) is 3–6x faster than JSON or dicts.
+- **Streams** keep memory flat: 2 GB of JSON Lines peaks at about 0.4 GB.
+- **Retries** with the same `batch_id` / `stream_id` never duplicate rows.
+- **PII stays as received** unless the tenant's profile protects it.
+
 ## Data contracts
 
 A contract is a JSON Schema (draft 2020-12) document plus a few keywords under an extension prefix (`x-dl-` by default, configurable per registry):
@@ -323,10 +343,10 @@ by_outcome = (
   - `TableRef.iceberg(layer, name)`: an Iceberg table in the tenant's location, or a table shared by tenants named with `location=`, `metadata_location=` or `identifier=` (with `catalog=`, any [pyiceberg catalog](https://py.iceberg.apache.org/configuration/): REST, Glue, SQL, …). Without a catalog the current snapshot is the newest `metadata/*.metadata.json`; use a catalog when several writers commit concurrently.
 - **Caching.** Listings, Iceberg snapshots and scan plans are reused for `max_staleness` seconds (default 60); `reader.refresh(tenant)` makes new data visible at once. With `cache_mb=512` (off by default), the contents of Parquet objects stay in memory as well: the SDK never rewrites an object, so warm reads fetch only new ones. Use it in services that read Bronze repeatedly.
 - **Pruning.** Filters on `year`, `month` and `day` (the Bronze partition columns) skip whole objects.
-- **Engines.** `engine="polars"` (default, extra `[read]`) is the fastest for repeated reads. `engine="duckdb"` (extra `[duckdb]`) uses about half the memory, starts fastest (good for short-lived functions) and `scan()` returns a DuckDB relation that accepts SQL (`relation.query("t", "SELECT ...")`). DuckDB downloads its `httpfs` and `iceberg` extensions on first use; on AWS Lambda pass `duckdb_config={"home_directory": "/tmp"}`, or point `extension_directory` at pre-installed extensions for offline environments.
+- **Engines.** `engine="polars"` (default, extra `[read]`) is the fastest with `cache_mb`. `engine="duckdb"` (extra `[duckdb]`) is the better choice without a cache and uses the least memory and `scan()` returns a DuckDB relation that accepts SQL (`relation.query("t", "SELECT ...")`). DuckDB downloads its `httpfs` and `iceberg` extensions on first use; on AWS Lambda pass `duckdb_config={"home_directory": "/tmp"}`, or point `extension_directory` at pre-installed extensions for offline environments.
 - **Credentials.** The same options as the client (`aws_region`, `aws_endpoint_url`, keys) or the AWS default chain. The reader role needs `s3:ListBucket` and `s3:GetObject` on the tenant's locations only ([policy examples](docs/iam.md)).
 
-On AWS Lambda against S3, warm reads of one tenant out of 8 (3.16 M rows) take 5–27 ms from Bronze with `cache_mb` and 67–147 ms from Iceberg, against 0.9–2.1 s for the same queries in Athena. Details in [docs/performance.md](docs/performance.md).
+On AWS Lambda against S3, warm queries over 3.1 M rows take 22–67 ms with Polars and `cache_mb`, and 100–950 ms with DuckDB without a cache; Iceberg tables take 67–147 ms without a cache. Athena takes 0.9–2.1 s for the same queries. Details in [docs/performance.md](docs/performance.md).
 
 ## Object layout
 
@@ -405,7 +425,11 @@ See the [changelog](CHANGELOG.md) for the full list.
 
 ## Performance
 
-A 200 MiB batch (869 k records) is validated and encoded in 0.42 s from Arrow (500 MiB/s, 200 MiB peak heap) and 2.71 s from JSON text, without PII protection; protection adds 30–85%. Streaming a 2 GB JSON Lines file peaks at 436 MB. Benchmarks, methodology and reader numbers are in [docs/performance.md](docs/performance.md).
+- **One call:** 200 MiB validated and encoded in **0.38 s from Arrow** (550 MiB/s) and 2.3 s from JSON, without network.
+- **Streams:** files of any size at 0.3–0.8 M records/s with under 1 GB of memory.
+- **Reads:** 22–67 ms per tenant query with the reader cache.
+
+Full results, the environment and tuning are in [docs/performance.md](docs/performance.md).
 
 ## Rust crate
 
