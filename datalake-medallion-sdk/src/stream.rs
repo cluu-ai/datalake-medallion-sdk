@@ -293,10 +293,14 @@ impl BronzePipeline {
         let runtime = Handle::try_current()
             .map_err(|_| DatalakeError::config("a stream must be opened inside a Tokio runtime"))?;
         let (jobs, receiver) = mpsc::channel(options.max_inflight_parts);
+        // Memory for uploads stays at `max_inflight_parts` parts' worth of
+        // bytes; small objects share that budget, so many go out at once.
         let uploader = runtime.spawn(upload(
             Arc::clone(self.storage()),
             receiver,
-            options.max_inflight_parts,
+            options
+                .max_inflight_parts
+                .saturating_mul(options.part_bytes),
         ));
         Ok(BronzeStream {
             pipeline: Arc::clone(self),
@@ -824,8 +828,23 @@ impl Drop for BronzeStream {
     }
 }
 
-/// Object index, part number, `ETag` and size of an uploaded part.
-type PartDone = (usize, i32, String, u64);
+/// A finished upload request.
+enum Done {
+    /// Part `number` of object `object` and its `ETag`.
+    Part {
+        object: usize,
+        number: i32,
+        etag: String,
+        size: usize,
+    },
+    /// A whole object written with one request.
+    Put { size: usize },
+}
+
+/// Requests in flight at most, whatever their size: many small objects
+/// (one per event day) go out together without opening hundreds of
+/// connections.
+const MAX_REQUESTS: usize = 32;
 
 /// An object whose parts are being uploaded.
 struct Upload {
@@ -833,18 +852,90 @@ struct Upload {
     id: String,
 }
 
-/// Upload task: runs parts concurrently (several objects may be open when
-/// the stream partitions by event day), completes objects, and aborts the
-/// unfinished uploads when the stream stops early. Returns bytes uploaded.
+/// Requests running in the upload task, bounded by the bytes they hold.
+struct Running {
+    set: JoinSet<Result<Done, DatalakeError>>,
+    /// Bytes of the bodies in flight.
+    inflight: usize,
+    budget: usize,
+    /// `ETag`s of finished parts by object.
+    done: HashMap<usize, Vec<(i32, String)>>,
+    /// Bytes uploaded.
+    uploaded: u64,
+}
+
+impl Running {
+    /// Records one finished request.
+    fn settle(
+        &mut self,
+        finished: Result<Result<Done, DatalakeError>, tokio::task::JoinError>,
+    ) -> Result<(), DatalakeError> {
+        let done = finished
+            .map_err(|e| DatalakeError::storage("stream", format!("upload failed: {e}")))??;
+        let size = match done {
+            Done::Part {
+                object,
+                number,
+                etag,
+                size,
+            } => {
+                self.done.entry(object).or_default().push((number, etag));
+                size
+            }
+            Done::Put { size } => size,
+        };
+        self.inflight -= size;
+        self.uploaded += size as u64;
+        Ok(())
+    }
+
+    /// Waits until a body of `size` bytes fits in the budget. One request
+    /// always runs, so a body larger than the budget still goes out alone.
+    async fn make_room(&mut self, size: usize) -> Result<(), DatalakeError> {
+        while !self.set.is_empty()
+            && (self.inflight + size > self.budget || self.set.len() >= MAX_REQUESTS)
+        {
+            if let Some(finished) = self.set.join_next().await {
+                self.settle(finished)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits for every request.
+    async fn drain(&mut self) -> Result<(), DatalakeError> {
+        while let Some(finished) = self.set.join_next().await {
+            self.settle(finished)?;
+        }
+        Ok(())
+    }
+
+    fn spawn<F>(&mut self, size: usize, request: F)
+    where
+        F: std::future::Future<Output = Result<Done, DatalakeError>> + Send + 'static,
+    {
+        self.inflight += size;
+        self.set.spawn(request);
+    }
+}
+
+/// Upload task: runs parts and small objects concurrently within `budget`
+/// bytes in flight (several objects may be open when the stream partitions
+/// by event day), completes objects, and aborts the unfinished uploads when
+/// the stream stops early. Returns bytes uploaded.
 async fn upload(
     storage: Arc<dyn ObjectStorage>,
     mut jobs: mpsc::Receiver<Job>,
-    max_inflight: usize,
+    budget: usize,
 ) -> Result<u64, DatalakeError> {
     let mut open: HashMap<usize, Upload> = HashMap::new();
-    let mut parts: JoinSet<Result<PartDone, DatalakeError>> = JoinSet::new();
-    let mut done: HashMap<usize, Vec<(i32, String)>> = HashMap::new();
-    let mut bytes: u64 = 0;
+    let mut running = Running {
+        set: JoinSet::new(),
+        inflight: 0,
+        budget,
+        done: HashMap::new(),
+        uploaded: 0,
+    };
     let result: Result<(), DatalakeError> = async {
         while let Some(job) = jobs.recv().await {
             match job {
@@ -853,8 +944,13 @@ async fn upload(
                     body,
                     content_type,
                 } => {
-                    bytes += body.len() as u64;
-                    retrying(|| storage.put(&path, body.clone(), content_type)).await?;
+                    let size = body.len();
+                    running.make_room(size).await?;
+                    let storage = Arc::clone(&storage);
+                    running.spawn(size, async move {
+                        retrying(|| storage.put(&path, body.clone(), content_type)).await?;
+                        Ok(Done::Put { size })
+                    });
                 }
                 Job::Part {
                     object,
@@ -871,39 +967,30 @@ async fn upload(
                             id,
                         });
                     }
-                    while parts.len() >= max_inflight {
-                        if let Some(finished) = parts.join_next().await {
-                            let (o, n, etag, size) = joined(finished)?;
-                            done.entry(o).or_default().push((n, etag));
-                            bytes += size;
-                        }
-                    }
+                    let size = body.len();
+                    running.make_room(size).await?;
                     let storage = Arc::clone(&storage);
                     let id = open.get(&object).map(|u| u.id.clone()).unwrap_or_default();
-                    parts.spawn(async move {
-                        let size = body.len() as u64;
+                    running.spawn(size, async move {
                         let etag =
                             retrying(|| storage.upload_part(&path, &id, number, body.clone()))
                                 .await?;
-                        Ok((object, number, etag, size))
+                        Ok(Done::Part {
+                            object,
+                            number,
+                            etag,
+                            size,
+                        })
                     });
                 }
                 Job::Barrier(ack) => {
-                    while let Some(finished) = parts.join_next().await {
-                        let (o, n, etag, size) = joined(finished)?;
-                        done.entry(o).or_default().push((n, etag));
-                        bytes += size;
-                    }
+                    running.drain().await?;
                     let _ = ack.send(());
                 }
                 Job::Complete { object } => {
-                    while let Some(finished) = parts.join_next().await {
-                        let (o, n, etag, size) = joined(finished)?;
-                        done.entry(o).or_default().push((n, etag));
-                        bytes += size;
-                    }
+                    running.drain().await?;
                     if let Some(upload) = open.remove(&object) {
-                        let mut etags = done.remove(&object).unwrap_or_default();
+                        let mut etags = running.done.remove(&object).unwrap_or_default();
                         etags.sort_unstable_by_key(|(n, _)| *n);
                         storage
                             .complete_multipart(&upload.path, &upload.id, etags)
@@ -912,18 +999,18 @@ async fn upload(
                 }
             }
         }
-        Ok(())
+        running.drain().await
     }
     .await;
     if result.is_err() || !open.is_empty() {
-        parts.abort_all();
+        running.set.abort_all();
         for (_, upload) in open.drain() {
             if let Err(e) = storage.abort_multipart(&upload.path, &upload.id).await {
                 tracing::warn!(error = %e, uri = %upload.path.uri, "could not abort multipart upload");
             }
         }
     }
-    result.map(|()| bytes)
+    result.map(|()| running.uploaded)
 }
 
 /// Attempts per request beyond the AWS SDK's own retries: parts and objects
@@ -947,12 +1034,6 @@ where
             other => return other,
         }
     }
-}
-
-fn joined(
-    finished: Result<Result<PartDone, DatalakeError>, tokio::task::JoinError>,
-) -> Result<PartDone, DatalakeError> {
-    finished.map_err(|e| DatalakeError::storage("stream", format!("part upload failed: {e}")))?
 }
 
 #[cfg(test)]
@@ -1679,6 +1760,143 @@ mod event_time_tests {
             assert_eq!(again.data_uris, report.data_uris, "retries reuse the keys");
             assert_eq!(storage.keys(), keys);
         }
+    }
+
+    /// Store that sleeps on every request and records the most requests and
+    /// body bytes in flight at once.
+    #[derive(Default)]
+    struct SlowStore {
+        inner: InMemoryStorage,
+        requests: std::sync::atomic::AtomicUsize,
+        bytes: std::sync::atomic::AtomicUsize,
+        max_requests: std::sync::atomic::AtomicUsize,
+        max_bytes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SlowStore {
+        async fn timed<T>(&self, size: usize, call: impl std::future::Future<Output = T>) -> T {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.requests.fetch_add(1, SeqCst) + 1;
+            let b = self.bytes.fetch_add(size, SeqCst) + size;
+            self.max_requests.fetch_max(n, SeqCst);
+            self.max_bytes.fetch_max(b, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let out = call.await;
+            self.requests.fetch_sub(1, SeqCst);
+            self.bytes.fetch_sub(size, SeqCst);
+            out
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStorage for SlowStore {
+        async fn put(&self, path: &ObjectPath, body: Bytes, ct: &str) -> Result<(), DatalakeError> {
+            self.timed(body.len(), self.inner.put(path, body.clone(), ct))
+                .await
+        }
+        async fn create_multipart(
+            &self,
+            path: &ObjectPath,
+            ct: &str,
+        ) -> Result<String, DatalakeError> {
+            self.inner.create_multipart(path, ct).await
+        }
+        async fn upload_part(
+            &self,
+            path: &ObjectPath,
+            id: &str,
+            n: i32,
+            body: Bytes,
+        ) -> Result<String, DatalakeError> {
+            self.timed(
+                body.len(),
+                self.inner.upload_part(path, id, n, body.clone()),
+            )
+            .await
+        }
+        async fn complete_multipart(
+            &self,
+            path: &ObjectPath,
+            id: &str,
+            parts: Vec<(i32, String)>,
+        ) -> Result<(), DatalakeError> {
+            self.inner.complete_multipart(path, id, parts).await
+        }
+        async fn abort_multipart(&self, path: &ObjectPath, id: &str) -> Result<(), DatalakeError> {
+            self.inner.abort_multipart(path, id).await
+        }
+    }
+
+    fn slow_pipeline(store: &Arc<SlowStore>) -> Arc<BronzePipeline> {
+        let mut schema = serde_json::json!({
+            "type": "object", "x-dl-domain": "app", "x-dl-datatype": "log",
+            "x-dl-schema_version": "1.0.0", "x-dl-partition_by": "at",
+            "required": ["id"],
+            "properties": {
+                "id": {"type": "string"},
+                "at": {"type": "string", "format": "date-time", "x-dl-type": "timestamp"},
+                "msg": {"type": "string"}
+            }
+        });
+        schema["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
+        let mut r = ContractRegistry::default();
+        r.register(&schema).unwrap();
+        let config = PipelineConfig {
+            max_future_skew: None,
+            ..PipelineConfig::default()
+        };
+        let storage: Arc<dyn ObjectStorage> = Arc::<SlowStore>::clone(store);
+        Arc::new(BronzePipeline::new(Arc::new(r), storage, config).unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn small_objects_upload_concurrently_within_the_byte_budget() {
+        use std::sync::atomic::Ordering::SeqCst;
+        // Stream: 9 event days with one open object at a time -> many small
+        // objects, each a single PUT.
+        let store = Arc::new(SlowStore::default());
+        let options = StreamOptions {
+            max_open_days: 1,
+            ..small(&Ulid::generate().to_string(), 1)
+        };
+        let budget = options.max_inflight_parts * options.part_bytes;
+        let source: Vec<_> = (0..6).map(|c| Ok(chunk(c * 900, 900, 9))).collect();
+        let report = slow_pipeline(&store)
+            .ingest_stream(tenant(), CONTRACT, None, source, options)
+            .await
+            .unwrap();
+        assert_eq!(report.records_ok, 5_400);
+        assert!(report.data_uris.len() >= 9, "{}", report.data_uris.len());
+        assert!(
+            store.max_requests.load(SeqCst) > 1,
+            "small objects went one by one"
+        );
+        assert!(
+            store.max_bytes.load(SeqCst) <= budget,
+            "byte budget exceeded"
+        );
+        assert_eq!(store.inner.keys().len(), report.data_uris.len());
+
+        // One-shot ingest: one object per event day, written concurrently.
+        let store = Arc::new(SlowStore::default());
+        let p = slow_pipeline(&store);
+        let RecordSource::Arrow(batches) = chunk(0, 900, 9) else {
+            unreachable!()
+        };
+        let report = p
+            .ingest(crate::pipeline::IngestRequest::new(
+                tenant(),
+                CONTRACT,
+                RecordSource::Arrow(batches),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(report.data_uris.len(), 9);
+        assert!(
+            store.max_requests.load(SeqCst) > 1,
+            "objects went one by one"
+        );
+        assert_eq!(store.inner.keys().len(), 9);
     }
 
     #[test]
