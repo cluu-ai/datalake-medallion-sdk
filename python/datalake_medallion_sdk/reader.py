@@ -293,8 +293,10 @@ class _ObjectCache:
     """Arrow contents of Parquet objects by path, least recently used out.
 
     Safe because the objects are immutable: the ingestion client writes each
-    object once under a unique name (a retry rewrites identical content), so
-    a cached object never goes stale; new objects are found by the listing.
+    object once under a unique name, and new objects are found by the
+    listing. Entries are keyed by path, size and modification time, so an
+    object rewritten in place (a stream retried with the same id) is read
+    again rather than served stale.
     """
 
     def __init__(self, capacity_bytes: int, s3: _S3) -> None:
@@ -319,30 +321,33 @@ class _ObjectCache:
             table = table.append_column(key, column)
         return table
 
-    def table(self, files: Sequence[str]) -> pa.Table | None:
-        """All ``files`` as one table, fetching only the missing ones; None when
-        they do not fit in the cache."""
+    def table(self, files: Sequence[tuple[str, str]]) -> pa.Table | None:
+        """All ``(path, version)`` objects as one table, fetching only the
+        missing ones; None when they do not fit in the cache."""
         import pyarrow as pa
 
+        keys = [f"{path}#{version}" for path, version in files]
         with self._lock:
-            missing = [f for f in files if f not in self._tables]
+            missing = [
+                (k, p) for k, (p, _) in zip(keys, files, strict=True) if k not in self._tables
+            ]
         if missing:
             with ThreadPoolExecutor(min(32, len(missing))) as pool:
-                loaded = dict(zip(missing, pool.map(self._load, missing), strict=True))
+                tables = list(pool.map(self._load, [p for _, p in missing]))
             with self._lock:
-                for path, table in loaded.items():
-                    if path not in self._tables:
-                        self._tables[path] = table
+                for (key, _), table in zip(missing, tables, strict=True):
+                    if key not in self._tables:
+                        self._tables[key] = table
                         self._size += table.nbytes
         with self._lock:
             parts = []
-            for path in files:
-                cached = self._tables.get(path)
+            for key in keys:
+                cached = self._tables.get(key)
                 if cached is None:
                     return None
-                self._tables.move_to_end(path)
+                self._tables.move_to_end(key)
                 parts.append(cached)
-            wanted = set(files)
+            wanted = set(keys)
             while self._size > self._capacity and self._tables:
                 oldest = next(iter(self._tables))
                 if oldest in wanted:
@@ -350,8 +355,8 @@ class _ObjectCache:
                 self._size -= self._tables.pop(oldest).nbytes
             if self._size > self._capacity:
                 # This table alone does not fit: do not keep it.
-                for path in files:
-                    dropped = self._tables.pop(path, None)
+                for key in keys:
+                    dropped = self._tables.pop(key, None)
                     if dropped is not None:
                         self._size -= dropped.nbytes
                 logger.warning("table larger than the reader cache; reading it from S3")
@@ -820,13 +825,14 @@ class LakeReader:
 
     def _resolve(self, profile: TenantProfile, table: TableRef) -> _Source:
         if table.format == "parquet":
-            files = sorted(
-                f"s3://{info.path}"
+            listed = sorted(
+                (f"s3://{info.path}", f"{info.size}:{info.mtime_ns}")
                 for info in self._s3.list(self._prefix(profile, table))
                 if info.path.endswith(".parquet") and info.size
             )
-            cached = self._objects.table(files) if self._objects is not None and files else None
-            return _Source(files=tuple(files), table=cached)
+            files = tuple(path for path, _ in listed)
+            cached = self._objects.table(listed) if self._objects is not None and files else None
+            return _Source(files=files, table=cached)
         if table.metadata_location is not None:
             return _Source(metadata_location=table.metadata_location)
         if table.identifier is not None:

@@ -38,6 +38,20 @@ pub(crate) fn arrow_type(kind: FieldKind) -> DataType {
     }
 }
 
+/// Arrow schema to parse JSON records of `contract` into, or `None` when a
+/// field is an object, array or union (those stay on the row path).
+pub(crate) fn json_input_schema(contract: &Contract) -> Option<Schema> {
+    contract
+        .fields()
+        .iter()
+        .map(|f| match f.kind {
+            FieldKind::Json => None,
+            kind => Some(Field::new(&f.name, arrow_type(kind), true)),
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(Schema::new)
+}
+
 /// Integers may arrive as integral floats (`1.0` is a JSON Schema integer).
 fn as_i64(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| {
@@ -245,6 +259,88 @@ fn mismatch(field: &str) -> DatalakeError {
 /// same validation as JSON input. Supports every type `arrow-json` can write
 /// (nested lists and structs, decimals, temporal types); anything else fails
 /// the batch instead of being silently altered.
+/// Result of [`coerce_text`].
+pub(crate) struct Coerced {
+    /// Rows whose values all parsed, with declared types.
+    pub typed: RecordBatch,
+    /// Input index of each row of `typed`.
+    pub kept: Vec<usize>,
+    /// Rows with a value that did not parse, as received, with their indices.
+    pub unparsed: Option<(RecordBatch, Vec<usize>)>,
+}
+
+/// Parses text columns of `integer`, `number` and `boolean` fields into
+/// `Int64`, `Float64` and `Boolean`. Other columns are left as they are.
+pub(crate) fn coerce_text(
+    contract: &Contract,
+    batch: &RecordBatch,
+) -> Result<Coerced, DatalakeError> {
+    use arrow::array::{Array, BooleanArray};
+    use arrow::compute::filter_record_batch;
+    use arrow::compute::kernels::cast::{cast_with_options, CastOptions};
+
+    let arrow_err = |e: arrow::error::ArrowError| DatalakeError::MalformedPayload {
+        reason: format!("cannot parse text columns: {e}"),
+    };
+    let rows = batch.num_rows();
+    let options = CastOptions {
+        safe: true,
+        ..CastOptions::default()
+    };
+    let mut failed = vec![false; rows];
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    for (input, array) in batch.schema().fields().iter().zip(batch.columns()) {
+        let target = contract
+            .fields()
+            .iter()
+            .find(|f| f.name == *input.name())
+            .and_then(|f| match f.kind {
+                FieldKind::Integer => Some(DataType::Int64),
+                FieldKind::Number => Some(DataType::Float64),
+                FieldKind::Boolean => Some(DataType::Boolean),
+                _ => None,
+            });
+        let is_text = matches!(
+            array.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        );
+        match target {
+            Some(target) if is_text => {
+                let parsed = cast_with_options(array, &target, &options).map_err(arrow_err)?;
+                for (i, flag) in failed.iter_mut().enumerate() {
+                    if array.is_valid(i) && parsed.is_null(i) {
+                        *flag = true;
+                    }
+                }
+                fields.push(Field::new(input.name(), target, true));
+                columns.push(parsed);
+            }
+            _ => {
+                fields.push(input.as_ref().clone());
+                columns.push(Arc::clone(array));
+            }
+        }
+    }
+    let typed = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(arrow_err)?;
+    if !failed.iter().any(|f| *f) {
+        return Ok(Coerced {
+            typed,
+            kept: (0..rows).collect(),
+            unparsed: None,
+        });
+    }
+    let keep = BooleanArray::from_iter(failed.iter().map(|f| Some(!f)));
+    let drop = BooleanArray::from_iter(failed.iter().map(|f| Some(*f)));
+    let typed = filter_record_batch(&typed, &keep).map_err(arrow_err)?;
+    let rest = filter_record_batch(batch, &drop).map_err(arrow_err)?;
+    Ok(Coerced {
+        typed,
+        kept: (0..rows).filter(|i| !failed[*i]).collect(),
+        unparsed: Some((rest, (0..rows).filter(|i| failed[*i]).collect())),
+    })
+}
+
 pub(crate) fn arrow_rows(batches: &[RecordBatch]) -> Result<Vec<Box<RawValue>>, DatalakeError> {
     let mut writer = LineDelimitedWriter::new(Vec::new());
     let refs: Vec<&RecordBatch> = batches.iter().collect();

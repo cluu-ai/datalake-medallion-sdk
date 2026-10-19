@@ -189,6 +189,51 @@ With `on_invalid="raise"` the client writes nothing and raises the typed error (
 
 **Inputs.** `ingest` accepts a `dict`, a list of dicts, JSON `str`/`bytes`, or any Arrow object implementing the PyCapsule interface, such as a pyarrow `Table`/`RecordBatch` or a Polars `DataFrame`. Arrow input gets the same validation and results as JSON and is about 4x faster: when every rule of the contract applies to one field at a time, it is checked column by column and only rows that may be invalid are converted to JSON. Validation and encoding run in Rust outside the GIL.
 
+## Large files and streams
+
+`ingest` validates one batch in memory and writes one object. Large files and continuous sources need different handling, because neither fits in memory. `ingest_stream` and `ingest_file` ingest input of any size in chunks, so memory stays bounded:
+
+```python
+# Files: CSV, TSV, JSON Lines or Parquet, local or on S3, optionally .gz/.bz2/.zst/.lz4.
+report = await client.ingest_file(
+    "s3://landing/acme/events-2026-10.jsonl.gz",
+    tenant="acme-001",
+    contract="security/login_event/1.0.0",
+)
+print(report.records_ok, report.records_quarantined, report.data_uris)
+
+# Streams: any Arrow stream (pyarrow RecordBatchReader or dataset scanner, Polars, DuckDB, ...)
+# or any iterable of chunks (lists of dicts, JSON text, Arrow batches...).
+import pyarrow.dataset as ds
+
+scanner = ds.dataset("s3://landing/acme/export/", format="parquet").scanner(batch_size=100_000)
+report = await client.ingest_stream(
+    scanner.to_reader(), tenant="acme-001", contract="security/login_event/1.0.0"
+)
+```
+
+- **Bounded memory.**
+  - Records are validated in chunks (`chunk_rows`, default 131,072 rows) exactly as `ingest` validates a batch.
+  - Accepted rows are encoded into Parquet row groups (`row_group_mb`, default 64).
+  - Each object is uploaded with S3 multipart upload in `part_mb` parts (default 16), up to `max_inflight_parts` at a time (default 4), while the next chunk is validated.
+  - Memory therefore stays at about one chunk, one row group and the parts in flight, whatever the input size.
+- **Right-sized objects.** A new Parquet object starts when the current one reaches `target_object_mb` (default 256 MB). Readers get a few large files instead of thousands of small ones, and no object reaches S3's 5 GB single-upload limit.
+- **Retries without duplicates.**
+  - Objects become visible only when complete, and are named `<stream_id>-00000.parquet`, `-00001`, …
+  - Running the same input again with the same `stream_id` (from `report.stream_id`, or the id in the error log) rewrites the same keys.
+  - An unfinished upload is aborted on error. Add an S3 lifecycle rule `AbortIncompleteMultipartUpload` as a safety net for processes that crash.
+- **Formats.**
+  - **CSV and TSV** are read as text and each value is parsed with the contract's type; empty cells are absent values, and a value that does not parse quarantines its record with the original text.
+  - **JSON Lines** are parsed straight into typed columns when they fit the contract. Lines with `null` or that do not fit take the row path; either way a malformed line quarantines only itself.
+  - **Parquet** is read one row group at a time.
+- **Reports.** `StreamReport` gives `records_received`, `records_ok`, `records_quarantined`, `rejections`, `data_uris`, `dlq_uris`, `bytes_written` and `stream_id`.
+
+`ingest_file` needs pyarrow (`pip install "datalake-medallion-sdk[pyarrow]"`).
+
+From Rust:
+- Use `BronzePipeline::ingest_stream(tenant, contract, hook, chunks, StreamOptions::default())` with any iterator of `RecordSource` chunks: `Arrow`, `JsonLines`, `ArrowText` for CSV read as text, `Json` or `Values`.
+- Or open a `BronzeStream` and `push` chunks yourself.
+
 ## PII protection
 
 Off by default: PII fields keep their declared type and value. Set `pii_protection` on a tenant profile to protect them in Bronze and in the quarantine entries:
@@ -287,7 +332,7 @@ On AWS Lambda against S3, warm reads of one tenant out of 8 (3.16 M rows) take 5
 <quarantine location>/tenant_id=<tenant>/data_type=<datatype>/error_code=<code>/year=YYYY/month=MM/day=DD/<batch_id>.jsonl
 ```
 
-With `partition_order="data_type_first"` the `data_type=` partition comes before `tenant_id=`. Each ingest call writes at most one Parquet object plus one quarantine object per error code. Quarantine objects are written first, so retrying a failed call never duplicates Bronze rows.
+With `partition_order="data_type_first"` the `data_type=` partition comes before `tenant_id=`. Each `ingest` call writes at most one Parquet object plus one quarantine object per error code (streams write one object per `target_object_mb`). Quarantine objects are written first, so retrying a failed call never duplicates Bronze rows.
 
 Lineage columns (prefix `_dl_`, configurable with `envelope_prefix`):
 
@@ -326,8 +371,9 @@ client = BronzeIngestionClient(contracts, tenants=tenants, hooks=hooks.as_mappin
 
 - **Credentials**: the AWS default chain (environment, profile, SSO, web identity, ECS/EC2 roles) unless `aws_access_key_id`/`aws_secret_access_key` are passed. The SDK never creates buckets; the writer role needs `s3:PutObject` on each tenant's bronze and quarantine locations only. See [IAM policy examples](docs/iam.md).
 - **S3-compatible stores** (MinIO, LocalStack, …): `aws_endpoint_url=` (path-style addressing is enabled automatically).
+- **Large inputs**: use `ingest_file` / `ingest_stream` (above) rather than one `ingest` call; S3 lifecycle rule `AbortIncompleteMultipartUpload` recommended.
 - **Client options**: `max_record_bytes` (default 10 MiB), `max_future_skew_seconds` (default 3600, `None` disables), `on_invalid` (`"quarantine"` or `"raise"`), `envelope_prefix` (default `"_dl_"`).
-- **Retries**: `@datalake_retry()` retries `StorageError` only, with exponential backoff and jitter.
+- **Retries and idempotency**: uploads are retried inside the call (4 attempts, exponential backoff with jitter) over the same object keys, so a transient S3 error never duplicates rows. To retry a whole call, for example after a crash, pass the earlier `batch_id=` (or `stream_id=` for streams): the same keys are rewritten instead of adding rows. `@datalake_retry()` retries `StorageError` only.
 - **Metrics**: `@emit_metrics(sink)` records duration, failures and record counts to logging, CloudWatch Embedded Metric Format or any `MetricsSink`.
 - **Concurrency**: one client and one reader per process serve every tenant and bucket; connections are created once and reused. Buckets must be reachable in the client's region.
 
@@ -356,7 +402,7 @@ See the [changelog](CHANGELOG.md) for the full list.
 
 ## Performance
 
-A 200 MiB batch (869 k records) is validated, protected and encoded in 0.64 s from Arrow (326 MiB/s, 173 MiB peak heap) and 2.76 s from JSON text, without PII protection; protection adds 40–60%. Benchmarks, methodology and reader numbers are in [docs/performance.md](docs/performance.md).
+A 200 MiB batch (869 k records) is validated and encoded in 0.42 s from Arrow (500 MiB/s, 200 MiB peak heap) and 2.71 s from JSON text, without PII protection; protection adds 30–85%. Streaming a 2 GB JSON Lines file peaks at 436 MB. Benchmarks, methodology and reader numbers are in [docs/performance.md](docs/performance.md).
 
 ## Rust crate
 
@@ -364,7 +410,7 @@ The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, `TenantProfi
 
 ```toml
 [dependencies]
-datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc4", default-features = false, features = ["aws-kms"] }
+datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc6", default-features = false, features = ["aws-kms"] }
 ```
 
 The library is imported as `_core` (`use _core::pipeline::BronzePipeline;`). `default-features = false` builds without Python, for example for an AWS Lambda; the `aws-kms` feature adds the KMS data key provider. The Rust API may change before 1.0.
@@ -382,7 +428,7 @@ Minimum supported Rust version: 1.94.1. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Scope
 
-The SDK covers Bronze ingestion to S3 and S3-compatible stores, and tenant-scoped reads of Parquet and Iceberg tables in every layer. Silver/Gold transformations, writing Iceberg or Delta tables, catalog registration and other object stores are not part of this release.
+The SDK covers Bronze ingestion to S3 and S3-compatible stores (single calls and streams of any size), and tenant-scoped reads of Parquet and Iceberg tables in every layer. Silver/Gold transformations, writing Iceberg or Delta tables, catalog registration and other object stores are not part of this release.
 
 ## License
 

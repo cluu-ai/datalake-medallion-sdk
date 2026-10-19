@@ -37,7 +37,8 @@ aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio"]
 bytes = "1"
 
 # Columnar data
-arrow = { version = "60", features = ["json", "ffi"] }
+# `chrono-tz`: timestamps with named zones (pyarrow writes "UTC") print as text.
+arrow = { version = "60", features = ["json", "ffi", "chrono-tz"] }
 parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd"] }
 
 # Contracts and validation
@@ -82,6 +83,7 @@ python = ["dep:pyo3", "dep:pyo3-async-runtimes", "arrow/pyarrow"]
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"
+arrow-csv = "60"
 proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
 

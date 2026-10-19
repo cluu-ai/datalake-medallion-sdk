@@ -62,6 +62,7 @@ pub mod pipeline;
 #[cfg(feature = "python")]
 mod python;
 pub mod storage;
+pub mod stream;
 pub mod tenant;
 pub mod validation;
 
