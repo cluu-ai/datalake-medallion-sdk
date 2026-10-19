@@ -231,3 +231,41 @@ def test_upsert_rejects_duplicate_keys(writer: LakeWriter) -> None:
 
     with pytest.raises(ConfigurationError, match="duplicate keys"):
         writer.upsert("acme-001", SHARED, rows([1, 1], "dup"))
+
+
+async def test_incremental_bronze_to_silver_is_idempotent(
+    make_client: Any, writer: LakeWriter, reader: LakeReader
+) -> None:
+    """The incremental job pattern: Bronze manifests -> changes -> Silver upserts
+    keyed by the Bronze batch, safe to run again."""
+    from .conftest import CONTRACT
+
+    bronze = TableRef.bronze("login_event")
+    silver = TableRef.iceberg("silver", "logins", identifier="silver.logins")
+    writer.create_table(
+        "acme-001",
+        silver,
+        pa.schema([("event_id", pa.string()), ("attempts", pa.int64())]),
+        keys=["event_id"],
+    )
+    client = make_client(manifests=True)
+    for start in (0, 100):
+        batch = [{"event_id": f"e{i}", "attempts": i} for i in range(start, start + 10)]
+        await client.ingest(batch, tenant="acme-001", contract=CONTRACT)
+
+    def run(since: str | None) -> tuple[str | None, list[Any]]:
+        changes = reader.changes("acme-001", bronze, since=since, settle_seconds=0)
+        results = []
+        for entry in changes.entries:
+            one = type(changes)([entry], changes.watermark)
+            rows = reader.read_changes("acme-001", bronze, one, columns=["event_id", "attempts"])
+            results.append(writer.upsert("acme-001", silver, rows, batch_id=entry["batch_id"]))
+        return changes.watermark, results
+
+    watermark, first = run(None)
+    assert [r.rows_inserted for r in first] == [10, 10]
+    _, again = run(None)  # the job crashed before saving its watermark
+    assert all(r.skipped for r in again), "batches already in Silver are skipped"
+    _, nothing = run(watermark)
+    assert nothing == []
+    assert reader.read("acme-001", silver).num_rows == 20

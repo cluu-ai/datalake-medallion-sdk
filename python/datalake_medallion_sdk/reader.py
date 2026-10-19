@@ -958,6 +958,42 @@ class LakeReader:
         watermark = chosen[-1].split("/", 1)[1].removesuffix(".json") if chosen else since
         return ChangeSet(entries, watermark)
 
+    @traced("read_changes")
+    def read_changes(
+        self,
+        tenant: TenantProfile | str,
+        table: TableRef,
+        changes: ChangeSet,
+        *,
+        columns: Sequence[str] | None = None,
+    ) -> pa.Table:
+        """Rows of the data objects of ``changes`` (from :meth:`changes`), as
+        one Arrow table: the input of an incremental job. Every object must
+        belong to ``tenant``'s ``table``, so a change set of another tenant is
+        refused."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        profile = self._profile(tenant)
+        prefix = self._prefix(profile, table).rstrip("/") + "/"
+        uris = changes.data_uris
+        foreign = [u for u in uris if not u.startswith(prefix)]
+        if foreign:
+            raise TenantViolationError(
+                f"{len(foreign)} objects are not in {profile.tenant_id!r}'s {table.name} table"
+            )
+        if not uris:
+            return pa.table({c: pa.nulls(0) for c in columns or ()})
+        cols = None if columns is None else [_check_identifier(c, "column") for c in columns]
+        fs = self._s3.filesystem()
+
+        def load(uri: str) -> pa.Table:
+            return pq.read_table(uri.removeprefix("s3://"), filesystem=fs, columns=cols)
+
+        with ThreadPoolExecutor(min(16, len(uris))) as pool:
+            parts = list(pool.map(load, uris))
+        return _plain_strings(pa.concat_tables(parts, promote_options="default"))
+
     def files(self, tenant: TenantProfile | str, table: TableRef) -> list[str]:
         """Objects (Parquet) or the metadata file (Iceberg) a read of ``table`` scans."""
         _, entry = self._entry(tenant, table)
