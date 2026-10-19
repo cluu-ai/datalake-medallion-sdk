@@ -149,3 +149,37 @@ async def test_invalid_records_are_quarantined(make_client: MakeClient, store: B
 async def test_protobuf_is_rejected(make_client: MakeClient) -> None:
     with pytest.raises(MalformedPayloadError, match="OTLP/JSON"):
         await client(make_client).ingest_otel_logs(b"\x0a\x12\x08", contract=CONTRACT)
+
+
+@pytest.mark.parametrize("engine", ["polars", "duckdb"])
+async def test_readme_log_query(
+    make_client: MakeClient, s3_endpoint: str, bucket: str, engine: str
+) -> None:
+    """The reading example of the README's logs section."""
+    from datalake_medallion_sdk import LakeReader, TableRef, TenantProfile, TenantRegistry
+
+    errors = [record(i, severityNumber=17, severityText="ERROR") for i in range(3)]
+    body = {"resourceLogs": [resource("acme-001", [record(i) for i in range(5)] + errors)]}
+    await client(make_client).ingest_otel_logs(body, contract=CONTRACT)
+    reader = LakeReader(
+        TenantRegistry([TenantProfile.for_bucket("acme-001", bucket)]),
+        engine=engine,
+        aws_region="us-east-1",
+        aws_endpoint_url=s3_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        max_staleness=0,
+    )
+    try:
+        table = reader.read(
+            "acme-001",
+            TableRef.bronze("logs"),
+            columns=["timestamp", "service_name", "severity_text", "body", "trace_id"],
+            where=[("timestamp", ">=", "2026-03-01T10:00:01Z"), ("severity_number", ">=", 17)],
+            order_by=[("timestamp", "desc")],
+            limit=100,
+        )
+    finally:
+        reader.close()
+    assert table.column("severity_text").to_pylist() == ["ERROR", "ERROR"]
+    assert table.column("body").to_pylist() == ["request 2 served", "request 1 served"]
