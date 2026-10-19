@@ -269,3 +269,56 @@ async def test_incremental_bronze_to_silver_is_idempotent(
     _, nothing = run(watermark)
     assert nothing == []
     assert reader.read("acme-001", silver).num_rows == 20
+
+
+def test_upsert_collapses_keys_stored_twice(writer: LakeWriter, reader: LakeReader) -> None:
+    writer.append("acme-001", SHARED, rows([1, 2], "a"))
+    writer.append("acme-001", SHARED, rows([1], "dup"))  # append does not enforce keys
+    result = writer.upsert("acme-001", SHARED, rows([1, 3], "new"))
+    assert (result.rows_updated, result.rows_inserted, result.rows_deleted) == (1, 1, 1)
+    assert values(reader, "acme-001") == {1: "new", 2: "a", 3: "new"}
+
+
+def test_commits_rejected_by_the_catalog_are_applied_again(
+    writer: LakeWriter, reader: LakeReader, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pyiceberg.exceptions import CommitFailedException
+    from pyiceberg.table import Table
+
+    original = Table.append
+    calls = {"n": 0}
+
+    def flaky(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise CommitFailedException("concurrent update to table version 8")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Table, "append", flaky)
+    result = writer.append("acme-001", SHARED, rows(range(3), "a"), batch_id="B-retry")
+    assert result.attempts == 2
+    assert values(reader, "acme-001") == {0: "a", 1: "a", 2: "a"}
+
+
+def test_partition_scoped_upserts_leave_other_partitions_alone(
+    writer: LakeWriter, catalog: Any, reader: LakeReader
+) -> None:
+    writer.append("acme-001", SHARED, rows(range(5), "d1", day="2026-10-01"))
+    writer.append("acme-001", SHARED, rows(range(5, 10), "d2", day="2026-10-02"))
+    before = {
+        f.file_path
+        for f in catalog.load_table("silver.items").scan().plan_files()
+        for f in [f.file]
+        if "2026-10-02" in f.file_path
+    }
+    result = writer.upsert(
+        "acme-001", SHARED, rows([1, 20], "new", day="2026-10-01"), partition_scoped=True
+    )
+    assert (result.rows_updated, result.rows_inserted) == (1, 1)
+    after = {
+        f.file.file_path
+        for f in catalog.load_table("silver.items").scan().plan_files()
+        if "2026-10-02" in f.file.file_path
+    }
+    assert after == before, "the other day's files were not rewritten"
+    assert values(reader, "acme-001")[1] == "new"

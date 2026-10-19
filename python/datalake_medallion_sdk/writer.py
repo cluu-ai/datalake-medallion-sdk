@@ -27,6 +27,7 @@ Needs ``pip install "datalake-medallion-sdk[write]"`` (PyIceberg and pyarrow).
 from __future__ import annotations
 
 import logging
+import random
 import time
 import warnings
 from collections.abc import Callable, Iterable, Sequence
@@ -53,6 +54,14 @@ TENANT_PROPERTY = "datalake.tenant-id"
 OPERATION_PROPERTY = "datalake.operation"
 
 Operation = Literal["append", "upsert", "replace"]
+
+# PyIceberg's commit retries for tables written by several jobs at once
+# (its defaults: 4 retries, 100 ms to 60 s).
+COMMIT_DEFAULTS = {
+    "commit.retry.num-retries": "10",
+    "commit.retry.min-wait-ms": "100",
+    "commit.retry.max-wait-ms": "10000",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,37 +115,72 @@ def _expressions() -> Any:
 def _key_filter(rows: pa.Table, keys: Sequence[str]) -> BooleanExpression:
     """Exact filter of the rows whose ``keys`` equal a row of ``rows``.
 
-    Columns with one value become ``EqualTo``, a single remaining column an
-    ``In``; several remaining columns a balanced ``Or`` of ``And`` terms, so
-    the expression is log(n) deep (PyIceberg's own upsert nests one ``Or`` per
-    key and overflows the stack with thousands of composite keys).
+    Columns with one value become ``EqualTo`` and the last column an ``In``;
+    other columns are grouped by their values, fewest first, so the expression
+    stays small and lets the engine prune partitions (PyIceberg's own upsert
+    nests one ``Or`` per key and overflows the stack with thousands of
+    composite keys).
     """
     import pyarrow.compute as pc
 
     ex = _expressions()
-    constant = [k for k in keys if pc.count_distinct(rows.column(k)).as_py() == 1]
-    varying = [k for k in keys if k not in constant]
-    terms: list[Any] = [ex.EqualTo(k, rows.column(k)[0].as_py()) for k in constant]
-    if len(varying) == 1:
-        values = pc.unique(rows.column(varying[0])).to_pylist()
-        terms.append(ex.In(varying[0], values))
-    elif varying:
-        combos = rows.select(varying).group_by(varying).aggregate([]).to_pylist()
-        ands = [
-            ex.And(*[ex.EqualTo(k, row[k]) for k in varying]) if len(varying) > 1 else None
-            for row in combos
-        ]
 
-        def balanced(items: list[Any]) -> Any:
-            if len(items) == 1:
-                return items[0]
-            mid = len(items) // 2
-            return ex.Or(balanced(items[:mid]), balanced(items[mid:]))
+    def build(part: pa.Table, cols: list[str]) -> Any:
+        terms: list[Any] = []
+        varying = []
+        for k in cols:
+            values = pc.unique(part.column(k))
+            if len(values) == 1:
+                terms.append(ex.EqualTo(k, values[0].as_py()))
+            else:
+                varying.append((len(values), k))
+        varying.sort()
+        if len(varying) == 1:
+            terms.append(ex.In(varying[0][1], pc.unique(part.column(varying[0][1])).to_pylist()))
+        elif varying:
+            first, rest = varying[0][1], [k for _, k in varying[1:]]
+            groups = [
+                ex.And(
+                    ex.EqualTo(first, value),
+                    build(part.filter(pc.equal(part.column(first), value)), rest),
+                )
+                for value in pc.unique(part.column(first)).to_pylist()
+            ]
+            terms.append(_balanced_or(groups))
+        out: Any = terms[0]
+        for term in terms[1:]:
+            out = ex.And(out, term)
+        return out
 
-        terms.append(balanced(ands))
-    out: Any = terms[0]
-    for term in terms[1:]:
-        out = ex.And(out, term)
+    return cast("BooleanExpression", build(rows.select(list(keys)), list(keys)))
+
+
+def _balanced_or(items: list[Any]) -> Any:
+    ex = _expressions()
+    if len(items) == 1:
+        return items[0]
+    mid = len(items) // 2
+    return ex.Or(_balanced_or(items[:mid]), _balanced_or(items[mid:]))
+
+
+def _partition_scope(
+    table: Table, rows: pa.Table, keys: Sequence[str], match: BooleanExpression
+) -> BooleanExpression:
+    """``match`` limited to the identity partitions of ``rows`` (columns not
+    already in ``keys``), so only those partitions are read and rewritten."""
+    import pyarrow.compute as pc
+    from pyiceberg.transforms import IdentityTransform
+
+    ex = _expressions()
+    schema = table.schema()
+    out: Any = match
+    for field in table.spec().fields:
+        if not isinstance(field.transform, IdentityTransform):
+            continue
+        name = schema.find_column_name(field.source_id)
+        if name is None or name in keys or name not in rows.column_names:
+            continue
+        out = ex.And(out, ex.In(name, pc.unique(rows.column(name)).to_pylist()))
     return cast("BooleanExpression", out)
 
 
@@ -211,8 +255,8 @@ class LakeWriter:
         namespace: Catalog namespace of tables that belong to one tenant;
             defaults to the layer (``silver`` / ``gold``). Shared tables are
             named by ``TableRef.iceberg(..., identifier="namespace.table")``.
-        conflict_retries: Times an operation is applied again after a real
-            conflict with another writer.
+        conflict_retries: Times an operation is applied again after a conflict
+            with another writer or a commit the catalog kept rejecting.
     """
 
     def __init__(
@@ -221,7 +265,7 @@ class LakeWriter:
         *,
         catalog: Catalog,
         namespace: str | None = None,
-        conflict_retries: int = 3,
+        conflict_retries: int = 5,
     ) -> None:
         _require_pyiceberg()
         if conflict_retries < 0:
@@ -336,7 +380,7 @@ class LakeWriter:
                 schema=iceberg_schema,
                 partition_spec=spec,
                 location=location,
-                properties=properties or {},
+                properties={**COMMIT_DEFAULTS, **(properties or {})},
             )
         except TableAlreadyExistsError:
             return self._catalog.load_table(identifier)
@@ -399,11 +443,11 @@ class LakeWriter:
         data: Any,
         batch_id: str | None,
         apply: Callable[
-            [Table, pa.Table, dict[str, str], BooleanExpression], tuple[int, int] | None
+            [Table, pa.Table, dict[str, str], BooleanExpression], tuple[int, int, int] | None
         ],
         where: list[Predicate] | None = None,
     ) -> WriteResult:
-        from pyiceberg.exceptions import ValidationException
+        from pyiceberg.exceptions import CommitFailedException, ValidationException
 
         ex = _expressions()
 
@@ -441,17 +485,23 @@ class LakeWriter:
             try:
                 logical = apply(iceberg, self._cast(rows, iceberg), props, scope)
                 break
-            except ValidationException:
+            except (ValidationException, CommitFailedException) as conflict:
+                # ValidationException: another writer changed the same rows.
+                # CommitFailedException: the catalog kept rejecting the commit
+                # (busy table) after PyIceberg's own retries. Either way nothing
+                # was committed: reload and apply again; batch_id guards against
+                # a commit that succeeded but was reported as failed.
                 if attempts > self._conflict_retries:
                     raise
                 logger.info(
-                    "conflict on %s for %s, applying %s again (attempt %d)",
+                    "%s on %s for %s, applying %s again (attempt %d)",
+                    type(conflict).__name__,
                     identifier,
                     profile.tenant_id,
                     operation,
                     attempts + 1,
                 )
-                time.sleep(min(2.0, 0.1 * 2**attempts))
+                time.sleep(random.uniform(0, min(5.0, 0.2 * 2**attempts)))  # noqa: S311 (jitter)
         iceberg = self._load(identifier)
         snapshot = iceberg.current_snapshot()
         if snapshot is None or (before is not None and snapshot.snapshot_id == before.snapshot_id):
@@ -484,10 +534,7 @@ class LakeWriter:
         rewritten = totals["added-records"] - len(rows)
         removed = totals["deleted-records"] - rewritten
         if logical is not None:
-            inserted, updated = logical
-            deleted = 0
-        elif operation == "upsert":  # replaced rows are the updated ones
-            inserted, updated, deleted = len(rows) - removed, removed, 0
+            inserted, updated, deleted = logical
         else:
             inserted, updated, deleted = len(rows), 0, removed
         return WriteResult(
@@ -534,9 +581,18 @@ class LakeWriter:
         *,
         keys: Sequence[str] | None = None,
         batch_id: str | None = None,
+        partition_scoped: bool = False,
     ) -> WriteResult:
         """Updates rows of ``tenant`` matching ``keys`` and inserts the others,
         in one commit.
+
+        Upserts rewrite every file holding a matched row (copy-on-write), so
+        their cost follows how many partitions the keys reach: include the
+        partition columns in ``keys``, or pass ``partition_scoped=True`` when
+        a row never changes partition (for example an event's day), to look
+        for matches only in the partitions of ``data``. Rows already stored
+        several times under one key are collapsed into the new row
+        (``WriteResult.rows_deleted`` counts the extra copies).
 
         ``keys`` default to the table's identifier fields; in a shared table
         ``tenant_id`` is always part of them. The rows whose keys appear in
@@ -545,7 +601,9 @@ class LakeWriter:
         Keys must be unique within ``data``.
         """
 
-        def apply(t: Table, rows: pa.Table, props: dict[str, str], _: Any) -> None:
+        def apply(
+            t: Table, rows: pa.Table, props: dict[str, str], _: Any
+        ) -> tuple[int, int, int] | None:
             join = (
                 list(keys)
                 if keys
@@ -562,13 +620,18 @@ class LakeWriter:
             for k in join:
                 if rows.column(k).null_count:
                     raise ConfigurationError(f"upsert key {k!r} has null values")
+            match = _key_filter(rows, join)
+            if partition_scoped:
+                match = _partition_scope(t, rows, join, match)
+            existing = t.scan(row_filter=match, selected_fields=tuple(join)).to_arrow()
+            matched_keys = (
+                existing.group_by(join).aggregate([]).num_rows if existing.num_rows else 0
+            )
             with warnings.catch_warnings():
                 # New keys only: nothing to replace is the normal case here.
                 warnings.filterwarnings("ignore", "Delete operation did not match any records")
-                t.overwrite(
-                    rows, overwrite_filter=_key_filter(rows, join), snapshot_properties=props
-                )
-            return None
+                t.overwrite(rows, overwrite_filter=match, snapshot_properties=props)
+            return len(rows) - matched_keys, matched_keys, existing.num_rows - matched_keys
 
         return self._write("upsert", tenant, table, data, batch_id, apply)
 
