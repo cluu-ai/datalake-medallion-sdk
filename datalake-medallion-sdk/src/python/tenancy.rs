@@ -427,6 +427,11 @@ impl PyTenantProfile {
         Ok(self.inner.table_uri(Layer::parse(layer)?, data_type)?)
     }
 
+    /// `s3://` prefix of the commit manifests of this tenant's `data_type`.
+    fn manifest_prefix(&self, data_type: &str) -> PyResult<String> {
+        Ok(self.inner.manifest_prefix(data_type)?)
+    }
+
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
     }

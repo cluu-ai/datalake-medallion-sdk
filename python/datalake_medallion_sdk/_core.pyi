@@ -160,6 +160,8 @@ class TenantProfile:
         self, layer: Literal["bronze", "quarantine", "silver", "gold"], data_type: str
     ) -> str | None:
         """``s3://`` prefix of this tenant's ``data_type`` table in ``layer``."""
+    def manifest_prefix(self, data_type: str) -> str:
+        """``s3://`` prefix of the commit manifests of this tenant's ``data_type``."""
 
 @final
 class TenantRegistry:
@@ -295,6 +297,7 @@ class BronzeIngestionClient:
         aws_secret_access_key: str | None = None,
         aws_session_token: str | None = None,
         force_path_style: bool | None = None,
+        manifests: bool = False,
     ) -> BronzeIngestionClient: ...
     async def ingest(
         self,

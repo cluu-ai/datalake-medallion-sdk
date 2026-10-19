@@ -63,6 +63,10 @@ pub struct PipelineConfig {
     /// Accepted rows, rejections and dead letters are the same as on the row
     /// path; turn it off only to compare the two paths or to debug.
     pub arrow_fast_path: bool,
+    /// Write a commit manifest entry after each batch (and each flushed part
+    /// of a stream), for consumers that read changes from a watermark; see
+    /// [`crate::manifest`]. Off by default.
+    pub manifests: bool,
 }
 
 impl Default for PipelineConfig {
@@ -73,6 +77,7 @@ impl Default for PipelineConfig {
             max_future_skew: Some(Duration::hours(1)),
             invalid_records: InvalidRecordPolicy::default(),
             arrow_fast_path: true,
+            manifests: false,
         }
     }
 }
@@ -211,10 +216,10 @@ pub struct IngestReport {
     pub pii_protection: String,
 }
 
-struct PendingObject {
-    path: ObjectPath,
-    body: Bytes,
-    content_type: &'static str,
+pub(crate) struct PendingObject {
+    pub(crate) path: ObjectPath,
+    pub(crate) body: Bytes,
+    pub(crate) content_type: &'static str,
 }
 
 /// Validated and encoded output of [`BronzePipeline::prepare`], ready to upload.
@@ -222,6 +227,8 @@ pub struct PreparedBatch {
     report: IngestReport,
     dead_letters: Vec<PendingObject>,
     data: Vec<PendingObject>,
+    /// Commit manifest entry, written after everything else.
+    manifest: Option<PendingObject>,
 }
 
 impl PreparedBatch {
@@ -352,6 +359,11 @@ impl BronzePipeline {
     #[must_use]
     pub fn config(&self) -> &PipelineConfig {
         &self.config
+    }
+
+    /// Whether commits write manifest entries.
+    pub(crate) fn manifests(&self) -> bool {
+        self.config.manifests
     }
 
     pub(crate) fn storage(&self) -> &Arc<dyn ObjectStorage> {
@@ -530,6 +542,12 @@ impl BronzePipeline {
         // never leaves Bronze rows whose rejected siblings were lost.
         put_all(&self.storage, &prepared.dead_letters).await?;
         put_all(&self.storage, &prepared.data).await?;
+        // Last: consumers that follow the manifests only see complete batches.
+        if let Some(m) = &prepared.manifest {
+            self.storage
+                .put(&m.path, m.body.clone(), m.content_type)
+                .await?;
+        }
         let r = &prepared.report;
         tracing::info!(
             batch_id = %r.batch_id,
@@ -1061,7 +1079,45 @@ impl BronzePipeline {
                 .collect::<Result<_, DatalakeError>>()?,
         };
         let records_quarantined = rejections.values().sum();
+        let manifest = if self.config.manifests {
+            let span = output
+                .batch
+                .as_ref()
+                .and_then(|b| crate::manifest::EventSpan::of(contract, b));
+            let objects = |list: &[PendingObject]| -> Vec<crate::manifest::ManifestObject> {
+                list.iter()
+                    .map(|o| crate::manifest::ManifestObject {
+                        uri: o.path.uri.clone(),
+                        bytes: o.body.len() as u64,
+                    })
+                    .collect()
+            };
+            Some(manifest_object(
+                tenant,
+                contract,
+                crate::manifest::Manifest {
+                    version: crate::manifest::MANIFEST_VERSION,
+                    commit_id: String::new(),
+                    batch_id: batch_id.to_owned(),
+                    tenant_id: tenant.tenant_id().to_string(),
+                    data_type: contract.data_type().to_owned(),
+                    contract: contract.key().to_owned(),
+                    schema_hash: contract.schema_hash().to_owned(),
+                    committed_at: String::new(),
+                    records_received: output.received,
+                    records_ok: output.records_ok,
+                    records_quarantined,
+                    data: objects(&data),
+                    dead_letters: objects(&dead_letters),
+                    event_time: span.map(|s| s.range()),
+                    sdk_version: env!("CARGO_PKG_VERSION").to_owned(),
+                },
+            )?)
+        } else {
+            None
+        };
         Ok(PreparedBatch {
+            manifest,
             report: IngestReport {
                 batch_id: batch_id.to_owned(),
                 tenant_id: tenant.tenant_id().to_string(),
@@ -1078,6 +1134,26 @@ impl BronzePipeline {
             data,
         })
     }
+}
+
+/// The manifest entry as an object to upload: stamped with a new commit id
+/// (a ULID, so entries sort by commit time) and its time.
+pub(crate) fn manifest_object(
+    tenant: &TenantProfile,
+    contract: &Contract,
+    mut manifest: crate::manifest::Manifest,
+) -> Result<PendingObject, DatalakeError> {
+    let id = Ulid::generate();
+    let at = ulid_time(id);
+    manifest.commit_id = id.to_string();
+    manifest.committed_at = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let body = serde_json::to_vec(&manifest)
+        .map_err(|e| DatalakeError::storage("manifest", e.to_string()))?;
+    Ok(PendingObject {
+        path: tenant.manifest_path(contract.data_type(), &at, &manifest.file_id())?,
+        body: Bytes::from(body),
+        content_type: crate::storage::JSON_CONTENT_TYPE,
+    })
 }
 
 /// Byte ranges of the non-blank lines of `text`, without line breaks.

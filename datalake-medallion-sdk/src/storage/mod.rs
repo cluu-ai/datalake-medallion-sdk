@@ -11,6 +11,9 @@ use crate::error::DatalakeError;
 use crate::tenant::ObjectPath;
 
 pub use memory::InMemoryStorage;
+
+/// Content type of commit manifest entries.
+pub const JSON_CONTENT_TYPE: &str = "application/json";
 pub use parquet::ParquetEncoder;
 pub use s3::{S3Options, S3Storage, StaticCredentials};
 

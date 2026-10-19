@@ -444,6 +444,25 @@ by_outcome = (
 - **Engines.** `engine="polars"` (default, extra `[read]`) is the fastest with `cache_mb`. `engine="duckdb"` (extra `[duckdb]`) is the better choice without a cache and uses the least memory and `scan()` returns a DuckDB relation that accepts SQL (`relation.query("t", "SELECT ...")`). DuckDB downloads its `httpfs` and `iceberg` extensions on first use; on AWS Lambda pass `duckdb_config={"home_directory": "/tmp"}`, or point `extension_directory` at pre-installed extensions for offline environments.
 - **Credentials.** The same options as the client (`aws_region`, `aws_endpoint_url`, keys) or the AWS default chain. The reader role needs `s3:ListBucket` and `s3:GetObject` on the tenant's locations only ([policy examples](docs/iam.md)).
 
+### Incremental reads: changes since a watermark
+
+A job that processes new Bronze data (a Silver build, a search indexer) should not list every object of a table on each run. With `manifests=True`, the client writes one small JSON entry per committed batch, and `LakeReader.changes()` returns the entries after a watermark, in commit order:
+
+```python
+client = BronzeIngestionClient(registry, tenants=tenants, manifests=True)
+...
+changes = reader.changes("acme-001", TableRef.bronze("login_event"), since=state.get("watermark"))
+for entry in changes.entries:  # batch_id, data and dead_letters objects, record counts,
+    process(entry["data"])  # contract, schema hash and event-time range
+state["watermark"] = changes.watermark  # store it with the job's output
+```
+
+- An entry is written only after every object it lists, so readers never see a half-written batch. Streams write one entry per `flush()`, per object closed by `max_object_seconds` and at the end.
+- Entries live under `<bronze>/_manifests/tenant_id=…/data_type=…/date=…/`, outside the data tree (engines that scan Bronze skip folders starting with `_`). Add an S3 lifecycle rule on that prefix to expire old entries.
+- Entries younger than `settle_seconds` (default 120) wait for the next call, so a writer whose clock is behind cannot slip an entry in before the watermark.
+- A retried upload rewrites the same entry; ingesting the same `batch_id` again adds another entry for the same objects. Treat `batch_id` (or the object URI) as the unit your job replaces, so reprocessing is idempotent.
+- Off by default; it adds one small `PUT` per batch.
+
 On AWS Lambda against S3, warm queries over 3.1 M rows take 22–67 ms with Polars and `cache_mb`, and 100–950 ms with DuckDB without a cache; Iceberg tables take 67–147 ms without a cache. Athena takes 0.9–2.1 s for the same queries. Details in [docs/performance.md](docs/performance.md).
 
 ## Object layout
@@ -495,9 +514,10 @@ client = BronzeIngestionClient(contracts, tenants=tenants, hooks=hooks.as_mappin
 - **Credentials**: the AWS default chain (environment, profile, SSO, web identity, ECS/EC2 roles) unless `aws_access_key_id`/`aws_secret_access_key` are passed. The SDK never creates buckets; the writer role needs `s3:PutObject` on each tenant's bronze and quarantine locations only. See [IAM policy examples](docs/iam.md).
 - **S3-compatible stores** (MinIO, LocalStack, …): `aws_endpoint_url=` (path-style addressing is enabled automatically).
 - **Large inputs**: use `ingest_file` / `ingest_stream` (above) rather than one `ingest` call; S3 lifecycle rule `AbortIncompleteMultipartUpload` recommended.
-- **Client options**: `max_record_bytes` (default 10 MiB), `max_future_skew_seconds` (default 3600, `None` disables), `on_invalid` (`"quarantine"` or `"raise"`), `envelope_prefix` (default `"_dl_"`).
+- **Client options**: `max_record_bytes` (default 10 MiB), `max_future_skew_seconds` (default 3600, `None` disables), `on_invalid` (`"quarantine"` or `"raise"`), `envelope_prefix` (default `"_dl_"`), `manifests` (default off, see [Incremental reads](#incremental-reads-changes-since-a-watermark)).
 - **Retries and idempotency**: uploads are retried inside the call (4 attempts, exponential backoff with jitter) over the same object keys, so a transient S3 error never duplicates rows. To retry a whole call, for example after a crash, pass the earlier `batch_id=` (or `stream_id=` for streams): the same keys are rewritten instead of adding rows. `@datalake_retry()` retries `StorageError` only.
 - **Metrics**: `@emit_metrics(sink)` records duration, failures and record counts to logging, CloudWatch Embedded Metric Format or any `MetricsSink`.
+- **OpenTelemetry** (optional, `pip install "datalake-medallion-sdk[otel]"`): ingests and reads become spans (`datalake.ingest`, `datalake.ingest_stream`, `datalake.read`, …) with `tenant.id`, `datalake.contract`, `datalake.data_type` and record counts, and the metrics `datalake.records` (by outcome), `datalake.bytes` and `datalake.operation.duration`. The SDK uses the OpenTelemetry API only and ships no exporter: configure the OpenTelemetry SDK and exporter in your application. Without the package nothing is wrapped; installed but not configured, a call costs about 2 µs.
 - **Concurrency**: one client and one reader per process serve every tenant and bucket; connections are created once and reused. Buckets must be reachable in the client's region.
 
 ## Errors
@@ -537,7 +557,7 @@ The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, `TenantProfi
 
 ```toml
 [dependencies]
-datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc11", default-features = false, features = ["aws-kms"] }
+datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc12", default-features = false, features = ["aws-kms"] }
 ```
 
 The library is imported as `_core` (`use _core::pipeline::BronzePipeline;`). `default-features = false` builds without Python, for example for an AWS Lambda; the `aws-kms` feature adds the KMS data key provider. The Rust API may change before 1.0.

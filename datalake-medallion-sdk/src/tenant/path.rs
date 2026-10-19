@@ -118,6 +118,36 @@ pub(crate) fn dlq_key(
     ))
 }
 
+/// Prefix of a table's commit manifests below the Bronze `prefix`. The
+/// leading underscore keeps engines that scan the Bronze tree (Hive, Spark,
+/// Athena) from reading it as data.
+pub(crate) fn manifest_prefix(
+    prefix: &str,
+    tenant: &TenantId,
+    data_type: &str,
+) -> Result<String, DatalakeError> {
+    let slug = data_type_slug(data_type)?;
+    Ok(format!(
+        "{prefix}/_manifests/tenant_id={tenant}/data_type={slug}"
+    ))
+}
+
+/// Key of one manifest entry: partitioned by commit day, named so keys sort
+/// by commit time.
+pub(crate) fn manifest_key(
+    prefix: &str,
+    tenant: &TenantId,
+    data_type: &str,
+    at: &DateTime<Utc>,
+    file_id: &str,
+) -> Result<String, DatalakeError> {
+    Ok(format!(
+        "{}/date={}/{file_id}.json",
+        manifest_prefix(prefix, tenant, data_type)?,
+        at.format("%Y-%m-%d")
+    ))
+}
+
 fn date_partitions(at: &DateTime<Utc>) -> String {
     at.format("year=%Y/month=%m/day=%d").to_string()
 }

@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Commit manifests (opt-in, `BronzeIngestionClient(manifests=True)`, Rust `PipelineConfig::manifests`): after each committed batch, one immutable JSON entry with its objects, record counts, contract, schema hash and event-time range, written only after every object it lists. Streams write one entry per `flush()`, per object closed by age and at the end. `LakeReader.changes(tenant, table, since=)` returns the entries after a watermark in commit order (`ChangeSet`), for incremental jobs that should not list every object. `TenantProfile.manifest_prefix(data_type)`.
+- Optional OpenTelemetry instrumentation (`[otel]` extra, API only, no exporter): spans for ingests and reads and the metrics `datalake.records`, `datalake.bytes` and `datalake.operation.duration`. Without the package nothing is wrapped; installed but not configured, about 2 µs per call.
+
+## [0.2.0rc11] - 2026-10-19
+
+### Added
+
 - OpenTelemetry logs: `datalake_medallion_sdk.otel.logs_contract()` (the Logs Data Model columns, typed timestamps, zstd) and `BronzeIngestionClient.ingest_otel_logs(body)`, which flattens an OTLP/JSON request, groups its records by the `tenant.id` resource attribute and writes each tenant once, in Rust and without pyarrow. `otel.flatten_logs()` returns the rows as pyarrow batches. Rust: `otel::flatten_logs_json`, `otel::flatten_logs_json_many`, `otel::logs_contract`.
 - Queue and stream batches: `ingest_otel_log_batch(bodies)` flattens many requests in parallel and returns a `TenantOutcome` per tenant (the requests that carried it, its report or error), so a consumer retries only the messages of a failed tenant or an unreadable message. `batch_id_for(message_ids, time_ms=)` gives a deterministic batch id, so a redelivered batch rewrites the same objects. Rust: `pipeline::batch_id_for`.
 - `examples/aws_lambda_handler.py`: a tested recipe for Kinesis, SQS and CloudWatch Logs events in AWS Lambda, with partial-batch failures.

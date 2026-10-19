@@ -180,6 +180,8 @@ enum Job {
     },
     /// Answered once every earlier job is uploaded.
     Barrier(tokio::sync::oneshot::Sender<()>),
+    /// A manifest entry, written once every earlier job is uploaded.
+    Manifest { path: ObjectPath, body: Bytes },
 }
 
 /// `Write` sink shared with the Parquet writer, drained into parts.
@@ -225,6 +227,8 @@ struct OpenObject {
     writer: ParallelWriter<Sink>,
     sink: Sink,
     parts_sent: i32,
+    /// Bytes handed to the uploader so far.
+    bytes_sent: u64,
     opened: std::time::Instant,
     /// Accepted rows not yet encoded: one row group's worth at most.
     pending: Vec<RecordBatch>,
@@ -257,6 +261,18 @@ pub struct BronzeStream {
     received: usize,
     records_ok: usize,
     rejections: BTreeMap<String, usize>,
+    /// What the next manifest entry lists (when manifests are on).
+    manifest: StreamManifest,
+}
+
+/// Objects and counts since the last manifest entry of a stream.
+#[derive(Default)]
+struct StreamManifest {
+    data: Vec<crate::manifest::ManifestObject>,
+    dead_letters: Vec<crate::manifest::ManifestObject>,
+    span: Option<crate::manifest::EventSpan>,
+    /// `received`, `records_ok` and quarantined at the last entry.
+    marks: (usize, usize, usize),
 }
 
 impl BronzePipeline {
@@ -325,6 +341,7 @@ impl BronzePipeline {
             received: 0,
             records_ok: 0,
             rejections: BTreeMap::new(),
+            manifest: StreamManifest::default(),
         })
     }
 
@@ -472,7 +489,8 @@ impl BronzeStream {
         for day in due {
             self.close_object(day)?;
         }
-        Ok(())
+        self.flush_dead_letters()?;
+        self.write_manifest()
     }
 
     /// Writes out what is buffered, completes the open objects and waits
@@ -488,6 +506,7 @@ impl BronzeStream {
             .flush_pending()
             .and_then(|()| self.close_objects())
             .and_then(|()| self.flush_dead_letters())
+            .and_then(|()| self.write_manifest())
             .and_then(|()| self.wait_uploads());
         if result.is_err() {
             self.shut_down();
@@ -560,6 +579,10 @@ impl BronzeStream {
     }
 
     fn write(&mut self, batch: &RecordBatch) -> Result<(), DatalakeError> {
+        if self.pipeline.manifests() {
+            let span = crate::manifest::EventSpan::of(&self.contract, batch);
+            self.manifest.span = crate::manifest::EventSpan::merge(self.manifest.span.take(), span);
+        }
         let Some(field) = self.contract.partition_by() else {
             return self.write_day(self.now.date_naive(), batch);
         };
@@ -568,6 +591,43 @@ impl BronzeStream {
             self.write_day(day.date_naive(), &part)?;
         }
         Ok(())
+    }
+
+    /// Writes a manifest entry for what completed since the last one, after
+    /// every upload before it (no-op when manifests are off or nothing new).
+    fn write_manifest(&mut self) -> Result<(), DatalakeError> {
+        if !self.pipeline.manifests() {
+            return Ok(());
+        }
+        let quarantined: usize = self.rejections.values().sum();
+        let (received, ok, rejected) = self.manifest.marks;
+        let m = &mut self.manifest;
+        if m.data.is_empty() && m.dead_letters.is_empty() && self.received == received {
+            return Ok(());
+        }
+        let entry = crate::manifest::Manifest {
+            version: crate::manifest::MANIFEST_VERSION,
+            commit_id: String::new(),
+            batch_id: self.stream_id.clone(),
+            tenant_id: self.tenant.tenant_id().to_string(),
+            data_type: self.contract.data_type().to_owned(),
+            contract: self.contract.key().to_owned(),
+            schema_hash: self.contract.schema_hash().to_owned(),
+            committed_at: String::new(),
+            records_received: self.received - received,
+            records_ok: self.records_ok - ok,
+            records_quarantined: quarantined - rejected,
+            data: std::mem::take(&mut m.data),
+            dead_letters: std::mem::take(&mut m.dead_letters),
+            event_time: m.span.take().map(|s| s.range()),
+            sdk_version: env!("CARGO_PKG_VERSION").to_owned(),
+        };
+        m.marks = (self.received, self.records_ok, quarantined);
+        let object = crate::pipeline::manifest_object(&self.tenant, &self.contract, entry)?;
+        self.send(Job::Manifest {
+            path: object.path,
+            body: object.body,
+        })
     }
 
     fn write_day(&mut self, day: NaiveDate, batch: &RecordBatch) -> Result<(), DatalakeError> {
@@ -607,6 +667,7 @@ impl BronzeStream {
             // parts goes out in parallel.
             while object.sink.len() >= part_bytes {
                 object.parts_sent += 1;
+                object.bytes_sent += part_bytes as u64;
                 ready.push(Job::Part {
                     object: object.index,
                     path: Arc::clone(&object.path),
@@ -654,6 +715,7 @@ impl BronzeStream {
             writer,
             sink,
             parts_sent: 0,
+            bytes_sent: 0,
             opened: std::time::Instant::now(),
             pending: Vec::new(),
             pending_rows: 0,
@@ -683,11 +745,18 @@ impl BronzeStream {
             writer,
             sink,
             parts_sent,
+            bytes_sent,
             ..
         } = object;
         writer.close()?;
         let rest = Bytes::from(sink.take());
         self.data_uris.push(path.uri.clone());
+        if self.pipeline.manifests() {
+            self.manifest.data.push(crate::manifest::ManifestObject {
+                uri: path.uri.clone(),
+                bytes: bytes_sent + rest.len() as u64,
+            });
+        }
         if parts_sent == 0 {
             // Fits in one part: a single PutObject is cheaper.
             let path = ObjectPath::clone(&path);
@@ -718,6 +787,14 @@ impl BronzeStream {
                 self.tenant
                     .dlq_path(self.contract.data_type(), &code, &self.now, &file_id)?;
             self.dlq_uris.push(path.uri.clone());
+            if self.pipeline.manifests() {
+                self.manifest
+                    .dead_letters
+                    .push(crate::manifest::ManifestObject {
+                        uri: path.uri.clone(),
+                        bytes: body.len() as u64,
+                    });
+            }
             self.send(Job::Put {
                 path,
                 body: Bytes::from(body),
@@ -793,6 +870,7 @@ impl BronzeStream {
         self.flush_pending()?;
         self.close_objects()?;
         self.flush_dead_letters()?;
+        self.write_manifest()?;
         let bytes_written = self.join_uploader()?;
         let records_quarantined = self.rejections.values().sum();
         tracing::info!(
@@ -986,6 +1064,14 @@ async fn upload(
                 Job::Barrier(ack) => {
                     running.drain().await?;
                     let _ = ack.send(());
+                }
+                Job::Manifest { path, body } => {
+                    // After everything it lists is uploaded.
+                    running.drain().await?;
+                    retrying(|| {
+                        storage.put(&path, body.clone(), crate::storage::JSON_CONTENT_TYPE)
+                    })
+                    .await?;
                 }
                 Job::Complete { object } => {
                     running.drain().await?;
