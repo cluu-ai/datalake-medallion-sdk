@@ -127,6 +127,15 @@ Streams that write one large object were compared with 0.2.0rc9 in the same func
 | 200 k records in one request (84 MiB) | 0.66 s | 128 MiB/s, 0.30 M records/s |
 | 200 k records in 100 requests (one queue batch) | **0.24 s** | **350 MiB/s, 0.83 M records/s** |
 
+On AWS (Lambda 10 GB / 6 vCPU, writing to S3 in the same region, 0.2.0rc11):
+
+| Case | Result |
+|---|---|
+| `ingest_otel_log_batch`: 1 M records in 500 requests (396 MiB of OTLP/JSON), 8 tenants | **2.5 s** including the uploads (158 MiB/s, 0.4 M records/s), one object per tenant, 1.5 GB peak including the requests held in Python |
+| The Lambda recipe: a Kinesis batch of 100 requests (100 k records), one unreadable and one with an unknown tenant | **0.5 s**; only those two messages reported in `batchItemFailures`; redelivering the batch rewrote the same objects |
+
+Single-object streams were compared with 0.2.0rc10 in the same function, alternating versions (median of 3): dataset scanner 4.49 → 4.33 s, DuckDB result 4.78 → 4.60 s.
+
 Requests of a batch are flattened in parallel. OTLP is read into typed structures with borrowed strings, and the rows take the columnar validation path; the first implementation, which built a JSON tree per record and fell back to the row path, took 3.98 s for the single request.
 
 ---
