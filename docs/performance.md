@@ -48,9 +48,24 @@ The same inputs written to a store that discards the bytes, measuring only the S
 
 | Input, ~500 MB | Stream | Peak heap |
 |---|---|---|
-| JSON Lines | 3.6 s (138 MiB/s) | 294 MiB |
-| CSV | 3.5 s (141 MiB/s) | 352 MiB |
-| Parquet | 3.7 s (0.86 M records/s) | 409 MiB |
+| JSON Lines | 3.3 s (152 MiB/s) | 294 MiB |
+| CSV | 3.3 s (151 MiB/s) | 358 MiB |
+| Parquet | 3.3 s (0.95 M records/s) | 415 MiB |
+
+0.2.0rc9 against 0.2.0rc8, run back to back and alternated (median of 4–10 rounds): CSV 3.34 → 3.32 s, JSON Lines 3.30 → 3.29 s, Parquet 3.37 → 3.34 s, with the same output and peak heap.
+
+### Storage options for logs
+
+The same 500 MB streams with the contract options of 0.2.0rc9 (median of 3 rounds):
+
+| Contract | CSV | Parquet | Bronze written |
+|---|---|---|---|
+| default (Snappy, event time as text) | 3.29 s | 3.32 s | 257 MiB |
+| `x-dl-compression: zstd` | 3.32 s (+1%) | 3.38 s (+2%) | **178 MiB (−31%)** |
+| `x-dl-type: timestamp` | 3.35 s (+2%) | 3.43 s (+3%) | 251 MiB |
+| both | 3.39 s (+3%) | 3.37 s (+1%) | 180 MiB (−30%) |
+
+Streams encode columns in parallel, so zstd adds little time. On one thread (`examples/compression_bench.rs`, 1 M log rows) zstd level 1 encodes about 20% slower than Snappy and writes 41% less; higher levels cost much more CPU for almost no gain. Snappy remains the default because it is the fastest; zstd is the recommendation for logs and other text-heavy tables.
 
 ### One call, by input type and protection
 
