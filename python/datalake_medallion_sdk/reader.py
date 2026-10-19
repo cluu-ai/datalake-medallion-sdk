@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 from urllib.parse import urlsplit
 
 from ._core import ConfigurationError, TenantProfile, TenantRegistry, TenantViolationError
+from ._telemetry import traced
 from .tenancy import TenantResolver
 
 if TYPE_CHECKING:
@@ -826,6 +827,7 @@ class LakeReader:
         """Name of the engine in use."""
         return cast("Engine", self._engine.name)
 
+    @traced("read")
     def read(
         self,
         tenant: TenantProfile | str,
@@ -889,6 +891,7 @@ class LakeReader:
             return self._engine.empty()
         return self._engine.scan(entry.base)
 
+    @traced("changes")
     def changes(
         self,
         tenant: TenantProfile | str,

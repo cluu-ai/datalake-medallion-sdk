@@ -21,6 +21,7 @@ from ._core import (
     TenantRegistry,
     TenantViolationError,
 )
+from ._telemetry import traced
 from .tenancy import TenantResolver
 
 if TYPE_CHECKING:
@@ -158,6 +159,7 @@ class BronzeIngestionClient:
             )
         }
 
+    @traced("ingest", layer="bronze")
     async def ingest(
         self,
         batch: Any,
@@ -194,6 +196,7 @@ class BronzeIngestionClient:
             batch, tenant=self._resolve(tenant), contract=contract, batch_id=batch_id
         )
 
+    @traced("ingest_otel_logs", layer="bronze", count=False)
     async def ingest_otel_logs(
         self,
         payload: OtlpPayload | list[OtlpPayload],
@@ -243,6 +246,7 @@ class BronzeIngestionClient:
                 raise outcome.error
         return {o.report.tenant_id: o.report for o in outcomes if o.report is not None}
 
+    @traced("ingest_otel_log_batch", layer="bronze")
     async def ingest_otel_log_batch(
         self,
         payloads: Sequence[OtlpPayload],
@@ -291,6 +295,7 @@ class BronzeIngestionClient:
         )
         return [TenantOutcome(t, list(s), r, e) for t, s, r, e in raw] + unreadable
 
+    @traced("ingest_stream", layer="bronze")
     async def ingest_stream(
         self,
         source: Any,
@@ -359,6 +364,7 @@ class BronzeIngestionClient:
             max_open_days=max_open_days,
         )
 
+    @traced("ingest_file", layer="bronze", count=False)
     async def ingest_file(
         self,
         path: str | os.PathLike[str],
