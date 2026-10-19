@@ -51,7 +51,14 @@ pub(crate) struct PyIngestReport {
 struct OtelOutcome {
     tenant: Option<String>,
     sources: Vec<usize>,
-    report: Result<IngestReport, DatalakeError>,
+    report: Result<IngestReport, OtelError>,
+}
+
+/// Why a tenant of `ingest_otel_logs` was not written.
+enum OtelError {
+    Datalake(DatalakeError),
+    /// The tenant could not be resolved (an exception of `resolve`).
+    Python(PyErr),
 }
 
 impl<'py> IntoPyObject<'py> for OtelOutcome {
@@ -62,7 +69,8 @@ impl<'py> IntoPyObject<'py> for OtelOutcome {
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let (report, error): (Option<PyIngestReport>, Option<Py<PyAny>>) = match self.report {
             Ok(r) => (Some(PyIngestReport::from(r)), None),
-            Err(e) => (None, Some(PyErr::from(e).into_value(py).into_any())),
+            Err(OtelError::Datalake(e)) => (None, Some(PyErr::from(e).into_value(py).into_any())),
+            Err(OtelError::Python(e)) => (None, Some(e.into_value(py).into_any())),
         };
         (self.tenant, self.sources, report, error).into_pyobject(py)
     }
@@ -352,8 +360,9 @@ impl PyBronzeIngestionClient {
     /// Tenants are validated one by one and committed concurrently; every
     /// tenant is attempted even when another fails. Returns one
     /// `(tenant_or_none, request_indices, IngestReport | None, error | None)`
-    /// per tenant, in tenant order, then `(None, [index], None, error)` per
-    /// unreadable request.
+    /// per tenant, in tenant order (tenants that could not be resolved after
+    /// the others), then `(None, [index], None, error)` per unreadable
+    /// request.
     ///
     /// `bodies` is a list of requests (for example the records of one queue
     /// batch): their rows are merged by tenant, so each tenant is written once.
@@ -373,8 +382,23 @@ impl PyBronzeIngestionClient {
             crate::otel::flatten_logs_json_many(&slices, tenant_attribute)
         })?;
         let mut requests = Vec::with_capacity(flattened.tenants.len());
+        // A tenant that cannot be resolved fails alone; the others go on.
+        let mut unresolved = Vec::new();
         for group in flattened.tenants {
-            let profile = self.resolve(&resolve.call1((group.tenant.clone(),))?)?;
+            let profile = match resolve
+                .call1((group.tenant.clone(),))
+                .and_then(|p| self.resolve(&p))
+            {
+                Ok(profile) => profile,
+                Err(e) => {
+                    unresolved.push(OtelOutcome {
+                        tenant: group.tenant,
+                        sources: group.sources,
+                        report: Err(OtelError::Python(e)),
+                    });
+                    continue;
+                }
+            };
             let mut request =
                 IngestRequest::new(profile, contract, RecordSource::Arrow(vec![group.batch]));
             if let Some(id) = &batch_id {
@@ -418,7 +442,8 @@ impl PyBronzeIngestionClient {
                     let report = match batch {
                         Ok(batch) => pipeline.commit_with_retries(&batch, 4).await,
                         Err(e) => Err(e),
-                    };
+                    }
+                    .map_err(OtelError::Datalake);
                     (
                         index,
                         OtelOutcome {
@@ -437,10 +462,11 @@ impl PyBronzeIngestionClient {
             }
             done.sort_unstable_by_key(|(index, _)| *index);
             let mut outcomes: Vec<OtelOutcome> = done.into_iter().map(|(_, o)| o).collect();
+            outcomes.extend(unresolved);
             outcomes.extend(malformed.into_iter().map(|(index, e)| OtelOutcome {
                 tenant: None,
                 sources: vec![index],
-                report: Err(e),
+                report: Err(OtelError::Datalake(e)),
             }));
             Ok(outcomes)
         })

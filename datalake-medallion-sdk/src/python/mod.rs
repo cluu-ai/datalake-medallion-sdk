@@ -23,5 +23,6 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<tenancy::PyPiiDecryptor>()?;
     m.add_function(wrap_pyfunction!(otel::otel_logs_contract, m)?)?;
     m.add_function(wrap_pyfunction!(otel::flatten_otlp_logs, m)?)?;
+    m.add_function(wrap_pyfunction!(otel::batch_id_for, m)?)?;
     Ok(())
 }

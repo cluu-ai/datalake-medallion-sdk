@@ -120,8 +120,16 @@ async def test_records_without_tenant_need_a_default(
     make_client: MakeClient, store: Bucket
 ) -> None:
     with pytest.raises(TenantViolationError):
-        await client(make_client).ingest_otel_logs(request(), contract=CONTRACT)
-    assert store.keys() == [], "nothing is written when a tenant cannot be resolved"
+        await client(make_client).ingest_otel_logs(request(), contract=CONTRACT, batch_id=ULID)
+    written = store.keys()
+    assert written and not any("tenant-b" in k for k in written), "resolved tenants are written"
+    # Calling again with a default tenant completes the batch without duplicates.
+    await client(make_client).ingest_otel_logs(
+        request(), contract=CONTRACT, default_tenant="tenant-b", batch_id=ULID
+    )
+    keys = store.keys()
+    assert set(written) < set(keys)
+    assert len([k for k in keys if "tenant_id=acme-001/" in k]) == 1
     with pytest.raises(TenantViolationError):
         bad = {"resourceLogs": [resource("unknown-tenant", [record(1)])]}
         await client(make_client).ingest_otel_logs(bad, contract=CONTRACT)

@@ -28,6 +28,7 @@ __all__ = [
     "TenantViolationError",
     "TypeCoercionError",
     "__version__",
+    "batch_id_for",
     "flatten_otlp_logs",
     "otel_logs_contract",
 ]
@@ -402,6 +403,9 @@ def otel_logs_contract(
     partition_by_event_time: bool,
 ) -> str:
     """JSON text of the contract for flattened OpenTelemetry logs."""
+
+def batch_id_for(message_ids: list[str], *, time_ms: int) -> str:
+    """Deterministic batch id (a ULID) for a set of source message ids."""
 
 def flatten_otlp_logs(body: bytes, *, tenant_attribute: str) -> list[tuple[str | None, Any]]:
     """Flatten an OTLP/JSON logs request into ``(tenant, pyarrow.RecordBatch)`` pairs."""
