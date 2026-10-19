@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Contract storage options, all optional and off by default:
+  - `x-dl-compression` (`snappy` default, `zstd`, `lz4`, `none`) and `x-dl-compression_level` (zstd, 1 to 22, default 1). On 1 M log rows zstd level 1 writes objects 41% smaller than Snappy for about 20% more encoding CPU; Snappy stays the default because it is the fastest.
+  - `x-dl-type: "timestamp"` stores a `date-time` field as `timestamp(µs, UTC)`; values that do not parse are quarantined.
+  - `x-dl-partition_by` partitions Bronze by the event day of a `date-time` field, in `ingest` (one object per event day, `IngestReport.data_uris`) and in streams (one open object per event day, at most `max_open_days`).
+- Streams for continuous sources: `ingest_stream(max_object_seconds=...)` closes objects by age. Rust: `StreamOptions::max_object_age`, `StreamOptions::max_open_days`, and `BronzeStream::flush()`, which waits until the open objects are uploaded.
+- `examples/compression_bench.rs`: size and speed of every codec on log-like data.
+
+### Fixed
+
+- `LakeReader` filters on timestamp and date columns accept ISO text, dates and datetimes in both engines, and values without a zone are UTC. Before, Polars rejected text values and DuckDB read zone-less values in the machine's local time zone. Filters on text columns are unchanged.
+- The `lz4` codec was not compiled in. Every codec a contract can declare now comes from one list, and tests encode each one in Rust and with the built wheel.
+
 ## [0.2.0rc8] - 2026-10-19
 
 ### Changed

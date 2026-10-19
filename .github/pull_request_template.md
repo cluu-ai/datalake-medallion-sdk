@@ -10,6 +10,15 @@ What changes and why.
 - [ ] `CHANGELOG.md` updated under `[Unreleased]`
 - [ ] Commits signed off (`git commit -s`, DCO)
 
+## Release gates
+
+- [ ] New options are off by default and set per contract or per call
+- [ ] Options come from one list in the code; tests cover every entry in Rust and against the wheel
+- [ ] Contract settings that cannot be honoured are rejected at registration
+- [ ] Buffers added by this change are capped
+- [ ] Benchmarks vs the previous release (back to back) show no regression, or N/A
+- [ ] Published numbers and docs contain no account or environment details
+
 ## Safety
 
 - [ ] No new path to storage that skips `BronzePipeline::prepare`

@@ -224,6 +224,9 @@ impl ColumnarPlan {
                     checks.push(Check::NotFuture(ctx.now + skew));
                 }
             }
+            if field.timestamp && !masked {
+                checks.push(Check::Timestamp);
+            }
             flag_rows(array, &checks, &mut flagged);
         }
         flag_oversized(contract, &columns, ctx.max_record_bytes, &mut flagged);
@@ -245,7 +248,7 @@ impl ColumnarPlan {
         let mut out = Vec::with_capacity(columns.len() + 1);
         for (field, column) in contract.fields().iter().zip(&columns) {
             let masked = field.pii && ctx.protector.is_some();
-            let target = codec::arrow_type(codec::storage_kind(field, masked));
+            let target = codec::storage_type(field, masked);
             let array = match column {
                 None => new_null_array(&target, accepted_rows),
                 Some(a) => {
@@ -253,6 +256,11 @@ impl ColumnarPlan {
                     match ctx.protector {
                         Some(p) if field.pii => {
                             protect_column(p, ctx.tenant_id, &field.name, &selected)?
+                        }
+                        // Same parsing as the row path, so both store the
+                        // same instants.
+                        _ if field.timestamp && selected.data_type() == &DataType::Utf8 => {
+                            codec::timestamps_from_text(&selected)
                         }
                         _ => cast(&selected, &target).map_err(arrow_error)?,
                     }
@@ -371,6 +379,8 @@ enum Check<'a> {
     FitsI64,
     Schema(&'a Validator),
     NotFuture(DateTime<Utc>),
+    /// Stored as a timestamp: the text must be an RFC 3339 date-time.
+    Timestamp,
 }
 
 impl Check<'_> {
@@ -385,6 +395,7 @@ impl Check<'_> {
                 DateTime::parse_from_rfc3339(array.as_string::<i32>().value(i))
                     .is_ok_and(|t| t.with_timezone(&Utc) > *limit)
             }
+            Self::Timestamp => codec::timestamp_micros(array.as_string::<i32>().value(i)).is_none(),
         }
     }
 }

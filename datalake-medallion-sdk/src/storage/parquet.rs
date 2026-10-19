@@ -30,10 +30,18 @@ pub struct ParquetEncoder {
 
 impl Default for ParquetEncoder {
     fn default() -> Self {
+        Self::with_compression(Compression::SNAPPY)
+    }
+}
+
+impl ParquetEncoder {
+    /// The SDK's writer settings with `compression`.
+    #[must_use]
+    pub fn with_compression(compression: Compression) -> Self {
         Self {
             properties: WriterProperties::builder()
                 .set_writer_version(WriterVersion::PARQUET_2_0)
-                .set_compression(Compression::SNAPPY)
+                .set_compression(compression)
                 .set_statistics_enabled(EnabledStatistics::Page)
                 .set_created_by(
                     concat!("datalake-medallion-sdk ", env!("CARGO_PKG_VERSION")).into(),
@@ -41,9 +49,13 @@ impl Default for ParquetEncoder {
                 .build(),
         }
     }
-}
 
-impl ParquetEncoder {
+    /// Encoder for a contract's [`BronzeCompression`].
+    #[must_use]
+    pub fn for_contract(compression: crate::contracts::BronzeCompression) -> Self {
+        Self::with_compression(compression.parquet())
+    }
+
     /// Creates an encoder with custom writer properties.
     #[must_use]
     pub fn with_properties(properties: WriterProperties) -> Self {
@@ -198,6 +210,55 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::sync::Arc;
+
+    /// Every codec a contract can declare parses, is compiled in and
+    /// round-trips (the `parquet` crate panics on a codec left out of its
+    /// features, so this must hold at build time).
+    #[test]
+    fn every_contract_codec_round_trips() {
+        use crate::contracts::{BronzeCompression, ContractRegistry};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let mut declared = Vec::new();
+        for name in BronzeCompression::NAMES {
+            let mut levels = vec![None];
+            if name == "zstd" {
+                levels.extend([Some(1), Some(22)]);
+            }
+            for level in levels {
+                let mut schema = serde_json::json!({
+                    "type": "object", "x-dl-domain": "app", "x-dl-datatype": "log",
+                    "x-dl-schema_version": "1.0.0", "x-dl-compression": name,
+                    "properties": {"id": {"type": "string"}}
+                });
+                if let Some(level) = level {
+                    schema["x-dl-compression_level"] = level.into();
+                }
+                let mut registry = ContractRegistry::default();
+                registry.register(&schema).unwrap();
+                declared.push(registry.get("app/log/1.0.0").unwrap().compression());
+            }
+        }
+        for codec in declared {
+            let body = ParquetEncoder::for_contract(codec)
+                .encode(&[batch(100)])
+                .unwrap_or_else(|e| panic!("{codec:?}: {e}"));
+            let reader = SerializedFileReader::new(body.clone()).unwrap();
+            // Files record the codec, not the ZSTD level.
+            let written = reader.metadata().row_group(0).column(0).compression();
+            assert_eq!(
+                std::mem::discriminant(&written),
+                std::mem::discriminant(&codec.parquet()),
+                "{codec:?}"
+            );
+            let rows: usize = ParquetRecordBatchReaderBuilder::try_new(body)
+                .unwrap()
+                .build()
+                .unwrap()
+                .map(|b| b.unwrap().num_rows())
+                .sum();
+            assert_eq!(rows, 100, "{codec:?}");
+        }
+    }
 
     fn batch(n: i32) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![

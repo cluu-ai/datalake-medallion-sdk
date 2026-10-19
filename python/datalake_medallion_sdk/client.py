@@ -170,6 +170,8 @@ class BronzeIngestionClient:
         max_inflight_parts: int = 4,
         parse_text_columns: bool = False,
         json_lines: bool = False,
+        max_object_seconds: float | None = None,
+        max_open_days: int = 4,
     ) -> StreamReport:
         """Ingest input of any size with bounded memory.
 
@@ -195,6 +197,14 @@ class BronzeIngestionClient:
         duplicated. Use :meth:`ingest_file` for CSV, JSON Lines and Parquet
         files, local or on S3.
 
+        For continuous sources (logs, events), ``max_object_seconds`` closes
+        an object once it is that old, so records become visible within a
+        bounded time even when traffic is low (checked as chunks arrive).
+        When the contract sets ``x-dl-partition_by``, rows go to one object
+        per event day (``<stream_id>-<YYYYMMDD>-00000.parquet`` under that
+        day's partition); at most ``max_open_days`` are open at once, each
+        holding up to one row group in memory.
+
         Raises:
             As :meth:`ingest`; on error the unfinished object is discarded.
         """
@@ -210,6 +220,8 @@ class BronzeIngestionClient:
             max_inflight_parts=max_inflight_parts,
             parse_text_columns=parse_text_columns,
             json_lines=json_lines,
+            max_object_seconds=max_object_seconds,
+            max_open_days=max_open_days,
         )
 
     async def ingest_file(
@@ -225,6 +237,7 @@ class BronzeIngestionClient:
         row_group_mb: int = 64,
         chunk_rows: int = 131_072,
         max_inflight_parts: int = 4,
+        max_open_days: int = 4,
     ) -> StreamReport:
         """Stream a CSV, TSV, JSON Lines or Parquet file into Bronze.
 
@@ -258,6 +271,7 @@ class BronzeIngestionClient:
             "row_group_mb": row_group_mb,
             "chunk_rows": chunk_rows,
             "max_inflight_parts": max_inflight_parts,
+            "max_open_days": max_open_days,
         }
         if kind == "parquet":
             import pyarrow as pa
