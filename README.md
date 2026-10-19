@@ -112,13 +112,12 @@ The rest of this page covers each piece in depth.
 | A file, local or on S3: CSV, TSV, JSON Lines, Parquet, gz/zst | `client.ingest_file("s3://…")` | 3.16 M records: Parquet **4.0 s**, CSV 5.6 s, JSONL 10.2 s; **0.5–0.9 GB** of memory |
 | An Arrow stream: pyarrow dataset, DuckDB result, Polars, Kafka batches… | `client.ingest_stream(reader)` | 0.7–0.8 M records/s with bounded memory |
 | A DataFrame already in memory | `client.ingest(df)` | 0.5 M records/s (one object) |
-| Application logs in OTLP/JSON, from an API or a queue batch | `client.ingest_otel_logs(body)` / `ingest_otel_log_batch(bodies)` | 0.3–0.8 M records/s locally²; one object per tenant per batch |
+| Application logs in OTLP/JSON, from an API or a queue batch | `client.ingest_otel_logs(body)` / `ingest_otel_log_batch(bodies)` | 1 M records (396 MiB) in **2.5 s**, one object per tenant |
 | Repeated per-tenant reads: APIs, dashboards | `LakeReader(cache_mb=1024)` (Polars) | **22–67 ms** per query on 3.1 M rows |
 | One-off or low-memory reads, SQL | `LakeReader(engine="duckdb")` | 100–950 ms, 0.3–0.7 GB |
 | Encrypted PII to read back | `PiiDecryptor.decrypt_column(...)` | 3.1 M values in **1.1 s** |
 
 ¹ AWS Lambda with 10 GB / 6 vCPU, reading from and writing to S3 in the same region. Methodology, local numbers and every configuration are in [docs/performance.md](docs/performance.md).
-² Measured without the network; see [Application logs](#application-logs-opentelemetry).
 
 Rules of thumb:
 - **Columnar input** (Parquet, Arrow) is 3–6x faster than JSON or dicts.
@@ -351,7 +350,7 @@ errors = reader.read(
 )
 ```
 
-**Performance** (local, no network; `examples/otel_throughput.rs`): 200 k log records, 84 MiB of OTLP/JSON, 4 tenants, flattened, validated and encoded in **0.66 s** as one request (128 MiB/s) and **0.24 s** as a batch of 100 requests (350 MiB/s, 0.83 M records/s).
+**Performance.** On AWS Lambda (10 GB / 6 vCPU), a batch of 500 requests with 1 M log records (396 MiB of OTLP/JSON) for 8 tenants is written to S3 in **2.5 s**, one object per tenant; the Lambda recipe handles a Kinesis batch of 100 requests in 0.5 s. Without the network (`examples/otel_throughput.rs`), 200 k records take 0.66 s as one request and 0.24 s as 100 requests (350 MiB/s). Details in [docs/performance.md](docs/performance.md).
 
 ## PII protection
 
