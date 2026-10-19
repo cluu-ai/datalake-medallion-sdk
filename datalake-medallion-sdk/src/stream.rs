@@ -321,7 +321,8 @@ impl BronzePipeline {
     {
         let mut stream = self.stream(tenant, contract, hook, options)?;
         tokio::task::spawn_blocking(move || {
-            for chunk in source {
+            let chunks = prefetch(source.into_iter());
+            for chunk in &chunks {
                 stream.push(chunk?)?;
             }
             stream.finish()
@@ -329,6 +330,35 @@ impl BronzePipeline {
         .await
         .map_err(|e| DatalakeError::storage("runtime", format!("stream task failed: {e}")))?
     }
+}
+
+/// Chunks read ahead on a separate thread.
+const PREFETCH: usize = 2;
+
+/// Runs `source` on its own thread, `PREFETCH` chunks ahead, so reading the
+/// next chunk (storage I/O, decompression, parsing in the caller) overlaps
+/// with validating and encoding the current one. Memory grows by at most
+/// `PREFETCH` chunks. The thread stops when the receiver is dropped.
+pub fn prefetch<I, T>(source: I) -> std::sync::mpsc::Receiver<T>
+where
+    I: Iterator<Item = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(PREFETCH);
+    std::thread::Builder::new()
+        .name("dl-stream-read".into())
+        .spawn(move || {
+            for item in source {
+                if tx.send(item).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_or_else(
+            |e| tracing::warn!(error = %e, "could not start the read-ahead thread"),
+            drop,
+        );
+    rx
 }
 
 impl OpenObject {

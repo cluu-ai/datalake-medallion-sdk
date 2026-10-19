@@ -186,9 +186,20 @@ async fn main() {
         )
         .expect("pipeline"),
     );
+    // DL_PII=aes protects the contract's PII fields with AES-256-GCM.
+    let protector: Option<Arc<dyn _core::validation::pii::FieldProtector>> =
+        match std::env::var("DL_PII").as_deref() {
+            Ok("aes") => Some(Arc::new(
+                _core::validation::pii::Aes256GcmEncryptor::new(&[7u8; 32], "local-key")
+                    .expect("key"),
+            )),
+            Ok("sha256") => Some(Arc::new(_core::validation::pii::Sha256Hasher)),
+            _ => None,
+        };
     let tenant = Arc::new(
         TenantProfile::for_bucket(TenantId::new("testing").expect("id"), "bench")
             .expect("profile")
+            .pii_protection(protector)
             .build()
             .expect("profile"),
     );
@@ -208,6 +219,64 @@ async fn main() {
         } else {
             Box::new(json_lines(path))
         };
+    if std::env::var("DL_JSON_PARSE").is_ok() {
+        // arrow-json decoding alone, blocks one after another vs in parallel.
+        use rayon::prelude::*;
+        let text = std::fs::read(path).expect("read");
+        let mut blocks = Vec::new();
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = (start + BLOCK).min(text.len());
+            while end < text.len() && text[end - 1] != b'\n' {
+                end += 1;
+            }
+            blocks.push(&text[start..end]);
+            start = end;
+        }
+        let fields = vec![
+            Field::new("event_id", DataType::Utf8, true),
+            Field::new("occurred_at", DataType::Utf8, true),
+            Field::new("severity", DataType::Utf8, true),
+            Field::new("asset_id", DataType::Int64, true),
+            Field::new("score", DataType::Float64, true),
+            Field::new("is_active", DataType::Boolean, true),
+            Field::new("country", DataType::Utf8, true),
+            Field::new("user_email", DataType::Utf8, true),
+            Field::new("source_ip", DataType::Utf8, true),
+            Field::new("phone", DataType::Utf8, true),
+            Field::new("amount", DataType::Float64, true),
+            Field::new("notes", DataType::Utf8, true),
+        ];
+        let schema = Arc::new(Schema::new(fields));
+        let decode = |b: &[u8]| -> usize {
+            let mut d = arrow::json::ReaderBuilder::new(Arc::clone(&schema))
+                .with_batch_size(1 << 20)
+                .build_decoder()
+                .expect("decoder");
+            let mut off = 0;
+            while off < b.len() {
+                let n = d.decode(&b[off..]).expect("decode");
+                if n == 0 {
+                    break;
+                }
+                off += n;
+            }
+            d.flush().expect("flush").map_or(0, |b| b.num_rows())
+        };
+        let t = Instant::now();
+        let rows: usize = blocks.iter().map(|b| decode(b)).sum();
+        let seq = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let rows_par: usize = blocks.par_iter().map(|b| decode(b)).sum();
+        let par = t.elapsed().as_secs_f64();
+        println!(
+            "{} blocks, {rows} rows: sequential {seq:.2} s = {:.0} MiB/s; parallel {par:.2} s = {:.0} MiB/s ({rows_par})",
+            blocks.len(),
+            size / seq,
+            size / par
+        );
+        return;
+    }
     if std::env::var("DL_STAGES").is_ok() {
         // Cost of each stage alone: reading, then Parquet encoding with the
         // SDK's writer properties (single-threaded ArrowWriter).

@@ -67,6 +67,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 
 # CPU parallelism for batch validation and masking
 rayon = "1"
+memchr = "2"
 
 # Errors and observability
 thiserror = "2"

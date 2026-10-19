@@ -263,3 +263,47 @@ def test_invalid_configs_are_rejected(tenant: dict[str, Any]) -> None:
 def test_profile_without_protection_never_needs_a_provider() -> None:
     profile = TenantProfile.for_bucket("acme-001", "acme-lake")
     assert profile.pii_protection == "none"
+
+
+async def test_decrypt_column_takes_and_returns_arrow(
+    make_client: MakeClient, store: Bucket, s3_endpoint: str, kms_key: str
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pl = pytest.importorskip("polars")
+    client = make_client(
+        pii_protection=PiiProtection.kms_envelope(
+            kms_key, region="us-east-1", endpoint_url=s3_endpoint, max_nonce_prefixes_per_key=1
+        )
+    )
+    tables = []
+    for i in range(2):  # one nonce prefix per key: the second call uses a new data key
+        rows = [{"event_id": f"e{i}{j}", "user_email": f"u{i}{j}@x.io"} for j in range(3)]
+        rows.append({"event_id": f"e{i}n"})
+        report = await client.ingest(rows, tenant="acme-001", contract=CONTRACT)
+        tables.append(store.parquet(report.data_uri))
+    table = pa.concat_tables(tables)
+    assert len(set(table.column("_dl_pii_key_ref").to_pylist())) == 2
+    reader = PiiDecryptor.kms(region="us-east-1", endpoint_url=s3_endpoint)
+    expected = ["u00@x.io", "u01@x.io", "u02@x.io", None, "u10@x.io", "u11@x.io", "u12@x.io", None]
+    clear = reader.decrypt_column(
+        table.column("user_email"),
+        tenant_id="acme-001",
+        field="user_email",
+        key_refs=table.column("_dl_pii_key_ref"),
+    )
+    assert isinstance(clear, pa.Array) and clear.to_pylist() == expected
+    frame = pl.from_arrow(table)
+    from_polars = reader.decrypt_column(
+        frame["user_email"],
+        tenant_id="acme-001",
+        field="user_email",
+        key_refs=frame["_dl_pii_key_ref"],
+    )
+    assert from_polars.to_pylist() == expected
+    with pytest.raises(ProtectionError):
+        reader.decrypt_column(
+            table.column("user_email"),
+            tenant_id="acme-001",
+            field="user_email",
+            key_refs=tables[0].column("_dl_pii_key_ref")[0].as_py(),
+        )

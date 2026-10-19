@@ -565,7 +565,7 @@ impl BronzePipeline {
         let max = self.config.max_record_bytes;
         let (typed, rows): (Vec<usize>, Vec<usize>) = (0..lines.len()).partition(|&i| {
             let line = &text.as_bytes()[lines[i].clone()];
-            line.len() <= max && !contains(line, b"null")
+            line.len() <= max && memchr::memmem::find(line, b"null").is_none()
         });
         let row_path = |indices: &[usize]| -> Vec<(usize, Raw)> {
             indices
@@ -575,13 +575,17 @@ impl BronzePipeline {
         };
         let parsed = if typed.is_empty() {
             None
+        } else if rows.is_empty() {
+            // Every line takes the typed path (the usual case): parse the
+            // chunk as it is, without copying it.
+            parse_json_lines(text.as_bytes(), &schema).filter(|b| b.num_rows() == typed.len())
         } else {
             let mut buffer = Vec::with_capacity(text.len());
             for &i in &typed {
                 buffer.extend_from_slice(&text.as_bytes()[lines[i].clone()]);
                 buffer.push(b'\n');
             }
-            parse_json_lines(&buffer, typed.len(), &schema).filter(|b| b.num_rows() == typed.len())
+            parse_json_lines(&buffer, &schema).filter(|b| b.num_rows() == typed.len())
         };
         let Some(batch) = parsed else {
             let all: Vec<usize> = (0..lines.len()).collect();
@@ -1030,13 +1034,42 @@ fn line_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     out
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
+/// Bytes of JSON Lines parsed per parallel task.
+const JSON_PART_BYTES: usize = 1 << 20;
+
+/// Parses newline-delimited JSON objects into one batch of `schema`, parts of
+/// about [`JSON_PART_BYTES`] (cut on line breaks) in parallel; `None` when a
+/// value does not fit its declared type or a field is undeclared.
+fn parse_json_lines(buffer: &[u8], schema: &Arc<arrow::datatypes::Schema>) -> Option<RecordBatch> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < buffer.len() {
+        let mut end = (start + JSON_PART_BYTES).min(buffer.len());
+        if end < buffer.len() {
+            end = memchr::memchr(b'\n', &buffer[end..]).map_or(buffer.len(), |i| end + i + 1);
+        }
+        // Blank parts (trailing line breaks) hold no record.
+        if !buffer[start..end].iter().all(u8::is_ascii_whitespace) {
+            parts.push(&buffer[start..end]);
+        }
+        start = end;
+    }
+    let batches: Vec<RecordBatch> = parts
+        .par_iter()
+        .map(|part| {
+            let rows = memchr::memchr_iter(b'\n', part).count() + 1;
+            parse_json_part(part, rows, schema)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    match batches.as_slice() {
+        [] => None,
+        [one] => Some(one.clone()),
+        [first, ..] => concat_batches(&first.schema(), &batches).ok(),
+    }
 }
 
-/// Parses newline-delimited JSON objects into one batch of `schema`; `None`
-/// when a value does not fit its declared type or a field is undeclared.
-fn parse_json_lines(
+/// One part of [`parse_json_lines`].
+fn parse_json_part(
     buffer: &[u8],
     rows: usize,
     schema: &Arc<arrow::datatypes::Schema>,
