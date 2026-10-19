@@ -322,6 +322,86 @@ impl PyBronzeIngestionClient {
         })
     }
 
+    /// Flattens an OTLP/JSON logs request and ingests each tenant's records
+    /// in one call, without pyarrow and without holding the GIL while parsing.
+    ///
+    /// `resolve(tenant_or_none)` maps each tenant found in `tenant_attribute`
+    /// (or `None` for records without it) to a `TenantProfile` or a tenant id.
+    /// Tenants are validated one by one and committed concurrently. Returns
+    /// `(tenant_or_none, IngestReport)` pairs in tenant order.
+    #[pyo3(signature = (body, *, contract, tenant_attribute, resolve, batch_id = None))]
+    fn ingest_otel_logs<'py>(
+        &self,
+        py: Python<'py>,
+        body: &Bound<'py, PyBytes>,
+        contract: &str,
+        tenant_attribute: &str,
+        resolve: &Bound<'py, PyAny>,
+        batch_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.parts.registry.get(contract)?;
+        let bytes = body.as_bytes();
+        let groups = py.detach(|| crate::otel::flatten_logs_json(bytes, tenant_attribute))?;
+        let mut requests = Vec::with_capacity(groups.len());
+        for group in groups {
+            let profile = self.resolve(&resolve.call1((group.tenant.clone(),))?)?;
+            let mut request =
+                IngestRequest::new(profile, contract, RecordSource::Arrow(vec![group.batch]));
+            if let Some(id) = &batch_id {
+                request = request.with_batch_id(id.clone());
+            }
+            if let Some(hook) = self.hooks.get(contract) {
+                request = request.with_hook(Arc::clone(hook));
+            }
+            requests.push((group.tenant, request));
+        }
+        let parts = Arc::clone(&self.parts);
+        let cell = Arc::clone(&self.pipeline);
+        future_into_py(py, async move {
+            let pipeline = cell
+                .get_or_try_init(|| async {
+                    let storage = S3Storage::connect(parts.s3.clone()).await;
+                    BronzePipeline::new(
+                        Arc::clone(&parts.registry),
+                        Arc::new(storage),
+                        parts.config.clone(),
+                    )
+                    .map(Arc::new)
+                })
+                .await?;
+            let worker = Arc::clone(pipeline);
+            let prepared = tokio::task::spawn_blocking(move || {
+                requests
+                    .into_iter()
+                    .map(|(tenant, request)| Ok((tenant, worker.prepare(request)?)))
+                    .collect::<Result<Vec<_>, DatalakeError>>()
+            })
+            .await
+            .map_err(|e| {
+                DatalakeError::storage("runtime", format!("validation task failed: {e}"))
+            })??;
+            let mut commits = tokio::task::JoinSet::new();
+            for (index, (tenant, batch)) in prepared.into_iter().enumerate() {
+                let pipeline = Arc::clone(pipeline);
+                commits.spawn(async move {
+                    let report = pipeline.commit_with_retries(&batch, 4).await?;
+                    Ok::<_, DatalakeError>((index, tenant, report))
+                });
+            }
+            let mut reports = Vec::with_capacity(commits.len());
+            while let Some(done) = commits.join_next().await {
+                reports.push(done.map_err(|e| {
+                    DatalakeError::storage("runtime", format!("upload task failed: {e}"))
+                })??);
+            }
+            reports.sort_unstable_by_key(|(index, ..)| *index);
+            Ok(reports
+                .into_iter()
+                .map(|(_, tenant, report)| (tenant, PyIngestReport::from(report)))
+                .collect::<Vec<_>>())
+        })
+    }
+
     /// Ingests input of any size with bounded memory: validated in chunks,
     /// written as Parquet objects of about `target_object_mb` uploaded in
     /// parts while the next chunk is validated.

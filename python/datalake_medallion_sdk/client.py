@@ -156,6 +156,57 @@ class BronzeIngestionClient:
             batch, tenant=self._resolve(tenant), contract=contract, batch_id=batch_id
         )
 
+    async def ingest_otel_logs(
+        self,
+        payload: bytes | bytearray | memoryview | str | Mapping[str, Any],
+        *,
+        contract: str,
+        tenant_attribute: str = "tenant.id",
+        default_tenant: TenantProfile | str | None = None,
+        batch_id: str | None = None,
+    ) -> dict[str, IngestReport]:
+        """Ingest an OTLP/JSON logs request for every tenant it contains.
+
+        Records are flattened to the columns of
+        :func:`datalake_medallion_sdk.otel.logs_contract` and grouped by the
+        resource attribute ``tenant_attribute`` (or a record attribute of that
+        name); each tenant id is resolved like ``ingest(tenant="<id>")``.
+        Records without it go to ``default_tenant``, or the call raises
+        :class:`TenantViolationError` before anything is written. Parsing,
+        validation and encoding run in Rust without the GIL and without
+        pyarrow; tenants are uploaded concurrently.
+
+        ``batch_id`` names every tenant's objects: pass a deterministic ULID
+        (for example derived from a queue message) so a redelivered request
+        rewrites the same keys. Returns the reports by tenant id.
+
+        Raises:
+            MalformedPayloadError: the request is not OTLP/JSON.
+            TenantViolationError: a tenant is unknown, or records have no
+                tenant and there is no ``default_tenant``.
+            As :meth:`ingest` otherwise.
+        """
+        from .otel import otlp_bytes
+
+        def resolve(tenant_id: str | None) -> TenantProfile | str:
+            if tenant_id is not None:
+                return self._resolve(tenant_id)
+            if default_tenant is None:
+                raise TenantViolationError(
+                    f"tenant violation: log records without the {tenant_attribute!r} "
+                    "attribute and no default_tenant"
+                )
+            return self._resolve(default_tenant)
+
+        pairs = await self._native.ingest_otel_logs(
+            otlp_bytes(payload),
+            contract=contract,
+            tenant_attribute=tenant_attribute,
+            resolve=resolve,
+            batch_id=batch_id,
+        )
+        return {report.tenant_id: report for _, report in pairs}
+
     async def ingest_stream(
         self,
         source: Any,

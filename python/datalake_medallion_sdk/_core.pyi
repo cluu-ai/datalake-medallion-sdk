@@ -28,6 +28,8 @@ __all__ = [
     "TenantViolationError",
     "TypeCoercionError",
     "__version__",
+    "flatten_otlp_logs",
+    "otel_logs_contract",
 ]
 __version__: str
 
@@ -315,6 +317,16 @@ class BronzeIngestionClient:
             RecordRejectedError: a record is invalid and ``on_invalid="raise"``.
             StorageError: encoding or upload failed.
         """
+    async def ingest_otel_logs(
+        self,
+        body: bytes,
+        *,
+        contract: str,
+        tenant_attribute: str,
+        resolve: Callable[[str | None], TenantProfile | str],
+        batch_id: str | None = None,
+    ) -> list[tuple[str | None, IngestReport]]:
+        """Flatten an OTLP/JSON logs request and ingest each tenant's records."""
     async def ingest_stream(
         self,
         source: Any,
@@ -376,3 +388,16 @@ class PiiDecryptor:
         self, tokens: Iterable[str | None], *, tenant_id: str, field: str, key_ref: str
     ) -> list[str | None]:
         """Decrypt a column (``None`` stays ``None``) without holding the GIL."""
+
+def otel_logs_contract(
+    *,
+    domain: str,
+    datatype: str,
+    schema_version: str,
+    compression: str,
+    partition_by_event_time: bool,
+) -> str:
+    """JSON text of the contract for flattened OpenTelemetry logs."""
+
+def flatten_otlp_logs(body: bytes, *, tenant_attribute: str) -> list[tuple[str | None, Any]]:
+    """Flatten an OTLP/JSON logs request into ``(tenant, pyarrow.RecordBatch)`` pairs."""
