@@ -1,137 +1,129 @@
 # Performance
 
-## Ingestion
+The numbers on this page are real runs of the published package. Use them to pick a client and a configuration.
 
-**Setup**
-- One batch of about 200 MiB: 868,961 records, 7 fields, 1 of them PII.
-- Measured on 2026-10-17 on a laptop: AMD Ryzen 7 7730U, 8 cores / 16 threads, Windows 11.
-- Tool: [`datalake-medallion-sdk/examples/throughput.rs`](../datalake-medallion-sdk/examples/throughput.rs), built with `opt-level = 3` and LTO disabled. Published wheels use LTO.
+## How it was measured
 
-**What is measured**
-- `prepare` covers every validation level, PII protection and Parquet encoding.
-- No network I/O is included; upload time depends on the network.
-- Peak heap is the memory allocated on top of the input.
-
-Mean of 3 alternating rounds against the previous release on the same machine (2026-10-18; laptop runs vary by about 10% with heat).
-
-| Input | PII protection | 0.2.0rc5 | 0.2.0rc6 | Throughput | Records/s | Peak heap |
-|---|---|---|---|---|---|---|
-| Arrow | none (default) | 0.75 s | **0.42 s** | 500 MiB/s | 2.1 M | 200 MiB |
-| Arrow | `sha256` | 0.99 s | **0.61 s** | 343 MiB/s | 1.4 M | 242 MiB |
-| Arrow | `aes-256-gcm` | 1.16 s | **0.78 s** | 268 MiB/s | 1.1 M | 250 MiB |
-| JSON text | none (default) | 3.26 s | **2.71 s** | 77 MiB/s | 0.32 M | 649 MiB |
-| JSON text | `sha256` | 3.96 s | **3.32 s** | 63 MiB/s | 0.26 M | 712 MiB |
-| JSON text | `aes-256-gcm` | 4.03 s | **3.51 s** | 60 MiB/s | 0.25 M | 768 MiB |
-
-0.2.0rc6 encodes the columns of each Parquet row group in parallel. This uses the `ArrowColumnWriter` pattern documented in the `parquet` crate. Encoding alone went from 1.78 s to 0.93 s for 3.16 M rows, with identical output. Parquet sizes are unchanged: 18 MiB without protection, 71 MiB with `sha256` and 59 MiB with `aes-256-gcm`.
-
-Findings:
-- **Arrow input is about 6x faster than JSON.** It also needs less extra memory than its own size: accepted columns are reused without copying, and only rows that may be invalid are converted.
-- **Protection costs 40–60% more time on Arrow.**
-- **Protected values compress far less** than the originals.
-
-To reproduce, run these from the `datalake-medallion-sdk/` folder:
-- `DL_BENCH_MB=200 cargo run --release --example throughput`: the table above.
-- `cargo bench`: the Criterion micro-benchmarks (contract checks, PII schemes, Parquet encoding, `prepare` by input type).
-
-## Streaming ingestion (`ingest_file`, `ingest_stream`)
-
-**Setup**
-- Inputs: 500 MB files, and one 2 GB JSON Lines file (6.7 M records).
-- Defaults: 8 MB read blocks, 131,072-row chunks, 64 MB row groups, 16 MB parts, 4 parts in flight.
-- S3 is an emulator running in another process, so the memory shown is the SDK process alone.
-- Measured on 2026-10-18 on the 16-thread laptop. Times include S3 uploads to the emulator.
-
-| Input | One `ingest` call | `ingest_file` (streaming) |
+| | Cloud (AWS) | Local |
 |---|---|---|
-| CSV, 500 MB (3.16 M records) | 6.9 s, peak 2,743 MB | 7.0 s, peak **765 MB** |
-| JSON Lines, 500 MB (1.68 M records) | 22.5 s, peak 4,489 MB | 6.4 s, peak **276 MB** |
-| Parquet, 264 MB (3.16 M records) | 6.7 s, peak 2,326 MB | 6.8 s, peak **798 MB** |
-| JSON Lines, 2 GB (6.7 M records) | (about 18 GB of memory) | 30.6 s, peak **436 MB**, 2 objects |
+| **Machine** | AWS Lambda, 10 GB memory (6 vCPU), Python 3.12, x86_64, same region as the bucket | Laptop with 8 cores / 16 threads, Windows 11 |
+| **SDK** | `0.2.0rc8` installed from the package index | Same code, release build |
+| **Storage** | Amazon S3, real uploads | A store that discards bytes, so only the SDK's own work is timed |
+| **Data** | 3.16 M records, 10 fields, 1% invalid (quarantined) | Same shape |
 
-Findings:
-- **Memory stays bounded.** It does not grow with the input: 4x the data costs 160 MB more, which is the second object's parts.
-- **Streaming is as fast as one call** for CSV and Parquet, because validating a chunk overlaps with uploading the previous one.
-- **Streaming JSON Lines is 3.5x faster** than one call. Lines that fit the contract are parsed straight into typed columns, and only lines with `null` take the row path.
-- **Tuning:**
-  - 8 MB blocks were faster and lighter than 32 MB (CSV peak 765 vs 1,226 MB).
-  - 32 MB row groups save about 100 MB more but cost about 20% throughput.
-  - On real S3, raise `max_inflight_parts` when the network allows; uploads then overlap more.
+Each case runs in a fresh process.
+- **Memory** is the process's peak resident set (`VmHWM`), including Python and the input.
+- **Throughput** is input size divided by wall time. That includes reading the source and uploading to S3.
+
+---
+
+## Ingestion: one client per use case
+
+3.16 M records from S3 into S3, on AWS:
+
+| How you call it | Input | Time | Records/s | Peak memory |
+|---|---|---|---|---|
+| `ingest_stream(pyarrow dataset scanner)` | Parquet, 92 MB | **4.1 s** | **0.77 M** | 1.4 GB |
+| `ingest_file("s3://…/x.parquet")` | Parquet, 92 MB | **4.0 s** | **0.77 M** | **0.9 GB** |
+| `ingest_stream(duckdb result)` | Parquet via DuckDB | 4.4 s | 0.72 M | 1.0 GB |
+| `ingest_file("s3://…/x.csv")` | CSV, 468 MB | 5.6 s | 0.56 M | **0.7 GB** |
+| `ingest(polars.DataFrame)` | whole frame in memory | 6.1 s¹ | 0.52 M | 1.8 GB |
+| `ingest(pyarrow.Table)` | whole table in memory | 6.7 s¹ | 0.47 M | 2.1 GB |
+| `ingest_file("s3://…/x.jsonl")` | JSON Lines, 793 MB | 10.2 s | 0.31 M | **0.5 GB** |
+| `ingest(list of dicts)`, 200 k records | Python objects | 4.6 s² | 0.09 M | 1.5 GB |
+| `ingest(json text)`, 200 k records | JSON string | 3.6 s² | 0.14 M | 1.4 GB |
+
+¹ Includes about 1 s to read the Parquet input into memory.
+² Most of the time is building the dicts or the JSON text in Python (2.2–2.3 s); the SDK part takes 1.4–2.2 s.
+
+What this means:
+- **Streams are the fastest and lightest way in.** `ingest_file` and `ingest_stream` validate chunk by chunk, read the next chunk while the current one is encoded, and upload Parquet in parallel parts. Memory stays flat whatever the input size: 2 GB of JSON Lines peaks at about 0.4 GB.
+- **Columnar input is the fast path.** Parquet and Arrow are validated column by column. JSON and dicts are validated record by record, about 3–6x slower per record.
+- **Prefer `ingest_file` for files on S3.** It reads them with 4 parallel ranged requests. A single S3 stream inside a Lambda reached about 37 MiB/s; parallel ranges reach about 90 MiB/s.
+- **Use `ingest(...)` for micro-batches** (an API call, a queue message, a Lambda batch): one call writes one object.
 
 ### Without the network
 
-The same streams written to a store that discards the bytes, with `examples/stream_throughput.rs`:
+The same inputs written to a store that discards the bytes, measuring only the SDK (local, `examples/stream_throughput.rs`):
 
-| Input | One call | Stream |
+| Input, ~500 MB | Stream | Peak heap |
 |---|---|---|
-| CSV, 500 MB | 6.46 s, 2,172 MiB heap | **5.30 s, 307 MiB** |
-| JSON Lines, 500 MB | 6.93 s, 2,563 MiB | **5.65 s, 268 MiB** |
-| Parquet, 264 MB | 6.11 s, 1,896 MiB | **4.60 s, 364 MiB** |
+| JSON Lines | 3.6 s (138 MiB/s) | 294 MiB |
+| CSV | 3.5 s (141 MiB/s) | 352 MiB |
+| Parquet | 3.7 s (0.86 M records/s) | 409 MiB |
 
-How the time splits:
-- The test contract checks a pattern, two formats, an enum and ranges on every record. These per-value rules cost 5–15%.
-- The rest is reading, typed validation and Parquet encoding.
-- 128 MB row groups (`row_group_bytes`) are 2–7% faster than the 64 MB default, for about 170 MiB more memory.
+### One call, by input type and protection
 
-## Reading (`LakeReader`)
+`examples/throughput.rs`: 200 MiB, 869 k records, 7 fields, 1 of them PII; local, no network. Mean of 3 rounds alternated with the previous release.
 
-**Data**
-- 3.16 M rows spread over 8 tenants. Every query reads one tenant: about 395 k rows.
-- **Bronze**: Parquet in the SDK layout, 2,313 objects, 217 MiB.
-- **Iceberg**: one table shared by all tenants, partitioned by `tenant_id` and month; 88 objects, 230 MiB.
-
-**Method**
-- Each engine and query runs in a fresh process.
-- *First* is the first call, including imports, reader setup, listing and planning.
-- *Warm* is the median of the next 5 calls.
-
-### Local disk (16 cores)
-
-| Query | Polars, Bronze | DuckDB, Bronze | Polars, Iceberg | DuckDB, Iceberg |
+| Input | PII protection | Time | Throughput | Peak heap |
 |---|---|---|---|---|
-| Aggregate one month | 14 ms | 47 ms | 8 ms | 15 ms |
-| 3 ids | 19 ms | 63 ms | 14 ms | 29 ms |
-| Keyset page of 1,000 | 23 ms | 48 ms | 20 ms | 24 ms |
-| Export 395 k rows to Arrow | 69 ms | 227 ms | 25 ms | 69 ms |
+| Arrow | none (default) | **0.38 s** | 550 MiB/s | 200 MiB |
+| Arrow | `sha256` | 0.55 s | 380 MiB/s | 243 MiB |
+| Arrow | `aes-256-gcm` | 0.72 s | 290 MiB/s | 250 MiB |
+| JSON text | none | 2.3 s | 90 MiB/s | 649 MiB |
+| JSON text | `sha256` | 2.9 s | 73 MiB/s | 712 MiB |
+| JSON text | `aes-256-gcm` | 3.1 s | 67 MiB/s | 768 MiB |
 
-- Peak memory: 86–174 MiB with DuckDB, 113–398 MiB with Polars.
-- First query: about 300 ms with DuckDB, 600–950 ms with Polars.
-- Listing only the tenant's prefix made reads 6.5x faster than listing the whole lake and filtering.
+Parquet columns are encoded in parallel. Protected values compress far less than the originals (Parquet output: 18 MiB unprotected, 59–71 MiB protected).
 
-### AWS Lambda in us-east-1 against S3 (4 GB memory, about 2 vCPU)
+---
 
-Same data and queries, read in-region with the 0.2.0rc4 wheel plus this release's reader. Warm median of 5 calls.
+## PII protection on AWS
 
-| Query | Polars, Bronze | Polars, Bronze, `cache_mb=512` | DuckDB, Bronze | DuckDB, Bronze, `cache_mb=512` | Polars, Iceberg | DuckDB, Iceberg | Athena, Bronze | Athena, Iceberg |
-|---|---|---|---|---|---|---|---|---|
-| Aggregate one month | 914 ms | **5 ms** | 3,319 ms | 43 ms | 67 ms | 71 ms | 1,216 ms | 917 ms |
-| 3 ids | 1,120 ms | **5 ms** | 3,340 ms | 39 ms | 132 ms | 119 ms | 1,102 ms | 992 ms |
-| Keyset page of 1,000 | 924 ms | **13 ms** | 3,263 ms | 55 ms | 111 ms | 103 ms | 1,282 ms | 1,174 ms |
-| Export 395 k rows | 1,125 ms | **27 ms** | 8,097 ms | 98 ms | 128 ms | 147 ms | 2,084 ms* | 2,088 ms* |
+Same 3.16 M records, `PiiProtection.kms_envelope` with a per-tenant KMS key:
 
-\* Athena: query execution only (`TotalExecutionTimeInMillis`, 55–93 ms of it queueing). Fetching the 395 k-row result takes longer still.
+| Step | Result |
+|---|---|
+| `ingest_file` Parquet + KMS envelope | 5.5 s, 0.9 GB peak (one KMS call per tenant per hour, not per record) |
+| `PiiDecryptor.decrypt_column`, 3.1 M values | **1.1 s**, about +0.1 GB |
+| `PiiDecryptor.decrypt_many`, same values (Python lists) | 3.2 s, about +0.9 GB |
 
-**First read** in a new process, including imports and listing:
-- Polars: 1.5–2.0 s.
-- DuckDB: 1.2–2.1 s.
-- DuckDB, Bronze without the cache: up to 23 s for the full export.
+To keep memory low:
+- Use `decrypt_column`: Arrow in, Arrow out.
+- Read `_dl_pii_key_ref` as a dictionary (`read_dictionary=["_dl_pii_key_ref"]`), so the long key reference is not repeated on every row.
 
-**Peak memory**: 180–380 MiB. The cache holds the tenant's Bronze table (about 100 MiB here).
+---
 
-What this shows:
-- **Bronze on S3 is many small objects.** Here that is about 212 per tenant, one per day; the ingestion client writes one per call. Without the cache, every read pays one S3 round trip per object.
-- **`cache_mb` removes those round trips.** Objects the SDK writes never change, so warm reads fetch only new objects. The result is 5–27 ms with Polars: 40–200x faster than reading S3 again, and 77–240x faster than Athena.
-- **Iceberg needs no cache to be fast.** It has few, larger files and prunes them with manifests, giving 67–147 ms with either engine.
-- **Athena** spends 0.9–2.1 s per query, and that is without fetching results.
+## Reading: `LakeReader`
 
-**Recommendations**
-- **Services that read Bronze repeatedly** (APIs, dashboards): use `LakeReader(cache_mb=...)` sized to the tenants' Bronze tables, with the default Polars engine.
-- **Silver and Gold**: compact into Iceberg or into larger Parquet files.
-- **Batch jobs that read once**: they don't need the cache.
-- **Pruning Bronze**: filter on the `year`, `month` and `day` partition columns. This skips whole objects even without the cache.
+Bronze table of 3.16 M records in one object. Warm queries are the median of 5 calls in the same process, on AWS:
 
-### Choosing an engine
+| Query | Polars, `cache_mb=1024` | Polars, no cache | DuckDB, no cache | DuckDB, `cache_mb=1024` |
+|---|---|---|---|---|
+| Aggregate | **22 ms** | 81 ms | 100 ms | 107 ms |
+| Keyset page of 1,000 | **37 ms** | 1,402 ms | 185 ms | 183 ms |
+| Export 3.1 M rows to Arrow | **67 ms** | 1,487 ms | 955 ms | 664 ms |
+| First query in a new process | 2.4–2.6 s | 0.9–1.3 s | 0.8–1.9 s | 2.5–3.3 s |
+| Peak memory | 1.9–2.1 GB | 0.4–0.8 GB | 0.3–0.7 GB | 1.5–1.9 GB |
 
-- **Polars** (default) gives the fastest repeated reads. Use it for long-running services and batch jobs.
-- **DuckDB** uses about half the memory and starts fastest. Use it for short-lived functions, memory-bound containers, or when you want SQL.
-- With `cache_mb`, Polars is the fastest on Bronze (5–27 ms on S3). On Iceberg both engines take 67–147 ms. Athena takes 0.9–2.1 s on the same data.
+What this means:
+- **Services that read the same tenants repeatedly** (APIs, dashboards): Polars with `cache_mb` answers in tens of milliseconds. Objects written by the SDK never change, so later reads fetch only new objects.
+- **Without a cache** (short-lived jobs, low memory): DuckDB, whose Parquet reader skips data well when reading straight from S3.
+- **Iceberg tables** (few, large files) need no cache. Earlier runs measured 67–147 ms warm with either engine.
+- **A query service** (Athena) took 0.9–2.1 s per query on the same data, plus queueing.
+
+---
+
+## Configuration in brief
+
+| Setting | Default | When to change it |
+|---|---|---|
+| `ingest_file(block_mb=)` | 8 | Rarely. Larger blocks used more memory and were not faster. |
+| `chunk_rows` | 131,072 | Lower it for very wide records or tight memory limits. |
+| `row_group_mb` / `row_group_bytes` | 64 MB | 128 MB was 2–7% faster for about 170 MB more memory. |
+| `target_object_mb` | 256 MB | Lower it for faster visibility of continuous streams; keep 128–512 MB for analytics. |
+| `max_inflight_parts` | 4 | Raise it on high-bandwidth networks. |
+| `LakeReader(engine=)` | `"polars"` | `"duckdb"` for no cache, the lowest memory or SQL. |
+| `LakeReader(cache_mb=)` | 0 (off) | Size it to the tenants a service reads repeatedly. |
+| `batch_id=` / `stream_id=` | new ULID | Pass the earlier id to retry a call without duplicating rows. |
+
+---
+
+## Reproduce
+
+- `cargo run --release --example throughput`: one call, by input type and protection (`DL_BENCH_MB` sets the size).
+- `cargo run --release --example stream_throughput -- <file> <contracts dir> <contract key>`: streams without network. `DL_PII=aes|sha256` adds protection; `DL_ONESHOT=1` compares with one call.
+- `cargo bench`: Criterion micro-benchmarks.
+
+Releases are compared with the previous one by building both and running them alternately. A release must not be slower.
