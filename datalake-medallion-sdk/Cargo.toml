@@ -83,6 +83,7 @@ python = ["dep:pyo3", "dep:pyo3-async-runtimes", "arrow/pyarrow"]
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"
+arrow-csv = "60"
 proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
 

@@ -15,7 +15,13 @@ All notable changes to this project are documented here. The format follows
 - `RecordSource::JsonLines` (one record per line, a malformed line quarantined alone) and `RecordSource::ArrowText` (text columns parsed with the contract's types, as for CSV).
 - JSON Lines that fit the contract are parsed straight into typed Arrow columns and validated column by column; lines with `null`, and blocks that do not fit, keep the row path, with identical results.
 
+- `ingest(..., batch_id=)` (Python) and `IngestRequest::with_batch_id` (Rust): retrying a call with the same ULID rewrites the same keys, and partitions follow the id's date.
+- Uploads are retried inside the call: `ingest` retries its commit (4 attempts, exponential backoff with jitter) over the same keys instead of re-validating with a new batch id; stream parts and objects are retried the same way before the stream is aborted.
+- Parquet encoding writes the columns of each row group in parallel (the `parquet` crate's `ArrowColumnWriter` pattern), for single calls and streams.
+
 ### Fixed
+
+- `LakeReader(cache_mb=...)` keyed cached objects by path only; an object rewritten in place (a stream retried with the same id) could be served stale. Entries are now keyed by path, size and modification time.
 
 - Arrow input with timestamps in a named time zone (pyarrow's `timestamp[..., tz=UTC]`, inferred from CSV and Parquet) failed with "Invalid timezone"; dates and timestamps given for `string` fields are now stored as their date-time text, on the columnar path.
 

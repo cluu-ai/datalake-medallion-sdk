@@ -295,6 +295,7 @@ class BronzeIngestionClient:
         *,
         tenant: TenantProfile | str,
         contract: str,
+        batch_id: str | None = None,
     ) -> IngestReport:
         """Validate ``batch`` against ``contract`` and write it for ``tenant``.
 

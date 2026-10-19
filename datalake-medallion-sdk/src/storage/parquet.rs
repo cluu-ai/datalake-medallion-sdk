@@ -1,11 +1,19 @@
 //! Parquet encoding of Bronze batches.
 
+use std::io::Write;
+use std::sync::Arc;
+
 use bytes::Bytes;
-use parquet::arrow::arrow_writer::ArrowWriterOptions;
+use parquet::arrow::arrow_writer::{
+    compute_leaves, ArrowColumnChunk, ArrowRowGroupWriterFactory, ArrowWriterOptions,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
+use parquet::file::writer::SerializedFileWriter;
+use rayon::prelude::*;
 
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use crate::error::DatalakeError;
@@ -57,19 +65,129 @@ impl ParquetEncoder {
         let first = batches
             .first()
             .ok_or_else(|| DatalakeError::storage("parquet", "no batches to encode"))?;
-        let err =
-            |e: parquet::errors::ParquetError| DatalakeError::storage("parquet", e.to_string());
-        let mut buffer = Vec::new();
-        let options = ArrowWriterOptions::new()
-            .with_properties(self.properties.clone())
-            .with_skip_arrow_metadata(true);
-        let mut writer =
-            ArrowWriter::try_new_with_options(&mut buffer, first.schema(), options).map_err(err)?;
+        let mut writer = ParallelWriter::try_new(Vec::new(), first.schema(), &self.properties)?;
+        let max_rows = self.max_row_group_rows();
+        // Row groups of up to `max_rows` rows, as ArrowWriter would form them:
+        // small input batches are combined, large ones split.
+        let mut group: Vec<RecordBatch> = Vec::new();
+        let mut rows = 0;
         for batch in batches {
-            writer.write(batch).map_err(err)?;
+            let mut offset = 0;
+            while offset < batch.num_rows() {
+                let len = (max_rows - rows).min(batch.num_rows() - offset);
+                group.push(batch.slice(offset, len));
+                rows += len;
+                offset += len;
+                if rows == max_rows {
+                    writer.write_row_group(&combine(&group)?)?;
+                    group.clear();
+                    rows = 0;
+                }
+            }
         }
-        writer.close().map_err(err)?;
-        Ok(Bytes::from(buffer))
+        if rows > 0 {
+            writer.write_row_group(&combine(&group)?)?;
+        }
+        Ok(Bytes::from(writer.close()?))
+    }
+
+    /// Rows per row group (the writer properties' limit, 1 Mi by default).
+    pub(crate) fn max_row_group_rows(&self) -> usize {
+        self.properties
+            .max_row_group_row_count()
+            .unwrap_or(1024 * 1024)
+            .max(1)
+    }
+}
+
+/// One batch from consecutive slices (no copy for a single slice).
+fn combine(group: &[RecordBatch]) -> Result<RecordBatch, DatalakeError> {
+    match group {
+        [one] => Ok(one.clone()),
+        [first, ..] => arrow::compute::concat_batches(&first.schema(), group)
+            .map_err(|e| DatalakeError::storage("parquet", e.to_string())),
+        [] => Err(DatalakeError::storage("parquet", "empty row group")),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // used with map_err
+fn parquet_err(e: parquet::errors::ParquetError) -> DatalakeError {
+    DatalakeError::storage("parquet", e.to_string())
+}
+
+/// Parquet writer that encodes the columns of each row group in parallel
+/// (on the rayon pool), as documented for `ArrowColumnWriter` in the
+/// `parquet` crate. Output is a standard Parquet file, the same as
+/// `ArrowWriter` writes with the same properties.
+pub(crate) struct ParallelWriter<W: Write + Send> {
+    writer: SerializedFileWriter<W>,
+    factory: ArrowRowGroupWriterFactory,
+    schema: SchemaRef,
+    row_groups: usize,
+}
+
+impl<W: Write + Send> ParallelWriter<W> {
+    pub(crate) fn try_new(
+        sink: W,
+        schema: SchemaRef,
+        properties: &WriterProperties,
+    ) -> Result<Self, DatalakeError> {
+        let options = ArrowWriterOptions::new()
+            .with_properties(properties.clone())
+            .with_skip_arrow_metadata(true);
+        let (writer, factory) =
+            ArrowWriter::try_new_with_options(sink, Arc::clone(&schema), options)
+                .and_then(ArrowWriter::into_serialized_writer)
+                .map_err(parquet_err)?;
+        Ok(Self {
+            writer,
+            factory,
+            schema,
+            row_groups: 0,
+        })
+    }
+
+    /// Writes `batch` as one row group, its columns encoded concurrently.
+    pub(crate) fn write_row_group(&mut self, batch: &RecordBatch) -> Result<(), DatalakeError> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let writers = self
+            .factory
+            .create_column_writers(self.row_groups)
+            .map_err(parquet_err)?;
+        let mut leaves = Vec::with_capacity(writers.len());
+        for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
+            leaves.extend(compute_leaves(field, column).map_err(parquet_err)?);
+        }
+        let chunks: Vec<ArrowColumnChunk> = writers
+            .into_par_iter()
+            .zip(leaves.into_par_iter())
+            .map(|(mut writer, leaf)| {
+                writer.write(&leaf)?;
+                writer.close()
+            })
+            .collect::<Result<_, _>>()
+            .map_err(parquet_err)?;
+        let mut row_group = self.writer.next_row_group().map_err(parquet_err)?;
+        for chunk in chunks {
+            chunk
+                .append_to_row_group(&mut row_group)
+                .map_err(parquet_err)?;
+        }
+        row_group.close().map_err(parquet_err)?;
+        self.row_groups += 1;
+        Ok(())
+    }
+
+    /// Bytes written to the sink so far.
+    pub(crate) fn bytes_written(&self) -> usize {
+        self.writer.bytes_written()
+    }
+
+    /// Writes the footer and returns the sink.
+    pub(crate) fn close(self) -> Result<W, DatalakeError> {
+        self.writer.into_inner().map_err(parquet_err)
     }
 }
 

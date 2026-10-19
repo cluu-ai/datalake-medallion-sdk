@@ -32,9 +32,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use chrono::{DateTime, TimeZone, Utc};
-use parquet::arrow::arrow_writer::ArrowWriterOptions;
-use parquet::arrow::ArrowWriter;
+use chrono::{DateTime, Utc};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -43,7 +41,10 @@ use ulid::Ulid;
 use crate::contracts::Contract;
 use crate::dlq;
 use crate::error::DatalakeError;
-use crate::pipeline::{BronzePipeline, CallContext, ChunkOutput, RecordSource};
+use crate::pipeline::{
+    jittered, ulid_time, BronzePipeline, CallContext, ChunkOutput, RecordSource,
+};
+use crate::storage::parquet::ParallelWriter;
 use crate::storage::{ObjectStorage, NDJSON_CONTENT_TYPE, PARQUET_CONTENT_TYPE};
 use crate::tenant::{ObjectPath, TenantProfile};
 use crate::validation::hooks::RecordHook;
@@ -64,7 +65,9 @@ pub struct StreamOptions {
     pub target_object_bytes: usize,
     /// Size of each uploaded part (at least 5 MiB).
     pub part_bytes: usize,
-    /// Encoded size at which the current row group is written out.
+    /// Accepted rows held, as Arrow memory, before they are encoded as one
+    /// Parquet row group (columns in parallel). Row groups also stop at the
+    /// writer's row limit (1 Mi rows).
     pub row_group_bytes: usize,
     /// Arrow rows gathered before a chunk is validated; larger chunks
     /// amortize per-chunk work, smaller ones use less memory.
@@ -198,14 +201,13 @@ impl Write for Sink {
 struct OpenObject {
     index: usize,
     path: Arc<ObjectPath>,
-    writer: ArrowWriter<Sink>,
+    writer: ParallelWriter<Sink>,
     sink: Sink,
     parts_sent: i32,
-}
-
-#[allow(clippy::needless_pass_by_value)] // used with map_err
-fn parquet_err(e: parquet::errors::ParquetError) -> DatalakeError {
-    DatalakeError::storage("parquet", e.to_string())
+    /// Accepted rows not yet encoded: one row group's worth at most.
+    pending: Vec<RecordBatch>,
+    pending_rows: usize,
+    pending_bytes: usize,
 }
 
 /// An ingest of unbounded input; see the module documentation.
@@ -329,11 +331,23 @@ impl BronzePipeline {
     }
 }
 
-fn ulid_time(id: Ulid) -> DateTime<Utc> {
-    let ms = i64::try_from(id.timestamp_ms()).unwrap_or(0);
-    Utc.timestamp_millis_opt(ms)
-        .single()
-        .unwrap_or_else(Utc::now)
+impl OpenObject {
+    /// Encodes the pending rows as one row group.
+    fn flush_row_group(&mut self) -> Result<(), DatalakeError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let batches = std::mem::take(&mut self.pending);
+        self.pending_rows = 0;
+        self.pending_bytes = 0;
+        let batch = if batches.len() == 1 {
+            batches.into_iter().next().unwrap_or_else(|| unreachable!())
+        } else {
+            concat_batches(&batches[0].schema(), &batches)
+                .map_err(|e| DatalakeError::storage("parquet", e.to_string()))?
+        };
+        self.writer.write_row_group(&batch)
+    }
 }
 
 impl BronzeStream {
@@ -450,17 +464,20 @@ impl BronzeStream {
         if self.object.is_none() {
             self.object = Some(self.open_object(batch)?);
         }
-        let (part_bytes, row_group_bytes, target) = (
+        let (part_bytes, row_group_bytes, row_group_rows, target) = (
             self.options.part_bytes,
             self.options.row_group_bytes,
+            self.pipeline.encoder().max_row_group_rows(),
             self.options.target_object_bytes,
         );
         let mut ready = Vec::new();
         let mut full = false;
         if let Some(object) = self.object.as_mut() {
-            object.writer.write(batch).map_err(parquet_err)?;
-            if object.writer.in_progress_size() >= row_group_bytes {
-                object.writer.flush().map_err(parquet_err)?;
+            object.pending_rows += batch.num_rows();
+            object.pending_bytes += batch.get_array_memory_size();
+            object.pending.push(batch.clone());
+            if object.pending_rows >= row_group_rows || object.pending_bytes >= row_group_bytes {
+                object.flush_row_group()?;
             }
             // Equal parts, uploaded concurrently: a row group of several
             // parts goes out in parallel.
@@ -473,7 +490,7 @@ impl BronzeStream {
                     body: Bytes::from(object.sink.take_front(part_bytes)),
                 });
             }
-            full = object.writer.bytes_written() + object.writer.in_progress_size() >= target;
+            full = object.writer.bytes_written() >= target;
         }
         for job in ready {
             self.send(job)?;
@@ -492,32 +509,37 @@ impl BronzeStream {
             .tenant
             .data_path(self.contract.data_type(), &self.now, &file_id)?;
         let sink = Sink::default();
-        let options = ArrowWriterOptions::new()
-            .with_properties(self.pipeline.encoder().properties().clone())
-            .with_skip_arrow_metadata(true);
-        let writer = ArrowWriter::try_new_with_options(sink.clone(), batch.schema(), options)
-            .map_err(parquet_err)?;
+        let writer = ParallelWriter::try_new(
+            sink.clone(),
+            batch.schema(),
+            self.pipeline.encoder().properties(),
+        )?;
         Ok(OpenObject {
             index,
             path: Arc::new(path),
             writer,
             sink,
             parts_sent: 0,
+            pending: Vec::new(),
+            pending_rows: 0,
+            pending_bytes: 0,
         })
     }
 
     fn close_object(&mut self) -> Result<(), DatalakeError> {
-        let Some(object) = self.object.take() else {
+        let Some(mut object) = self.object.take() else {
             return Ok(());
         };
+        object.flush_row_group()?;
         let OpenObject {
             index,
             path,
             writer,
             sink,
             parts_sent,
+            ..
         } = object;
-        writer.close().map_err(parquet_err)?;
+        writer.close()?;
         let rest = Bytes::from(sink.take());
         self.data_uris.push(path.uri.clone());
         if parts_sent == 0 {
@@ -673,7 +695,7 @@ async fn upload(
                     content_type,
                 } => {
                     bytes += body.len() as u64;
-                    storage.put(&path, body, content_type).await?;
+                    retrying(|| storage.put(&path, body.clone(), content_type)).await?;
                 }
                 Job::Part {
                     object,
@@ -705,7 +727,9 @@ async fn upload(
                     let id = open.as_ref().map(|(_, u)| u.id.clone()).unwrap_or_default();
                     parts.spawn(async move {
                         let size = body.len() as u64;
-                        let etag = storage.upload_part(&path, &id, number, body).await?;
+                        let etag =
+                            retrying(|| storage.upload_part(&path, &id, number, body.clone()))
+                                .await?;
                         Ok((number, etag, size))
                     });
                 }
@@ -742,6 +766,29 @@ async fn upload(
         }
     }
     result.map(|()| bytes)
+}
+
+/// Attempts per request beyond the AWS SDK's own retries: parts and objects
+/// are rewritten whole, so repeating one is safe.
+const ATTEMPTS: u32 = 4;
+
+async fn retrying<T, F, Fut>(mut call: F) -> Result<T, DatalakeError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, DatalakeError>>,
+{
+    let mut delay = std::time::Duration::from_millis(250);
+    let mut attempt = 1;
+    loop {
+        match call().await {
+            Err(DatalakeError::Storage { .. }) if attempt < ATTEMPTS => {
+                tokio::time::sleep(jittered(delay)).await;
+                delay = delay.saturating_mul(2);
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
 }
 
 fn joined(

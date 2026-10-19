@@ -273,18 +273,22 @@ impl PyBronzeIngestionClient {
     /// object implementing the Arrow `PyCapsule` interface (`__arrow_c_stream__`
     /// or `__arrow_c_array__`), such as a `pyarrow` table or record batch or a
     /// Polars data frame.
-    #[pyo3(signature = (batch, *, tenant, contract))]
+    #[pyo3(signature = (batch, *, tenant, contract, batch_id = None))]
     fn ingest<'py>(
         &self,
         py: Python<'py>,
         batch: &Bound<'py, PyAny>,
         tenant: &Bound<'py, PyAny>,
         contract: &str,
+        batch_id: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let tenant = self.resolve(tenant)?;
         self.parts.registry.get(contract)?;
         let records = to_source(py, batch)?;
         let mut request = IngestRequest::new(tenant, contract, records);
+        if let Some(id) = batch_id {
+            request = request.with_batch_id(id);
+        }
         if let Some(hook) = self.hooks.get(contract) {
             request = request.with_hook(Arc::clone(hook));
         }
@@ -309,7 +313,9 @@ impl PyBronzeIngestionClient {
                 .map_err(|e| {
                     DatalakeError::storage("runtime", format!("validation task failed: {e}"))
                 })??;
-            let report = pipeline.commit(&prepared).await?;
+            // Uploads rewrite the same keys, so transient failures are
+            // retried here rather than by re-validating with a new batch id.
+            let report = pipeline.commit_with_retries(&prepared, 4).await?;
             Ok(PyIngestReport::from(report))
         })
     }

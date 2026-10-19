@@ -59,3 +59,4 @@ lcov.info
 
 # mdBook build output
 /book/
+/target-bench/

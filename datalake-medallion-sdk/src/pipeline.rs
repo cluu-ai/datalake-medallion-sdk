@@ -107,6 +107,10 @@ pub struct IngestRequest {
     pub records: RecordSource,
     /// Optional Level 4 hook.
     pub hook: Option<Arc<dyn RecordHook>>,
+    /// ULID naming the call's objects; generated when `None`. Retrying a call
+    /// with the same id rewrites the same keys, so an upload that reached
+    /// storage but whose response was lost does not duplicate rows.
+    pub batch_id: Option<String>,
 }
 
 impl IngestRequest {
@@ -122,7 +126,15 @@ impl IngestRequest {
             contract: contract.into(),
             records,
             hook: None,
+            batch_id: None,
         }
+    }
+
+    /// Fixes the batch id (a ULID), for retries over the same keys.
+    #[must_use]
+    pub fn with_batch_id(mut self, batch_id: impl Into<String>) -> Self {
+        self.batch_id = Some(batch_id.into());
+        self
     }
 
     /// Attaches a Level 4 hook.
@@ -334,10 +346,21 @@ impl BronzePipeline {
             None => None,
             Some(p) => Some(p.bind(request.tenant.tenant_id().as_str())?.unwrap_or(p)),
         };
+        // A given id also fixes the partition date (the ULID's time), so a
+        // retry on another day writes the same keys.
+        let (batch_id, now) = match &request.batch_id {
+            None => (Ulid::generate().to_string(), Utc::now()),
+            Some(text) => {
+                let id = Ulid::from_string(text).map_err(|_| {
+                    DatalakeError::config(format!("batch_id {text:?} is not a ULID"))
+                })?;
+                (id.to_string(), ulid_time(id))
+            }
+        };
         let call = CallContext {
             tenant: &request.tenant,
-            batch_id: Ulid::generate().to_string(),
-            now: Utc::now(),
+            batch_id,
+            now,
             protector: bound.as_deref(),
             index_offset: 0,
         };
@@ -418,6 +441,32 @@ impl BronzePipeline {
         }
 
         self.collect(contract, call, received, slots, columnar)
+    }
+
+    /// [`commit`](Self::commit) with up to `attempts` tries and exponential
+    /// backoff with jitter on storage errors. Safe because a commit rewrites
+    /// the same keys with the same bytes.
+    ///
+    /// # Errors
+    ///
+    /// The last storage error.
+    pub async fn commit_with_retries(
+        &self,
+        prepared: &PreparedBatch,
+        attempts: u32,
+    ) -> Result<IngestReport, DatalakeError> {
+        let attempts = attempts.max(1);
+        let mut delay = std::time::Duration::from_millis(200);
+        for attempt in 1..=attempts {
+            match self.commit(prepared).await {
+                Err(DatalakeError::Storage { .. }) if attempt < attempts => {
+                    tokio::time::sleep(jittered(delay)).await;
+                    delay = delay.saturating_mul(2);
+                }
+                other => return other,
+            }
+        }
+        self.commit(prepared).await
     }
 
     /// Uploads a prepared batch: dead-letter objects first, then data.
@@ -532,7 +581,7 @@ impl BronzePipeline {
                 buffer.extend_from_slice(&text.as_bytes()[lines[i].clone()]);
                 buffer.push(b'\n');
             }
-            parse_json_lines(&buffer, &schema).filter(|b| b.num_rows() == typed.len())
+            parse_json_lines(&buffer, typed.len(), &schema).filter(|b| b.num_rows() == typed.len())
         };
         let Some(batch) = parsed else {
             let all: Vec<usize> = (0..lines.len()).collect();
@@ -987,10 +1036,14 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Parses newline-delimited JSON objects into one batch of `schema`; `None`
 /// when a value does not fit its declared type or a field is undeclared.
-fn parse_json_lines(buffer: &[u8], schema: &Arc<arrow::datatypes::Schema>) -> Option<RecordBatch> {
+fn parse_json_lines(
+    buffer: &[u8],
+    rows: usize,
+    schema: &Arc<arrow::datatypes::Schema>,
+) -> Option<RecordBatch> {
     let mut decoder = arrow::json::ReaderBuilder::new(Arc::clone(schema))
         .with_strict_mode(true)
-        .with_batch_size(buffer.len().max(1))
+        .with_batch_size(rows.max(1))
         .build_decoder()
         .ok()?;
     let mut offset = 0;
@@ -1037,6 +1090,22 @@ fn decode_rows(source: RecordSource) -> Result<Vec<Raw>, DatalakeError> {
                 .collect())
         }
     }
+}
+
+/// Time of a ULID (its first 48 bits).
+pub(crate) fn ulid_time(id: Ulid) -> DateTime<Utc> {
+    use chrono::TimeZone;
+    let ms = i64::try_from(id.timestamp_ms()).unwrap_or(0);
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(Utc::now)
+}
+
+/// `delay` scaled by a random factor in [0.5, 1.5).
+pub(crate) fn jittered(delay: std::time::Duration) -> std::time::Duration {
+    let mut byte = [0u8; 1];
+    let _ = getrandom::fill(&mut byte);
+    delay.mul_f64(0.5 + f64::from(byte[0]) / 256.0)
 }
 
 /// Serialized length of a value without allocating the text.

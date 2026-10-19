@@ -1416,6 +1416,7 @@ version = "0.2.0-rc.6"
 dependencies = [
  "aes-gcm",
  "arrow",
+ "arrow-csv",
  "async-trait",
  "aws-config",
  "aws-sdk-kms",

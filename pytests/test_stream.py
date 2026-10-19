@@ -190,3 +190,47 @@ async def test_file_on_s3(make_client: MakeClient, store: Bucket, tmp_path: Path
     )
     assert report.records_ok == 2_701
     assert all(uri.startswith(f"s3://{store.name}/bronze/") for uri in report.data_uris)
+
+
+async def test_reader_cache_sees_a_retried_stream(
+    make_client: MakeClient, s3_endpoint: str, bucket: str
+) -> None:
+    from datalake_medallion_sdk import TenantProfile
+
+    reader = LakeReader(
+        TenantRegistry([TenantProfile.for_bucket("acme-001", bucket)]),
+        aws_region="us-east-1",
+        aws_endpoint_url=s3_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        max_staleness=0,
+        cache_mb=64,
+    )
+    client = make_client()
+    first = await client.ingest_stream(table(0, 100), tenant="acme-001", contract=CONTRACT)
+    assert reader.read("acme-001", EVENTS).num_rows == 90
+    # Same stream id, different content: the object is rewritten in place.
+    await client.ingest_stream(
+        table(1_000, 300), tenant="acme-001", contract=CONTRACT, stream_id=first.stream_id
+    )
+    assert reader.read("acme-001", EVENTS).num_rows == 270
+    reader.close()
+
+
+async def test_ingest_with_a_batch_id_rewrites_the_same_keys(
+    make_client: MakeClient, store: Bucket
+) -> None:
+    client = make_client()
+    first = await client.ingest(rows(0, 50), tenant="acme-001", contract=CONTRACT)
+    keys = store.keys()
+    again = await client.ingest(
+        rows(0, 50), tenant="acme-001", contract=CONTRACT, batch_id=first.batch_id
+    )
+    assert (again.batch_id, again.data_uri, again.dlq_uris) == (
+        first.batch_id,
+        first.data_uri,
+        first.dlq_uris,
+    )
+    assert store.keys() == keys
+    with pytest.raises(ConfigurationError, match="ULID"):
+        await client.ingest(rows(0, 1), tenant="acme-001", contract=CONTRACT, batch_id="nope")

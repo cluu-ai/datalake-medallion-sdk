@@ -12,17 +12,21 @@
 - No network I/O is included; upload time depends on the network.
 - Peak heap is the memory allocated on top of the input.
 
-| Input | PII protection | Time | Throughput | Records/s | Peak heap | Parquet |
+Mean of 3 alternating rounds against the previous release on the same machine (2026-10-18; laptop runs vary by about 10% with heat).
+
+| Input | PII protection | 0.2.0rc5 | 0.2.0rc6 | Throughput | Records/s | Peak heap |
 |---|---|---|---|---|---|---|
-| Arrow | none (default) | 0.64 s | 326 MiB/s | 1.35 M | 173 MiB | 18 MiB |
-| Arrow | `sha256` | 0.89 s | 236 MiB/s | 0.98 M | 254 MiB | 71 MiB |
-| Arrow | `aes-256-gcm` | 1.03 s | 204 MiB/s | 0.85 M | 242 MiB | 59 MiB |
-| JSON text | none (default) | 2.76 s | 76 MiB/s | 0.32 M | 784 MiB | 18 MiB |
-| JSON text | `sha256` | 3.36 s | 62 MiB/s | 0.26 M | 895 MiB | 71 MiB |
-| JSON text | `aes-256-gcm` | 3.38 s | 62 MiB/s | 0.26 M | 940 MiB | 59 MiB |
+| Arrow | none (default) | 0.75 s | **0.42 s** | 500 MiB/s | 2.1 M | 200 MiB |
+| Arrow | `sha256` | 0.99 s | **0.61 s** | 343 MiB/s | 1.4 M | 242 MiB |
+| Arrow | `aes-256-gcm` | 1.16 s | **0.78 s** | 268 MiB/s | 1.1 M | 250 MiB |
+| JSON text | none (default) | 3.26 s | **2.71 s** | 77 MiB/s | 0.32 M | 649 MiB |
+| JSON text | `sha256` | 3.96 s | **3.32 s** | 63 MiB/s | 0.26 M | 712 MiB |
+| JSON text | `aes-256-gcm` | 4.03 s | **3.51 s** | 60 MiB/s | 0.25 M | 768 MiB |
+
+0.2.0rc6 encodes the columns of each Parquet row group in parallel. This uses the `ArrowColumnWriter` pattern documented in the `parquet` crate. Encoding alone went from 1.78 s to 0.93 s for 3.16 M rows, with identical output. Parquet sizes are unchanged: 18 MiB without protection, 71 MiB with `sha256` and 59 MiB with `aes-256-gcm`.
 
 Findings:
-- **Arrow input is about 4x faster than JSON.** It also needs less extra memory than its own size: accepted columns are reused without copying, and only rows that may be invalid are converted.
+- **Arrow input is about 6x faster than JSON.** It also needs less extra memory than its own size: accepted columns are reused without copying, and only rows that may be invalid are converted.
 - **Protection costs 40–60% more time on Arrow.**
 - **Protected values compress far less** than the originals.
 
@@ -53,6 +57,21 @@ Findings:
   - 8 MB blocks were faster and lighter than 32 MB (CSV peak 765 vs 1,226 MB).
   - 32 MB row groups save about 100 MB more but cost about 20% throughput.
   - On real S3, raise `max_inflight_parts` when the network allows; uploads then overlap more.
+
+### Without the network
+
+The same streams written to a store that discards the bytes, with `examples/stream_throughput.rs`:
+
+| Input | One call | Stream |
+|---|---|---|
+| CSV, 500 MB | 6.46 s, 2,172 MiB heap | **5.30 s, 307 MiB** |
+| JSON Lines, 500 MB | 6.93 s, 2,563 MiB | **5.65 s, 268 MiB** |
+| Parquet, 264 MB | 6.11 s, 1,896 MiB | **4.60 s, 364 MiB** |
+
+How the time splits:
+- The test contract checks a pattern, two formats, an enum and ranges on every record. These per-value rules cost 5–15%.
+- The rest is reading, typed validation and Parquet encoding.
+- 128 MB row groups (`row_group_bytes`) are 2–7% faster than the 64 MB default, for about 170 MiB more memory.
 
 ## Reading (`LakeReader`)
 

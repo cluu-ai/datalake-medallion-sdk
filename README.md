@@ -332,7 +332,7 @@ On AWS Lambda against S3, warm reads of one tenant out of 8 (3.16 M rows) take 5
 <quarantine location>/tenant_id=<tenant>/data_type=<datatype>/error_code=<code>/year=YYYY/month=MM/day=DD/<batch_id>.jsonl
 ```
 
-With `partition_order="data_type_first"` the `data_type=` partition comes before `tenant_id=`. Each ingest call writes at most one Parquet object plus one quarantine object per error code. Quarantine objects are written first, so retrying a failed call never duplicates Bronze rows.
+With `partition_order="data_type_first"` the `data_type=` partition comes before `tenant_id=`. Each `ingest` call writes at most one Parquet object plus one quarantine object per error code (streams write one object per `target_object_mb`). Quarantine objects are written first, so retrying a failed call never duplicates Bronze rows.
 
 Lineage columns (prefix `_dl_`, configurable with `envelope_prefix`):
 
@@ -373,7 +373,7 @@ client = BronzeIngestionClient(contracts, tenants=tenants, hooks=hooks.as_mappin
 - **S3-compatible stores** (MinIO, LocalStack, …): `aws_endpoint_url=` (path-style addressing is enabled automatically).
 - **Large inputs**: use `ingest_file` / `ingest_stream` (above) rather than one `ingest` call; S3 lifecycle rule `AbortIncompleteMultipartUpload` recommended.
 - **Client options**: `max_record_bytes` (default 10 MiB), `max_future_skew_seconds` (default 3600, `None` disables), `on_invalid` (`"quarantine"` or `"raise"`), `envelope_prefix` (default `"_dl_"`).
-- **Retries**: `@datalake_retry()` retries `StorageError` only, with exponential backoff and jitter.
+- **Retries and idempotency**: uploads are retried inside the call (4 attempts, exponential backoff with jitter) over the same object keys, so a transient S3 error never duplicates rows. To retry a whole call, for example after a crash, pass the earlier `batch_id=` (or `stream_id=` for streams): the same keys are rewritten instead of adding rows. `@datalake_retry()` retries `StorageError` only.
 - **Metrics**: `@emit_metrics(sink)` records duration, failures and record counts to logging, CloudWatch Embedded Metric Format or any `MetricsSink`.
 - **Concurrency**: one client and one reader per process serve every tenant and bucket; connections are created once and reused. Buckets must be reachable in the client's region.
 
@@ -402,7 +402,7 @@ See the [changelog](CHANGELOG.md) for the full list.
 
 ## Performance
 
-A 200 MiB batch (869 k records) is validated, protected and encoded in 0.64 s from Arrow (326 MiB/s, 173 MiB peak heap) and 2.76 s from JSON text, without PII protection; protection adds 40–60%. Streaming a 2 GB JSON Lines file peaks at 436 MB. Benchmarks, methodology and reader numbers are in [docs/performance.md](docs/performance.md).
+A 200 MiB batch (869 k records) is validated and encoded in 0.42 s from Arrow (500 MiB/s, 200 MiB peak heap) and 2.71 s from JSON text, without PII protection; protection adds 30–85%. Streaming a 2 GB JSON Lines file peaks at 436 MB. Benchmarks, methodology and reader numbers are in [docs/performance.md](docs/performance.md).
 
 ## Rust crate
 
@@ -410,7 +410,7 @@ The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, `TenantProfi
 
 ```toml
 [dependencies]
-datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc4", default-features = false, features = ["aws-kms"] }
+datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc6", default-features = false, features = ["aws-kms"] }
 ```
 
 The library is imported as `_core` (`use _core::pipeline::BronzePipeline;`). `default-features = false` builds without Python, for example for an AWS Lambda; the `aws-kms` feature adds the KMS data key provider. The Rust API may change before 1.0.

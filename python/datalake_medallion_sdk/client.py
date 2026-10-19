@@ -113,7 +113,12 @@ class BronzeIngestionClient:
         }
 
     async def ingest(
-        self, batch: Any, *, tenant: TenantProfile | str, contract: str
+        self,
+        batch: Any,
+        *,
+        tenant: TenantProfile | str,
+        contract: str,
+        batch_id: str | None = None,
     ) -> IngestReport:
         """Validate ``batch`` against ``contract`` and write it for ``tenant``.
 
@@ -122,6 +127,12 @@ class BronzeIngestionClient:
         ``str``/``bytes``, or any object implementing the Arrow PyCapsule
         interface (pyarrow, Polars, ...); Arrow is the fastest path.
         Validation, protection and encoding run outside the GIL.
+
+        Uploads are retried (4 attempts, exponential backoff with jitter)
+        over the same object keys, so a transient S3 error never duplicates
+        rows. ``batch_id`` (a ULID, e.g. ``report.batch_id`` of a failed or
+        uncertain earlier call) names the objects: calling again with the
+        same id rewrites the same keys instead of adding rows.
 
         Raises:
             TenantViolationError: invalid or unknown tenant, or a resolver
@@ -133,7 +144,9 @@ class BronzeIngestionClient:
             ProtectionError: the tenant's PII protector failed; nothing written.
             StorageError: encoding or upload failed; safe to retry.
         """
-        return await self._native.ingest(batch, tenant=self._resolve(tenant), contract=contract)
+        return await self._native.ingest(
+            batch, tenant=self._resolve(tenant), contract=contract, batch_id=batch_id
+        )
 
     async def ingest_stream(
         self,
