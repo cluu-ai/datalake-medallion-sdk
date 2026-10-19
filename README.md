@@ -495,6 +495,8 @@ writer.replace("acme-001", logins, day_rows, where=[("day", "==", "2026-10-19")]
 With [commit manifests](#incremental-reads-changes-since-a-watermark), a job processes each new Bronze batch exactly once, even if it crashes before saving its watermark:
 
 ```python
+from datalake_medallion_sdk import ChangeSet
+
 changes = reader.changes("acme-001", TableRef.bronze("login_event"), since=watermark)
 for entry in changes.entries:
     rows = reader.read_changes(
