@@ -319,14 +319,18 @@ class BronzeIngestionClient:
         """
     async def ingest_otel_logs(
         self,
-        body: bytes,
+        bodies: list[bytes],
         *,
         contract: str,
         tenant_attribute: str,
         resolve: Callable[[str | None], TenantProfile | str],
         batch_id: str | None = None,
-    ) -> list[tuple[str | None, IngestReport]]:
-        """Flatten an OTLP/JSON logs request and ingest each tenant's records."""
+    ) -> list[tuple[str | None, list[int], IngestReport | None, DatalakeError | None]]:
+        """Flatten OTLP/JSON logs requests and ingest each tenant's records.
+
+        One ``(tenant, request_indices, report, error)`` per tenant, then one
+        per unreadable request.
+        """
     async def ingest_stream(
         self,
         source: Any,

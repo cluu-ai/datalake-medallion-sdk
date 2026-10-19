@@ -11,13 +11,18 @@
 //! and in the original `snake_case` as the specification allows. Trace and
 //! span ids are hex text; 64-bit integers may be numbers or strings.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Builder, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use chrono::{DateTime, SecondsFormat};
+use chrono::{DateTime, Datelike, Timelike};
+use serde::de::{self, Deserializer, Visitor};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::error::DatalakeError;
@@ -59,6 +64,19 @@ pub struct TenantLogs {
     pub tenant: Option<String>,
     /// One row per log record, columns as in [`logs_contract`].
     pub batch: RecordBatch,
+    /// Indices of the requests that contributed rows (always `[0]` for
+    /// [`flatten_logs_json`]).
+    pub sources: Vec<usize>,
+}
+
+/// Outcome of [`flatten_logs_json_many`].
+#[derive(Debug)]
+pub struct FlattenedRequests {
+    /// Rows by tenant, merged across requests.
+    pub tenants: Vec<TenantLogs>,
+    /// Requests that could not be read, with their index and error; the
+    /// other requests are flattened anyway.
+    pub malformed: Vec<(usize, DatalakeError)>,
 }
 
 /// JSON Schema contract for flattened `OpenTelemetry` logs: event time typed as a
@@ -141,99 +159,290 @@ impl Rows {
     }
 }
 
-/// One record's values, in [`COLUMNS`] order.
-#[derive(Default)]
-struct Record {
-    text: Vec<Option<String>>,
-    ints: Vec<Option<i64>>,
+// Positions of the text and integer builders, in [`COLUMNS`] order.
+const T_TIME: usize = 0;
+const T_OBSERVED: usize = 1;
+const T_SEVERITY: usize = 2;
+const T_BODY: usize = 3;
+const T_ATTRIBUTES: usize = 4;
+const T_TRACE: usize = 5;
+const T_SPAN: usize = 6;
+const T_EVENT: usize = 7;
+const T_SERVICE: usize = 8;
+const T_SCOPE_NAME: usize = 9;
+const T_SCOPE_VERSION: usize = 10;
+const T_RESOURCE: usize = 11;
+const I_SEVERITY: usize = 0;
+const I_FLAGS: usize = 1;
+
+/// A 64-bit integer written as a JSON number or a string, as OTLP/JSON
+/// allows; anything else reads as absent.
+#[derive(Debug, Clone, Copy)]
+struct Int(Option<i64>);
+
+impl<'de> Deserialize<'de> for Int {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct IntVisitor;
+        impl Visitor<'_> for IntVisitor {
+            type Value = Int;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an integer, or a string of digits")
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Int, E> {
+                Ok(Int(Some(v)))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Int, E> {
+                Ok(Int(i64::try_from(v).ok()))
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Int, E> {
+                Ok(Int(None))
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Int, E> {
+                Ok(Int(None))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Int, E> {
+                Ok(Int(v.parse().ok()))
+            }
+        }
+        d.deserialize_any(IntVisitor)
+    }
 }
 
-/// `obj[camel]`, or `obj[snake]` as the specification allows.
-fn get<'a>(obj: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {
-    obj.get(camel).or_else(|| obj.get(snake))
-}
+/// Unsigned nanoseconds since the epoch, as a number or a string.
+#[derive(Debug, Clone, Copy)]
+struct Nanos(Option<u64>);
 
-fn array<'a>(obj: &'a Value, camel: &str, snake: &str) -> &'a [Value] {
-    get(obj, camel, snake)
-        .and_then(Value::as_array)
-        .map_or(&[], Vec::as_slice)
-}
-
-/// A 64-bit integer written as a number or as a string.
-fn int(v: Option<&Value>) -> Option<i64> {
-    match v? {
-        Value::Number(n) => n
-            .as_i64()
-            .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok())),
-        Value::String(s) => s.parse().ok(),
-        _ => None,
+impl<'de> Deserialize<'de> for Nanos {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Int::deserialize(d).map(|Int(v)| Nanos(v.and_then(|n| u64::try_from(n).ok())))
     }
 }
 
-/// Nanoseconds since the epoch as RFC 3339 text with microseconds; `None`
-/// for zero (unset) or out of range.
-fn time(v: Option<&Value>) -> Option<String> {
-    let nanos = match v? {
-        Value::Number(n) => n.as_u64()?,
-        Value::String(s) => s.parse().ok()?,
-        _ => return None,
-    };
-    if nanos == 0 {
-        return None;
-    }
-    let secs = i64::try_from(nanos / 1_000_000_000).ok()?;
-    let sub = u32::try_from(nanos % 1_000_000_000).ok()?;
-    DateTime::from_timestamp(secs, sub).map(|t| t.to_rfc3339_opts(SecondsFormat::Micros, true))
+#[derive(Deserialize, Default)]
+struct Request<'a> {
+    #[serde(borrow, default, rename = "resourceLogs", alias = "resource_logs")]
+    resource_logs: Vec<ResourceLogs<'a>>,
 }
 
-/// An OTLP `AnyValue` as plain JSON.
-fn any_value(v: &Value) -> Value {
-    if let Some(s) = get(v, "stringValue", "string_value") {
-        return s.clone();
-    }
-    if let Some(b) = get(v, "boolValue", "bool_value") {
-        return b.clone();
-    }
-    if let Some(i) = get(v, "intValue", "int_value") {
-        return int(Some(i)).map_or(Value::Null, Value::from);
-    }
-    if let Some(d) = get(v, "doubleValue", "double_value") {
-        return d.clone();
-    }
-    if let Some(a) = get(v, "arrayValue", "array_value") {
-        return Value::Array(array(a, "values", "values").iter().map(any_value).collect());
-    }
-    if let Some(kv) = get(v, "kvlistValue", "kvlist_value") {
-        return Value::Object(key_values(array(kv, "values", "values")));
-    }
-    // Bytes stay as their base64 text.
-    get(v, "bytesValue", "bytes_value")
-        .cloned()
-        .unwrap_or(Value::Null)
+#[derive(Deserialize, Default)]
+struct ResourceLogs<'a> {
+    #[serde(borrow, default)]
+    resource: Option<Attributes<'a>>,
+    #[serde(borrow, default, rename = "scopeLogs", alias = "scope_logs")]
+    scope_logs: Vec<ScopeLogs<'a>>,
 }
 
-fn key_values(items: &[Value]) -> Map<String, Value> {
+#[derive(Deserialize, Default)]
+struct Attributes<'a> {
+    #[serde(borrow, default)]
+    attributes: Vec<KeyValue<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+struct ScopeLogs<'a> {
+    #[serde(borrow, default)]
+    scope: Option<Scope<'a>>,
+    #[serde(borrow, default, rename = "logRecords", alias = "log_records")]
+    log_records: Vec<LogRecord<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+struct Scope<'a> {
+    #[serde(borrow, default)]
+    name: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    version: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize, Default)]
+struct LogRecord<'a> {
+    #[serde(default, rename = "timeUnixNano", alias = "time_unix_nano")]
+    time: Option<Nanos>,
+    #[serde(
+        default,
+        rename = "observedTimeUnixNano",
+        alias = "observed_time_unix_nano"
+    )]
+    observed: Option<Nanos>,
+    #[serde(default, rename = "severityNumber", alias = "severity_number")]
+    severity_number: Option<Int>,
+    #[serde(borrow, default, rename = "severityText", alias = "severity_text")]
+    severity_text: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    body: Option<AnyValue<'a>>,
+    #[serde(borrow, default)]
+    attributes: Vec<KeyValue<'a>>,
+    #[serde(borrow, default, rename = "traceId", alias = "trace_id")]
+    trace_id: Option<Cow<'a, str>>,
+    #[serde(borrow, default, rename = "spanId", alias = "span_id")]
+    span_id: Option<Cow<'a, str>>,
+    #[serde(default)]
+    flags: Option<Int>,
+    #[serde(borrow, default, rename = "eventName", alias = "event_name")]
+    event_name: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct KeyValue<'a> {
+    #[serde(borrow)]
+    key: Cow<'a, str>,
+    #[serde(borrow, default)]
+    value: Option<AnyValue<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+struct AnyValue<'a> {
+    #[serde(borrow, default, rename = "stringValue", alias = "string_value")]
+    string: Option<Cow<'a, str>>,
+    #[serde(default, rename = "boolValue", alias = "bool_value")]
+    boolean: Option<bool>,
+    #[serde(default, rename = "intValue", alias = "int_value")]
+    int: Option<Int>,
+    #[serde(default, rename = "doubleValue", alias = "double_value")]
+    double: Option<f64>,
+    #[serde(borrow, default, rename = "arrayValue", alias = "array_value")]
+    array: Option<Values<'a, AnyValue<'a>>>,
+    #[serde(borrow, default, rename = "kvlistValue", alias = "kvlist_value")]
+    kvlist: Option<Values<'a, KeyValue<'a>>>,
+    #[serde(borrow, default, rename = "bytesValue", alias = "bytes_value")]
+    bytes: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct Values<'a, T> {
+    #[serde(default = "Vec::new")]
+    values: Vec<T>,
+    #[serde(skip)]
+    _borrow: std::marker::PhantomData<&'a ()>,
+}
+
+/// JSON text of a string, escaped. Writing to a `Vec` cannot fail.
+fn push_json_str(out: &mut Vec<u8>, s: &str) {
+    let _ = serde_json::to_writer(&mut *out, s);
+}
+
+/// An OTLP `AnyValue` as plain JSON (bytes stay base64 text).
+fn push_any(out: &mut Vec<u8>, v: &AnyValue<'_>) {
+    if let Some(s) = &v.string {
+        push_json_str(out, s);
+    } else if let Some(b) = v.boolean {
+        out.extend_from_slice(if b { b"true" } else { b"false" });
+    } else if let Some(Int(i)) = v.int {
+        match i {
+            Some(i) => {
+                let _ = write!(out, "{i}");
+            }
+            None => out.extend_from_slice(b"null"),
+        }
+    } else if let Some(d) = v.double {
+        let _ = serde_json::to_writer(&mut *out, &d);
+    } else if let Some(a) = &v.array {
+        out.push(b'[');
+        for (n, item) in a.values.iter().enumerate() {
+            if n > 0 {
+                out.push(b',');
+            }
+            push_any(out, item);
+        }
+        out.push(b']');
+    } else if let Some(kv) = &v.kvlist {
+        push_key_values(out, &kv.values);
+    } else if let Some(b) = &v.bytes {
+        push_json_str(out, b);
+    } else {
+        out.extend_from_slice(b"null");
+    }
+}
+
+fn push_key_values(out: &mut Vec<u8>, items: &[KeyValue<'_>]) {
+    out.push(b'{');
+    for (n, kv) in items.iter().enumerate() {
+        if n > 0 {
+            out.push(b',');
+        }
+        push_json_str(out, &kv.key);
+        out.push(b':');
+        match &kv.value {
+            Some(v) => push_any(out, v),
+            None => out.extend_from_slice(b"null"),
+        }
+    }
+    out.push(b'}');
+}
+
+/// Attributes as JSON text in `out` (cleared first); `false` when empty.
+fn attributes_json(out: &mut Vec<u8>, items: &[KeyValue<'_>]) -> bool {
+    out.clear();
+    if items.is_empty() {
+        return false;
+    }
+    push_key_values(out, items);
+    true
+}
+
+/// The string value of attribute `key`.
+fn string_attribute<'a>(items: &'a [KeyValue<'_>], key: &str) -> Option<&'a str> {
     items
         .iter()
-        .filter_map(|kv| {
-            let key = kv.get("key")?.as_str()?;
-            Some((
-                key.to_owned(),
-                kv.get("value").map_or(Value::Null, any_value),
-            ))
-        })
-        .collect()
+        .find(|kv| kv.key == key)
+        .and_then(|kv| kv.value.as_ref()?.string.as_deref())
 }
 
-/// A map as JSON text; `None` when empty.
-fn json_text(map: &Map<String, Value>) -> Option<String> {
-    (!map.is_empty()).then(|| Value::Object(map.clone()).to_string())
+/// Nanoseconds as RFC 3339 text with microseconds in `out` (cleared first);
+/// `false` for zero (unset) or out of range.
+fn time_text(out: &mut String, nanos: Option<Nanos>) -> bool {
+    out.clear();
+    let Some(Nanos(Some(nanos))) = nanos else {
+        return false;
+    };
+    if nanos == 0 {
+        return false;
+    }
+    let (Ok(secs), Ok(sub)) = (
+        i64::try_from(nanos / 1_000_000_000),
+        u32::try_from(nanos % 1_000_000_000),
+    ) else {
+        return false;
+    };
+    let Some(t) = DateTime::from_timestamp(secs, sub) else {
+        return false;
+    };
+    // Written field by field: much cheaper than interpreting a format
+    // string twice per record.
+    let _ = write!(
+        out,
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+        t.year(),
+        t.month(),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.timestamp_subsec_micros()
+    );
+    true
 }
 
-fn text(v: Option<&Value>) -> Option<String> {
-    v.and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+fn non_empty<'a>(s: Option<&'a Cow<'_, str>>) -> Option<&'a str> {
+    s.map(AsRef::as_ref).filter(|s| !s.is_empty())
+}
+
+/// Lowercase hex id (OTLP/JSON ids are hex; some exporters use uppercase).
+fn hex_id<'a>(s: Option<&'a Cow<'_, str>>, buf: &'a mut String) -> Option<&'a str> {
+    let s = non_empty(s)?;
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        buf.clear();
+        buf.extend(s.chars().map(|c| c.to_ascii_lowercase()));
+        Some(buf.as_str())
+    } else {
+        Some(s)
+    }
+}
+
+fn as_text(bytes: &[u8]) -> &str {
+    // The JSON writers above only produce UTF-8.
+    std::str::from_utf8(bytes).unwrap_or_default()
 }
 
 /// Flattens an OTLP/JSON logs export request into one row per log record,
@@ -248,91 +457,152 @@ pub fn flatten_logs_json(
     body: &[u8],
     tenant_attribute: &str,
 ) -> Result<Vec<TenantLogs>, DatalakeError> {
-    let request: Value =
-        serde_json::from_slice(body).map_err(|e| DatalakeError::MalformedPayload {
-            reason: format!("OTLP logs request is not valid JSON: {e}"),
-        })?;
-    if !request.is_object() {
+    if body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
         return Err(DatalakeError::MalformedPayload {
             reason: "OTLP logs request must be a JSON object".into(),
         });
     }
-    let mut groups: BTreeMap<Option<String>, Rows> = BTreeMap::new();
-    for resource_logs in array(&request, "resourceLogs", "resource_logs") {
-        let resource = key_values(array(
-            resource_logs.get("resource").unwrap_or(&Value::Null),
-            "attributes",
-            "attributes",
-        ));
-        let resource_tenant = resource
-            .get(tenant_attribute)
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let service = resource
-            .get("service.name")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let resource_json = json_text(&resource);
-        for scope_logs in array(resource_logs, "scopeLogs", "scope_logs") {
-            let scope = scope_logs.get("scope").unwrap_or(&Value::Null);
-            let (scope_name, scope_version) = (text(scope.get("name")), text(scope.get("version")));
-            for log in array(scope_logs, "logRecords", "log_records") {
-                let attributes = key_values(array(log, "attributes", "attributes"));
-                let tenant = resource_tenant.clone().or_else(|| {
-                    attributes
-                        .get(tenant_attribute)
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
-                let observed = time(get(log, "observedTimeUnixNano", "observed_time_unix_nano"));
-                let body = get(log, "body", "body")
-                    .map(any_value)
-                    .and_then(|b| match b {
-                        Value::Null => None,
-                        Value::String(s) => Some(s),
-                        other => Some(other.to_string()),
-                    });
-                let record = Record {
-                    text: vec![
-                        // The record's time, or when it was observed if unset.
-                        time(get(log, "timeUnixNano", "time_unix_nano"))
-                            .or_else(|| observed.clone()),
-                        observed,
-                        text(get(log, "severityText", "severity_text")),
-                        body,
-                        json_text(&attributes),
-                        text(get(log, "traceId", "trace_id")).map(|s| s.to_ascii_lowercase()),
-                        text(get(log, "spanId", "span_id")).map(|s| s.to_ascii_lowercase()),
-                        text(get(log, "eventName", "event_name")),
-                        service.clone(),
-                        scope_name.clone(),
-                        scope_version.clone(),
-                        resource_json.clone(),
-                    ],
-                    ints: vec![
-                        int(get(log, "severityNumber", "severity_number")),
-                        int(get(log, "flags", "flags")),
-                    ],
+    let request: Request<'_> =
+        serde_json::from_slice(body).map_err(|e| DatalakeError::MalformedPayload {
+            reason: format!("OTLP logs request is not valid OTLP/JSON: {e}"),
+        })?;
+    // Few tenants per request: a linear search beats hashing owned keys.
+    let mut groups: Vec<(Option<String>, Rows)> = Vec::new();
+    let mut last: Option<usize> = None;
+    let (mut time, mut observed, mut trace, mut span) =
+        (String::new(), String::new(), String::new(), String::new());
+    let (mut json, mut resource_json, mut body_json) = (Vec::new(), Vec::new(), Vec::new());
+    for resource_logs in &request.resource_logs {
+        let resource: &[KeyValue<'_>] = resource_logs
+            .resource
+            .as_ref()
+            .map_or(&[], |r| r.attributes.as_slice());
+        let resource_tenant = string_attribute(resource, tenant_attribute);
+        let service = string_attribute(resource, "service.name");
+        let has_resource = attributes_json(&mut resource_json, resource);
+        for scope_logs in &resource_logs.scope_logs {
+            let scope = scope_logs.scope.as_ref();
+            let scope_name = scope.and_then(|s| non_empty(s.name.as_ref()));
+            let scope_version = scope.and_then(|s| non_empty(s.version.as_ref()));
+            for log in &scope_logs.log_records {
+                let tenant =
+                    resource_tenant.or_else(|| string_attribute(&log.attributes, tenant_attribute));
+                let index = match last {
+                    Some(i) if groups[i].0.as_deref() == tenant => i,
+                    _ => {
+                        let i = if let Some(i) =
+                            groups.iter().position(|(t, _)| t.as_deref() == tenant)
+                        {
+                            i
+                        } else {
+                            groups.push((tenant.map(str::to_owned), Rows::new()));
+                            groups.len() - 1
+                        };
+                        last = Some(i);
+                        i
+                    }
                 };
-                let rows = groups.entry(tenant).or_insert_with(Rows::new);
-                for (builder, value) in rows.text.iter_mut().zip(record.text) {
-                    builder.append_option(value);
+                let rows = &mut groups[index].1;
+                let has_observed = time_text(&mut observed, log.observed);
+                // The record's time, or when it was observed if unset.
+                if time_text(&mut time, log.time) {
+                    rows.text[T_TIME].append_value(&time);
+                } else if has_observed {
+                    rows.text[T_TIME].append_value(&observed);
+                } else {
+                    rows.text[T_TIME].append_null();
                 }
-                for (builder, value) in rows.ints.iter_mut().zip(record.ints) {
-                    builder.append_option(value);
+                rows.text[T_OBSERVED].append_option(has_observed.then_some(observed.as_str()));
+                rows.text[T_SEVERITY].append_option(non_empty(log.severity_text.as_ref()));
+                match &log.body {
+                    Some(b) if b.string.is_some() => {
+                        rows.text[T_BODY].append_option(b.string.as_deref());
+                    }
+                    Some(b) => {
+                        body_json.clear();
+                        push_any(&mut body_json, b);
+                        let text = as_text(&body_json);
+                        rows.text[T_BODY].append_option((text != "null").then_some(text));
+                    }
+                    None => rows.text[T_BODY].append_null(),
                 }
+                let has_attributes = attributes_json(&mut json, &log.attributes);
+                rows.text[T_ATTRIBUTES].append_option(has_attributes.then(|| as_text(&json)));
+                rows.text[T_TRACE].append_option(hex_id(log.trace_id.as_ref(), &mut trace));
+                rows.text[T_SPAN].append_option(hex_id(log.span_id.as_ref(), &mut span));
+                rows.text[T_EVENT].append_option(non_empty(log.event_name.as_ref()));
+                rows.text[T_SERVICE].append_option(service);
+                rows.text[T_SCOPE_NAME].append_option(scope_name);
+                rows.text[T_SCOPE_VERSION].append_option(scope_version);
+                rows.text[T_RESOURCE].append_option(has_resource.then(|| as_text(&resource_json)));
+                rows.ints[I_SEVERITY].append_option(log.severity_number.and_then(|Int(v)| v));
+                rows.ints[I_FLAGS].append_option(log.flags.and_then(|Int(v)| v));
             }
         }
     }
+    groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     groups
         .into_iter()
         .map(|(tenant, rows)| {
             Ok(TenantLogs {
                 tenant,
                 batch: rows.finish()?,
+                sources: vec![0],
             })
         })
         .collect()
+}
+
+/// Flattens several OTLP/JSON requests (for example the records of one
+/// queue batch) and merges their rows by tenant, in request order, so each
+/// tenant is ingested once.
+///
+/// # Errors
+///
+/// [`DatalakeError::Storage`] if merging Arrow batches fails; unreadable
+/// requests are reported in [`FlattenedRequests::malformed`] instead.
+pub fn flatten_logs_json_many(
+    bodies: &[&[u8]],
+    tenant_attribute: &str,
+) -> Result<FlattenedRequests, DatalakeError> {
+    use rayon::prelude::*;
+
+    // Requests are independent: flatten them on every core, merge in order.
+    let flattened: Vec<_> = bodies
+        .par_iter()
+        .map(|body| flatten_logs_json(body, tenant_attribute))
+        .collect();
+    let mut groups: BTreeMap<Option<String>, (Vec<RecordBatch>, Vec<usize>)> = BTreeMap::new();
+    let mut malformed = Vec::new();
+    for (index, result) in flattened.into_iter().enumerate() {
+        match result {
+            Ok(parts) => {
+                for part in parts {
+                    let (batches, sources) = groups.entry(part.tenant).or_default();
+                    batches.push(part.batch);
+                    sources.push(index);
+                }
+            }
+            Err(e) => malformed.push((index, e)),
+        }
+    }
+    let tenants = groups
+        .into_iter()
+        .map(|(tenant, (batches, sources))| {
+            let batch = if batches.len() == 1 {
+                batches.into_iter().next().unwrap_or_else(|| unreachable!())
+            } else {
+                arrow::compute::concat_batches(&batches[0].schema(), &batches)
+                    .map_err(|e| DatalakeError::storage("arrow", e.to_string()))?
+            };
+            Ok(TenantLogs {
+                tenant,
+                batch,
+                sources,
+            })
+        })
+        .collect::<Result<_, DatalakeError>>()?;
+    Ok(FlattenedRequests { tenants, malformed })
 }
 
 #[cfg(test)]
@@ -392,7 +662,7 @@ mod tests {
         assert_eq!(body.value(1), r#"{"error":"boom"}"#);
         assert_eq!(
             column(acme, "attributes").as_string::<i32>().value(0),
-            r#"{"ok":true,"order.id":42}"#
+            r#"{"order.id":42,"ok":true}"#
         );
         assert_eq!(
             column(acme, "trace_id").as_string::<i32>().value(0),
@@ -491,6 +761,44 @@ mod tests {
             stored.column_by_name("timestamp").unwrap().data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         );
+    }
+
+    #[test]
+    fn several_requests_merge_by_tenant() {
+        let one = request().to_string();
+        let out = flatten_logs_json_many(&[one.as_bytes(), b"nope", one.as_bytes()], "tenant.id")
+            .unwrap();
+        let rows: Vec<_> = out.tenants.iter().map(|g| g.batch.num_rows()).collect();
+        assert_eq!(rows, [2, 6, 2]);
+        assert!(out.tenants.iter().all(|g| g.sources == [0, 2]));
+        assert_eq!(out.malformed.len(), 1);
+        assert_eq!(
+            out.malformed[0].0, 1,
+            "the unreadable request is reported, the rest kept"
+        );
+    }
+
+    /// The contract must keep the columnar fast path: content keywords are
+    /// annotations in draft 2020-12, but may be asserted by draft 7.
+    #[test]
+    fn contract_keeps_the_columnar_path() {
+        let mut registry = ContractRegistry::default();
+        registry
+            .register(&logs_contract("otel", "logs", "1.0.0", "zstd", false))
+            .unwrap();
+        assert!(registry
+            .get("otel/logs/1.0.0")
+            .unwrap()
+            .columnar()
+            .is_some());
+        let mut draft7 = logs_contract("otel", "logs7", "1.0.0", "zstd", false);
+        draft7["$schema"] = json!("http://json-schema.org/draft-07/schema#");
+        registry.register(&draft7).unwrap();
+        assert!(registry
+            .get("otel/logs7/1.0.0")
+            .unwrap()
+            .columnar()
+            .is_none());
     }
 
     #[test]

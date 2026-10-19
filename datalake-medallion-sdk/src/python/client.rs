@@ -46,6 +46,28 @@ pub(crate) struct PyIngestReport {
     pii_protection: String,
 }
 
+/// Per-tenant result of `ingest_otel_logs`, converted to a Python tuple
+/// `(tenant, sources, report | None, exception | None)`.
+struct OtelOutcome {
+    tenant: Option<String>,
+    sources: Vec<usize>,
+    report: Result<IngestReport, DatalakeError>,
+}
+
+impl<'py> IntoPyObject<'py> for OtelOutcome {
+    type Target = PyTuple;
+    type Output = Bound<'py, PyTuple>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let (report, error): (Option<PyIngestReport>, Option<Py<PyAny>>) = match self.report {
+            Ok(r) => (Some(PyIngestReport::from(r)), None),
+            Err(e) => (None, Some(PyErr::from(e).into_value(py).into_any())),
+        };
+        (self.tenant, self.sources, report, error).into_pyobject(py)
+    }
+}
+
 impl From<IngestReport> for PyIngestReport {
     fn from(r: IngestReport) -> Self {
         Self {
@@ -327,23 +349,31 @@ impl PyBronzeIngestionClient {
     ///
     /// `resolve(tenant_or_none)` maps each tenant found in `tenant_attribute`
     /// (or `None` for records without it) to a `TenantProfile` or a tenant id.
-    /// Tenants are validated one by one and committed concurrently. Returns
-    /// `(tenant_or_none, IngestReport)` pairs in tenant order.
-    #[pyo3(signature = (body, *, contract, tenant_attribute, resolve, batch_id = None))]
+    /// Tenants are validated one by one and committed concurrently; every
+    /// tenant is attempted even when another fails. Returns one
+    /// `(tenant_or_none, request_indices, IngestReport | None, error | None)`
+    /// per tenant, in tenant order, then `(None, [index], None, error)` per
+    /// unreadable request.
+    ///
+    /// `bodies` is a list of requests (for example the records of one queue
+    /// batch): their rows are merged by tenant, so each tenant is written once.
+    #[pyo3(signature = (bodies, *, contract, tenant_attribute, resolve, batch_id = None))]
     fn ingest_otel_logs<'py>(
         &self,
         py: Python<'py>,
-        body: &Bound<'py, PyBytes>,
+        bodies: Vec<Vec<u8>>,
         contract: &str,
         tenant_attribute: &str,
         resolve: &Bound<'py, PyAny>,
         batch_id: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.parts.registry.get(contract)?;
-        let bytes = body.as_bytes();
-        let groups = py.detach(|| crate::otel::flatten_logs_json(bytes, tenant_attribute))?;
-        let mut requests = Vec::with_capacity(groups.len());
-        for group in groups {
+        let flattened = py.detach(|| {
+            let slices: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+            crate::otel::flatten_logs_json_many(&slices, tenant_attribute)
+        })?;
+        let mut requests = Vec::with_capacity(flattened.tenants.len());
+        for group in flattened.tenants {
             let profile = self.resolve(&resolve.call1((group.tenant.clone(),))?)?;
             let mut request =
                 IngestRequest::new(profile, contract, RecordSource::Arrow(vec![group.batch]));
@@ -353,8 +383,9 @@ impl PyBronzeIngestionClient {
             if let Some(hook) = self.hooks.get(contract) {
                 request = request.with_hook(Arc::clone(hook));
             }
-            requests.push((group.tenant, request));
+            requests.push((group.tenant, group.sources, request));
         }
+        let malformed = flattened.malformed;
         let parts = Arc::clone(&self.parts);
         let cell = Arc::clone(&self.pipeline);
         future_into_py(py, async move {
@@ -373,32 +404,45 @@ impl PyBronzeIngestionClient {
             let prepared = tokio::task::spawn_blocking(move || {
                 requests
                     .into_iter()
-                    .map(|(tenant, request)| Ok((tenant, worker.prepare(request)?)))
-                    .collect::<Result<Vec<_>, DatalakeError>>()
+                    .map(|(tenant, sources, request)| (tenant, sources, worker.prepare(request)))
+                    .collect::<Vec<_>>()
             })
             .await
             .map_err(|e| {
                 DatalakeError::storage("runtime", format!("validation task failed: {e}"))
-            })??;
+            })?;
             let mut commits = tokio::task::JoinSet::new();
-            for (index, (tenant, batch)) in prepared.into_iter().enumerate() {
+            for (index, (tenant, sources, batch)) in prepared.into_iter().enumerate() {
                 let pipeline = Arc::clone(pipeline);
                 commits.spawn(async move {
-                    let report = pipeline.commit_with_retries(&batch, 4).await?;
-                    Ok::<_, DatalakeError>((index, tenant, report))
+                    let report = match batch {
+                        Ok(batch) => pipeline.commit_with_retries(&batch, 4).await,
+                        Err(e) => Err(e),
+                    };
+                    (
+                        index,
+                        OtelOutcome {
+                            tenant,
+                            sources,
+                            report,
+                        },
+                    )
                 });
             }
-            let mut reports = Vec::with_capacity(commits.len());
-            while let Some(done) = commits.join_next().await {
-                reports.push(done.map_err(|e| {
+            let mut done = Vec::with_capacity(commits.len());
+            while let Some(finished) = commits.join_next().await {
+                done.push(finished.map_err(|e| {
                     DatalakeError::storage("runtime", format!("upload task failed: {e}"))
-                })??);
+                })?);
             }
-            reports.sort_unstable_by_key(|(index, ..)| *index);
-            Ok(reports
-                .into_iter()
-                .map(|(_, tenant, report)| (tenant, PyIngestReport::from(report)))
-                .collect::<Vec<_>>())
+            done.sort_unstable_by_key(|(index, _)| *index);
+            let mut outcomes: Vec<OtelOutcome> = done.into_iter().map(|(_, o)| o).collect();
+            outcomes.extend(malformed.into_iter().map(|(index, e)| OtelOutcome {
+                tenant: None,
+                sources: vec![index],
+                report: Err(e),
+            }));
+            Ok(outcomes)
         })
     }
 

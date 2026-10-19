@@ -44,6 +44,9 @@ _MIB = 1024 * 1024
 
 __all__ = ["BronzeIngestionClient", "ClientOptions"]
 
+OtlpPayload = bytes | bytearray | memoryview | str | Mapping[str, Any]
+"""One OTLP/JSON logs request: encoded JSON, or the decoded mapping."""
+
 
 class ClientOptions(TypedDict, total=False):
     """Keyword options of :class:`BronzeIngestionClient`."""
@@ -158,7 +161,7 @@ class BronzeIngestionClient:
 
     async def ingest_otel_logs(
         self,
-        payload: bytes | bytearray | memoryview | str | Mapping[str, Any],
+        payload: OtlpPayload | list[OtlpPayload],
         *,
         contract: str,
         tenant_attribute: str = "tenant.id",
@@ -178,7 +181,12 @@ class BronzeIngestionClient:
 
         ``batch_id`` names every tenant's objects: pass a deterministic ULID
         (for example derived from a queue message) so a redelivered request
-        rewrites the same keys. Returns the reports by tenant id.
+        rewrites the same keys. Every tenant is attempted even when another
+        fails; the first error is then raised, and calling again with the same
+        ``batch_id`` rewrites what was already written. ``payload`` may also
+        be a list of requests
+        (the records of one queue batch): their rows are merged by tenant, so
+        each tenant is written once. Returns the reports by tenant id.
 
         Raises:
             MalformedPayloadError: the request is not OTLP/JSON.
@@ -198,14 +206,21 @@ class BronzeIngestionClient:
                 )
             return self._resolve(default_tenant)
 
-        pairs = await self._native.ingest_otel_logs(
-            otlp_bytes(payload),
+        bodies = (
+            [otlp_bytes(p) for p in payload] if isinstance(payload, list) else [otlp_bytes(payload)]
+        )
+        outcomes = await self._native.ingest_otel_logs(
+            bodies,
             contract=contract,
             tenant_attribute=tenant_attribute,
             resolve=resolve,
             batch_id=batch_id,
         )
-        return {report.tenant_id: report for _, report in pairs}
+        # Every tenant was attempted; report the first failure after all.
+        for _, _, _, error in outcomes:
+            if error is not None:
+                raise error
+        return {report.tenant_id: report for _, _, report, _ in outcomes if report is not None}
 
     async def ingest_stream(
         self,

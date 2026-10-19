@@ -1,12 +1,13 @@
 //! OTLP/JSON logs: flattening and ingestion throughput, without network I/O.
 //!
 //! ```text
-//! cargo run --release --example otel_throughput -- [records] [tenants]
+//! cargo run --release --example otel_throughput -- [records] [tenants] [requests]
 //! ```
 //!
-//! Builds one OTLP/JSON export request with log records spread over a few
-//! tenants, then times `otel::flatten_logs_json` and the ingestion of every
-//! tenant's rows into a store that discards the bytes.
+//! Builds OTLP/JSON export requests (several, as in one queue batch, when
+//! `requests` > 1) with log records spread over a few tenants, then times
+//! `otel::flatten_logs_json_many` and the ingestion of every tenant's rows
+//! into a store that discards the bytes.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -96,8 +97,12 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     let records: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(200_000);
     let tenants: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(4);
-    let body = request(records, tenants);
-    let mib = body.len() as f64 / 1_048_576.0;
+    let requests: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1);
+    let bodies: Vec<Vec<u8>> = (0..requests)
+        .map(|_| request(records / requests, tenants))
+        .collect();
+    let slices: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+    let mib = bodies.iter().map(Vec::len).sum::<usize>() as f64 / 1_048_576.0;
 
     let mut registry = ContractRegistry::default();
     registry
@@ -120,7 +125,9 @@ async fn main() {
     );
     for round in 0..3 {
         let t0 = Instant::now();
-        let groups = otel::flatten_logs_json(&body, "tenant.id").unwrap();
+        let groups = otel::flatten_logs_json_many(&slices, "tenant.id")
+            .unwrap()
+            .tenants;
         let flatten = t0.elapsed();
         let mut ok = 0;
         for group in groups {
@@ -145,7 +152,7 @@ async fn main() {
         }
         let total = t0.elapsed();
         println!(
-            "round {round}: {records} records, {mib:.0} MiB OTLP/JSON, {tenants} tenants: flatten {:.0} ms, total {:.0} ms ({:.0} MiB/s, {:.2} M records/s), ok {ok}",
+            "round {round}: {records} records in {requests} requests, {mib:.0} MiB OTLP/JSON, {tenants} tenants: flatten {:.0} ms, total {:.0} ms ({:.0} MiB/s, {:.2} M records/s), ok {ok}",
             flatten.as_secs_f64() * 1e3,
             total.as_secs_f64() * 1e3,
             mib / total.as_secs_f64(),
