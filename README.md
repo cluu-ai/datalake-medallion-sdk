@@ -139,6 +139,8 @@ A contract is a JSON Schema (draft 2020-12) document plus a few keywords under a
 | `x-dl-type: "timestamp"` | no | on a `date-time` string property: store it as `timestamp(µs, UTC)` instead of text, so engines filter and sort it as time. A value that does not parse quarantines its record |
 | `x-dl-partition_by` | no | name of a `date-time` property: partition Bronze by the day of that event time instead of the ingest day (see [Object layout](#object-layout)) |
 
+**Partitioning logs by event time.** Use `x-dl-partition_by` when a tenant writes a lot per day (hundreds of MB or more) or many events arrive days late. With little data per day it creates one small object per day, and reading many small objects is slower than reading a few large ones: on AWS, 3.1 M records spread over 212 days became 212 objects of about 0.6 MB, and an uncached DuckDB export went from 0.7 s (one object) to 8.6 s. For low-volume logs, keep the default ingest-day partitions, declare the event time with `x-dl-type: "timestamp"` and filter on it: Parquet statistics let the readers skip row groups outside the range. Merging small objects into large ones is the job of the Silver layer.
+
 **Choosing a codec.** Snappy is the default because it is the fastest to write. For logs and other text-heavy data, `"x-dl-compression": "zstd"` makes objects about 40% smaller (less storage, upload and scan) for about 20% more encoding CPU; higher levels cost much more CPU for almost no gain. Measured on 1 M log rows: Snappy 74 MiB, zstd level 1 43 MiB, zstd level 6 43 MiB at 3.5× the encoding time of level 1.
 
 ```json
@@ -462,7 +464,7 @@ The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, `TenantProfi
 
 ```toml
 [dependencies]
-datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc9", default-features = false, features = ["aws-kms"] }
+datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc10", default-features = false, features = ["aws-kms"] }
 ```
 
 The library is imported as `_core` (`use _core::pipeline::BronzePipeline;`). `default-features = false` builds without Python, for example for an AWS Lambda; the `aws-kms` feature adds the KMS data key provider. The Rust API may change before 1.0.

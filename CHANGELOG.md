@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Small objects are uploaded concurrently. Streams bound uploads by bytes in flight (`max_inflight_parts` × `part_bytes`, the same memory as before) and at most 32 requests, so the many small objects of event-day partitions go out together instead of one by one; `ingest` writes up to 16 objects at once, dead letters first. On AWS, a stream of 3.1 M log records over 212 event days took 13.7 s in 0.2.0rc9 against 3.1 s without partitions.
+- `LakeReader` looks up column types only when a filter value is text or a date.
+
+## [0.2.0rc9] - 2026-10-19
+
 ### Added
 
 - Contract storage options, all optional and off by default:
