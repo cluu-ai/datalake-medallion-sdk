@@ -336,3 +336,44 @@ def test_compaction_stops_within_its_budget_and_resumes(
     rest = maintenance.compact("acme-001", SHARED)
     assert (rest.partitions, rest.remaining) == (2, 0)
     assert len(reader.read("acme-001", SHARED).column("id")) == 12
+
+
+def test_iceberg_reads_are_served_from_the_object_cache(
+    writer: LakeWriter, s3_endpoint: str, tenants: TenantRegistry, catalog: Any
+) -> None:
+    from datalake_medallion_sdk import reader as reader_module
+
+    writer.append("acme-001", SHARED, rows(range(3), "a"))
+    writer.append("tenant-b", SHARED, rows(range(2), "b"))
+    loads: list[str] = []
+    original = reader_module._ObjectCache._read
+
+    def counting(self: Any, path: str, hive: bool) -> Any:
+        loads.append(path)
+        return original(self, path, hive)
+
+    reader_module._ObjectCache._read = counting  # type: ignore[method-assign]
+    try:
+        cached = LakeReader(
+            tenants,
+            catalog=catalog,
+            cache_mb=64,
+            max_staleness=0,
+            aws_region="us-east-1",
+            aws_endpoint_url=s3_endpoint,
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        first = cached.read("acme-001", SHARED, order_by=["id"])
+        assert first.column("v").to_pylist() == ["a"] * 3
+        assert first.column_names == ["tenant_id", "id", "day", "v"], "no columns from paths"
+        assert all("tenant_id=acme-001" in p for p in loads), "only the tenant's files"
+        fetched = len(loads)
+        assert cached.read("acme-001", SHARED).num_rows == 3
+        assert len(loads) == fetched, "a warm read touches no object"
+        writer.append("acme-001", SHARED, rows([9], "new"))
+        assert cached.read("acme-001", SHARED).num_rows == 4
+        assert len(loads) == fetched + 1, "only the new data file is fetched"
+        cached.close()
+    finally:
+        reader_module._ObjectCache._read = original  # type: ignore[method-assign]
