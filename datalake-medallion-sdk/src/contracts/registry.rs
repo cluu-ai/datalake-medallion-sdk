@@ -91,6 +91,42 @@ pub struct FieldSpec {
     pub pii: bool,
     /// Declared as `"type": "string", "format": "date-time"`.
     pub date_time: bool,
+    /// A `date-time` field stored as `timestamp(us, UTC)` instead of text
+    /// (`"x-dl-type": "timestamp"` on the property).
+    pub timestamp: bool,
+}
+
+/// Parquet compression of a contract's Bronze objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BronzeCompression {
+    /// Snappy: fast, moderate ratio (the default).
+    #[default]
+    Snappy,
+    /// Zstandard at a level from 1 to 22: smaller objects, more CPU.
+    Zstd(i32),
+    /// LZ4 (raw).
+    Lz4,
+    /// No compression.
+    None,
+}
+
+impl BronzeCompression {
+    /// Codec names `x-dl-compression` accepts. Every name must parse and
+    /// encode: tests run through this list, so a codec added here without
+    /// its Parquet support fails the build's tests, not a write.
+    pub const NAMES: [&'static str; 4] = ["snappy", "zstd", "lz4", "none"];
+
+    /// The Parquet codec written for this setting.
+    #[must_use]
+    pub fn parquet(self) -> parquet::basic::Compression {
+        use parquet::basic::{Compression, ZstdLevel};
+        match self {
+            Self::Snappy => Compression::SNAPPY,
+            Self::Zstd(level) => Compression::ZSTD(ZstdLevel::try_new(level).unwrap_or_default()),
+            Self::Lz4 => Compression::LZ4_RAW,
+            Self::None => Compression::UNCOMPRESSED,
+        }
+    }
 }
 
 /// One compiled data contract.
@@ -101,6 +137,8 @@ pub struct Contract {
     version: String,
     layer: Option<String>,
     mode: FlexibilityMode,
+    compression: BronzeCompression,
+    partition_by: Option<String>,
     fields: Vec<FieldSpec>,
     field_index: HashMap<String, usize>,
     pii_fields: Vec<String>,
@@ -170,33 +208,21 @@ impl Contract {
             }
         };
 
-        let mut fields = Vec::new();
-        if let Some(props) = root.get("properties") {
-            let props = props
-                .as_object()
-                .ok_or_else(|| ctx("'properties' must be an object".into()))?;
-            for (name, prop) in props {
-                let pii = match prop.get(kw("pii")) {
-                    None | Some(Value::Bool(false)) => false,
-                    Some(Value::Bool(true)) => true,
-                    Some(_) => {
-                        return Err(ctx(format!(
-                            "'{}' on '{name}' must be a boolean",
-                            kw("pii")
-                        )))
-                    }
-                };
-                let kind = field_kind(prop);
-                let date_time = kind == FieldKind::String
-                    && prop.get("format").and_then(Value::as_str) == Some("date-time");
-                fields.push(FieldSpec {
-                    name: name.clone(),
-                    kind,
-                    pii,
-                    date_time,
-                });
+        let compression = parse_compression(root, &kw, &ctx)?;
+
+        let fields = parse_fields(root, &kw, &ctx)?;
+        let partition_by = match root.get(&kw("partition_by")) {
+            None => None,
+            Some(Value::String(name)) if fields.iter().any(|f| &f.name == name && f.date_time) => {
+                Some(name.clone())
             }
-        }
+            Some(_) => {
+                return Err(ctx(format!(
+                    "'{}' must name a declared string field with format date-time",
+                    kw("partition_by")
+                )))
+            }
+        };
 
         let columnar = ColumnarPlan::compile(root, &fields, mode, extension_prefix);
         let validator = jsonschema::options()
@@ -228,6 +254,8 @@ impl Contract {
             version,
             layer,
             mode,
+            compression,
+            partition_by,
             fields,
             field_index,
             pii_fields,
@@ -266,6 +294,17 @@ impl Contract {
     #[must_use]
     pub fn mode(&self) -> FlexibilityMode {
         self.mode
+    }
+    /// `date-time` field whose day partitions Bronze objects (event time);
+    /// `None` partitions by ingest time.
+    #[must_use]
+    pub fn partition_by(&self) -> Option<&str> {
+        self.partition_by.as_deref()
+    }
+    /// Parquet compression of the contract's Bronze objects.
+    #[must_use]
+    pub fn compression(&self) -> BronzeCompression {
+        self.compression
     }
     /// Declared top-level fields, sorted by name (this is also the Parquet column order).
     #[must_use]
@@ -512,6 +551,96 @@ fn required_version(root: &Map<String, Value>, keyword: &str) -> Result<String, 
         Err(DatalakeError::boot(format!(
             "'{keyword}' must match [0-9A-Za-z.+_-]{{1,32}}, got {value:?}"
         )))
+    }
+}
+
+/// Declared top-level fields, with their SDK keywords.
+fn parse_fields(
+    root: &Map<String, Value>,
+    kw: &dyn Fn(&str) -> String,
+    ctx: &dyn Fn(String) -> DatalakeError,
+) -> Result<Vec<FieldSpec>, DatalakeError> {
+    let mut fields = Vec::new();
+    if let Some(props) = root.get("properties") {
+        let props = props
+            .as_object()
+            .ok_or_else(|| ctx("'properties' must be an object".into()))?;
+        for (name, prop) in props {
+            let pii = match prop.get(kw("pii")) {
+                None | Some(Value::Bool(false)) => false,
+                Some(Value::Bool(true)) => true,
+                Some(_) => {
+                    return Err(ctx(format!(
+                        "'{}' on '{name}' must be a boolean",
+                        kw("pii")
+                    )))
+                }
+            };
+            let kind = field_kind(prop);
+            let date_time = kind == FieldKind::String
+                && prop.get("format").and_then(Value::as_str) == Some("date-time");
+            let timestamp = match prop.get(kw("type")) {
+                None => false,
+                Some(Value::String(t)) if t == "timestamp" && date_time => true,
+                Some(_) => {
+                    return Err(ctx(format!(
+                        "'{}' on '{name}' must be \"timestamp\" on a string with format date-time",
+                        kw("type")
+                    )))
+                }
+            };
+            fields.push(FieldSpec {
+                name: name.clone(),
+                kind,
+                pii,
+                date_time,
+                timestamp,
+            });
+        }
+    }
+    Ok(fields)
+}
+
+/// `x-dl-compression` (`snappy`, `zstd`, `lz4`, `none`) and
+/// `x-dl-compression_level` (zstd only, 1 to 22, default 3).
+fn parse_compression(
+    root: &Map<String, Value>,
+    kw: &dyn Fn(&str) -> String,
+    ctx: &dyn Fn(String) -> DatalakeError,
+) -> Result<BronzeCompression, DatalakeError> {
+    let level = match root.get(&kw("compression_level")) {
+        None => None,
+        Some(v) => Some(
+            v.as_i64()
+                .and_then(|l| i32::try_from(l).ok())
+                .filter(|l| (1..=22).contains(l))
+                .ok_or_else(|| {
+                    ctx(format!(
+                        "'{}' must be an integer from 1 to 22",
+                        kw("compression_level")
+                    ))
+                })?,
+        ),
+    };
+    let codec = match root.get(&kw("compression")) {
+        None => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => return Err(ctx(format!("'{}' must be a string", kw("compression")))),
+    };
+    match (codec, level) {
+        (None | Some("snappy"), None) => Ok(BronzeCompression::Snappy),
+        (Some("zstd"), level) => Ok(BronzeCompression::Zstd(level.unwrap_or(3))),
+        (Some("lz4"), None) => Ok(BronzeCompression::Lz4),
+        (Some("none"), None) => Ok(BronzeCompression::None),
+        (_, Some(_)) => Err(ctx(format!(
+            "'{}' applies to zstd only",
+            kw("compression_level")
+        ))),
+        (Some(other), None) => Err(ctx(format!(
+            "'{}' must be one of {}, got {other:?}",
+            kw("compression"),
+            BronzeCompression::NAMES.join(", ")
+        ))),
     }
 }
 

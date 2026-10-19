@@ -16,7 +16,10 @@
 //! Objects become visible only when complete, under keys derived from the
 //! stream id: `<stream_id>-00000.parquet`, `-00001`, … Running the same input
 //! again with the same [`StreamOptions::stream_id`] rewrites the same keys,
-//! so a failed stream can be retried without duplicating rows. Incomplete
+//! so a failed stream can be retried without duplicating rows. When the
+//! contract partitions by event time (`x-dl-partition_by`), rows go to one
+//! open object per event day, `<stream_id>-<YYYYMMDD>-00000.parquet`, with at
+//! most [`StreamOptions::max_open_days`] open at once. Incomplete
 //! multipart uploads are aborted on failure; configure an S3 lifecycle rule
 //! (`AbortIncompleteMultipartUpload`) as a safety net for crashed processes.
 //!
@@ -25,19 +28,20 @@
 //! from `tokio::task::spawn_blocking`, never from inside an async task; or
 //! use [`BronzePipeline::ingest_stream`], which does that for you.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use ulid::Ulid;
 
+use crate::codec;
 use crate::contracts::Contract;
 use crate::dlq;
 use crate::error::DatalakeError;
@@ -76,6 +80,14 @@ pub struct StreamOptions {
     pub max_inflight_parts: usize,
     /// Buffered dead-letter bytes that trigger writing quarantine objects.
     pub dead_letter_bytes: usize,
+    /// Closes the current object once it is this old, even if it is small,
+    /// so continuous streams become visible within a bounded time. `None`
+    /// closes objects by size only.
+    pub max_object_age: Option<std::time::Duration>,
+    /// Objects open at once when the contract partitions by event time, one
+    /// per event day; opening another closes the oldest. Each open object
+    /// holds up to one row group and one part in memory.
+    pub max_open_days: usize,
 }
 
 impl Default for StreamOptions {
@@ -88,6 +100,8 @@ impl Default for StreamOptions {
             chunk_rows: 131_072,
             max_inflight_parts: 4,
             dead_letter_bytes: 8 * MIB,
+            max_object_age: None,
+            max_open_days: 4,
         }
     }
 }
@@ -111,6 +125,11 @@ impl StreamOptions {
         if !(1..=64).contains(&self.max_inflight_parts) {
             return Err(DatalakeError::config(
                 "max_inflight_parts must be between 1 and 64",
+            ));
+        }
+        if !(1..=64).contains(&self.max_open_days) {
+            return Err(DatalakeError::config(
+                "max_open_days must be between 1 and 64",
             ));
         }
         Ok(())
@@ -159,6 +178,8 @@ enum Job {
         body: Bytes,
         content_type: &'static str,
     },
+    /// Answered once every earlier job is uploaded.
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 /// `Write` sink shared with the Parquet writer, drained into parts.
@@ -197,13 +218,14 @@ impl Write for Sink {
     }
 }
 
-/// The Parquet object being written.
+/// A Parquet object being written.
 struct OpenObject {
     index: usize,
     path: Arc<ObjectPath>,
     writer: ParallelWriter<Sink>,
     sink: Sink,
     parts_sent: i32,
+    opened: std::time::Instant,
     /// Accepted rows not yet encoded: one row group's worth at most.
     pending: Vec<RecordBatch>,
     pending_rows: usize,
@@ -224,7 +246,8 @@ pub struct BronzeStream {
     uploader: Option<JoinHandle<Result<u64, DatalakeError>>>,
     pending: Vec<RecordBatch>,
     pending_rows: usize,
-    object: Option<OpenObject>,
+    /// Open objects by partition day (one entry without event time).
+    objects: BTreeMap<NaiveDate, OpenObject>,
     next_object: usize,
     data_uris: Vec<String>,
     dead_letters: BTreeMap<String, Vec<u8>>,
@@ -288,7 +311,7 @@ impl BronzePipeline {
             uploader: Some(uploader),
             pending: Vec::new(),
             pending_rows: 0,
-            object: None,
+            objects: BTreeMap::new(),
             next_object: 0,
             data_uris: Vec::new(),
             dead_letters: BTreeMap::new(),
@@ -404,6 +427,7 @@ impl BronzeStream {
     }
 
     fn push_inner(&mut self, records: RecordSource) -> Result<(), DatalakeError> {
+        self.close_if_old()?;
         match records {
             RecordSource::Arrow(batches) => {
                 for batch in batches {
@@ -424,6 +448,47 @@ impl BronzeStream {
                 self.process(other)
             }
         }
+    }
+
+    /// Closes the objects that reached `max_object_age`.
+    fn close_if_old(&mut self) -> Result<(), DatalakeError> {
+        let Some(age) = self.options.max_object_age else {
+            return Ok(());
+        };
+        let due: Vec<NaiveDate> = self
+            .objects
+            .iter()
+            .filter(|(_, o)| o.opened.elapsed() >= age)
+            .map(|(day, _)| *day)
+            .collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        self.flush_pending()?;
+        for day in due {
+            self.close_object(day)?;
+        }
+        Ok(())
+    }
+
+    /// Writes out what is buffered, completes the open objects and waits
+    /// until they are uploaded, so a quiet stream's records are visible (and
+    /// the input can be checkpointed) without waiting for more input. The
+    /// stream stays open.
+    ///
+    /// # Errors
+    ///
+    /// As [`push`](Self::push).
+    pub fn flush(&mut self) -> Result<(), DatalakeError> {
+        let result = self
+            .flush_pending()
+            .and_then(|()| self.close_objects())
+            .and_then(|()| self.flush_dead_letters())
+            .and_then(|()| self.wait_uploads());
+        if result.is_err() {
+            self.shut_down();
+        }
+        result
     }
 
     fn flush_pending(&mut self) -> Result<(), DatalakeError> {
@@ -491,18 +556,43 @@ impl BronzeStream {
     }
 
     fn write(&mut self, batch: &RecordBatch) -> Result<(), DatalakeError> {
-        if self.object.is_none() {
-            self.object = Some(self.open_object(batch)?);
+        let Some(field) = self.contract.partition_by() else {
+            return self.write_day(self.now.date_naive(), batch);
+        };
+        let field = field.to_owned();
+        for (day, part) in codec::event_day_groups(batch, &field, self.now)? {
+            self.write_day(day.date_naive(), &part)?;
+        }
+        Ok(())
+    }
+
+    fn write_day(&mut self, day: NaiveDate, batch: &RecordBatch) -> Result<(), DatalakeError> {
+        if !self.objects.contains_key(&day) {
+            if self.objects.len() >= self.options.max_open_days {
+                // Late or scattered event days: close the oldest object.
+                let oldest = self
+                    .objects
+                    .iter()
+                    .min_by_key(|(_, o)| o.index)
+                    .map(|(d, _)| *d);
+                if let Some(oldest) = oldest {
+                    self.close_object(oldest)?;
+                }
+            }
+            let object = self.open_object(day, batch)?;
+            self.objects.insert(day, object);
         }
         let (part_bytes, row_group_bytes, row_group_rows, target) = (
             self.options.part_bytes,
             self.options.row_group_bytes,
-            self.pipeline.encoder().max_row_group_rows(),
+            self.pipeline
+                .encoder_for(&self.contract)
+                .max_row_group_rows(),
             self.options.target_object_bytes,
         );
         let mut ready = Vec::new();
         let mut full = false;
-        if let Some(object) = self.object.as_mut() {
+        if let Some(object) = self.objects.get_mut(&day) {
             object.pending_rows += batch.num_rows();
             object.pending_bytes += batch.get_array_memory_size();
             object.pending.push(batch.clone());
@@ -526,23 +616,33 @@ impl BronzeStream {
             self.send(job)?;
         }
         if full {
-            self.close_object()?;
+            self.close_object(day)?;
         }
         Ok(())
     }
 
-    fn open_object(&mut self, batch: &RecordBatch) -> Result<OpenObject, DatalakeError> {
+    fn open_object(
+        &mut self,
+        day: NaiveDate,
+        batch: &RecordBatch,
+    ) -> Result<OpenObject, DatalakeError> {
         let index = self.next_object;
         self.next_object += 1;
-        let file_id = format!("{}-{index:05}", self.stream_id);
-        let path = self
-            .tenant
-            .data_path(self.contract.data_type(), &self.now, &file_id)?;
+        let path = if self.contract.partition_by().is_some() {
+            let file_id = format!("{}-{}-{index:05}", self.stream_id, day.format("%Y%m%d"));
+            let start = day.and_time(chrono::NaiveTime::MIN).and_utc();
+            self.tenant
+                .data_path(self.contract.data_type(), &start, &file_id)?
+        } else {
+            let file_id = format!("{}-{index:05}", self.stream_id);
+            self.tenant
+                .data_path(self.contract.data_type(), &self.now, &file_id)?
+        };
         let sink = Sink::default();
         let writer = ParallelWriter::try_new(
             sink.clone(),
             batch.schema(),
-            self.pipeline.encoder().properties(),
+            self.pipeline.encoder_for(&self.contract).properties(),
         )?;
         Ok(OpenObject {
             index,
@@ -550,14 +650,26 @@ impl BronzeStream {
             writer,
             sink,
             parts_sent: 0,
+            opened: std::time::Instant::now(),
             pending: Vec::new(),
             pending_rows: 0,
             pending_bytes: 0,
         })
     }
 
-    fn close_object(&mut self) -> Result<(), DatalakeError> {
-        let Some(mut object) = self.object.take() else {
+    /// Completes every open object, in the order they were opened.
+    fn close_objects(&mut self) -> Result<(), DatalakeError> {
+        let mut days: Vec<(usize, NaiveDate)> =
+            self.objects.iter().map(|(d, o)| (o.index, *d)).collect();
+        days.sort_unstable();
+        for (_, day) in days {
+            self.close_object(day)?;
+        }
+        Ok(())
+    }
+
+    fn close_object(&mut self, day: NaiveDate) -> Result<(), DatalakeError> {
+        let Some(mut object) = self.objects.remove(&day) else {
             return Ok(());
         };
         object.flush_row_group()?;
@@ -626,6 +738,19 @@ impl BronzeStream {
             .unwrap_or_else(|| DatalakeError::storage("stream", "upload task stopped")))
     }
 
+    /// Blocks until the upload task has finished every job sent so far.
+    fn wait_uploads(&mut self) -> Result<(), DatalakeError> {
+        let (done, uploaded) = tokio::sync::oneshot::channel();
+        self.send(Job::Barrier(done))?;
+        if self.runtime.block_on(uploaded).is_ok() {
+            return Ok(());
+        }
+        Err(self
+            .join_uploader()
+            .err()
+            .unwrap_or_else(|| DatalakeError::storage("stream", "upload task stopped")))
+    }
+
     fn join_uploader(&mut self) -> Result<u64, DatalakeError> {
         self.jobs = None;
         match self.uploader.take() {
@@ -639,7 +764,7 @@ impl BronzeStream {
     /// Stops after an error: the unfinished object is discarded and its
     /// multipart upload aborted.
     fn shut_down(&mut self) {
-        self.object = None;
+        self.objects.clear();
         self.pending.clear();
         if self.uploader.is_some() {
             let _ = self.join_uploader();
@@ -662,7 +787,7 @@ impl BronzeStream {
 
     fn finish_inner(&mut self) -> Result<StreamReport, DatalakeError> {
         self.flush_pending()?;
-        self.close_object()?;
+        self.close_objects()?;
         self.flush_dead_letters()?;
         let bytes_written = self.join_uploader()?;
         let records_quarantined = self.rejections.values().sum();
@@ -699,22 +824,26 @@ impl Drop for BronzeStream {
     }
 }
 
+/// Object index, part number, `ETag` and size of an uploaded part.
+type PartDone = (usize, i32, String, u64);
+
 /// An object whose parts are being uploaded.
 struct Upload {
     path: Arc<ObjectPath>,
     id: String,
 }
 
-/// Upload task: runs parts concurrently, completes objects in order, aborts
-/// an unfinished upload when the stream stops early. Returns bytes uploaded.
+/// Upload task: runs parts concurrently (several objects may be open when
+/// the stream partitions by event day), completes objects, and aborts the
+/// unfinished uploads when the stream stops early. Returns bytes uploaded.
 async fn upload(
     storage: Arc<dyn ObjectStorage>,
     mut jobs: mpsc::Receiver<Job>,
     max_inflight: usize,
 ) -> Result<u64, DatalakeError> {
-    let mut open: Option<(usize, Upload)> = None;
-    let mut parts: JoinSet<Result<(i32, String, u64), DatalakeError>> = JoinSet::new();
-    let mut done: Vec<(i32, String)> = Vec::new();
+    let mut open: HashMap<usize, Upload> = HashMap::new();
+    let mut parts: JoinSet<Result<PartDone, DatalakeError>> = JoinSet::new();
+    let mut done: HashMap<usize, Vec<(i32, String)>> = HashMap::new();
     let mut bytes: u64 = 0;
     let result: Result<(), DatalakeError> = async {
         while let Some(job) = jobs.recv().await {
@@ -733,53 +862,52 @@ async fn upload(
                     number,
                     body,
                 } => {
-                    if open.as_ref().map(|(i, _)| *i) != Some(object) {
+                    if let std::collections::hash_map::Entry::Vacant(slot) = open.entry(object) {
                         let id = storage
                             .create_multipart(&path, PARQUET_CONTENT_TYPE)
                             .await?;
-                        open = Some((
-                            object,
-                            Upload {
-                                path: Arc::clone(&path),
-                                id,
-                            },
-                        ));
-                        done.clear();
+                        slot.insert(Upload {
+                            path: Arc::clone(&path),
+                            id,
+                        });
                     }
                     while parts.len() >= max_inflight {
                         if let Some(finished) = parts.join_next().await {
-                            let (n, etag, size) = joined(finished)?;
-                            done.push((n, etag));
+                            let (o, n, etag, size) = joined(finished)?;
+                            done.entry(o).or_default().push((n, etag));
                             bytes += size;
                         }
                     }
                     let storage = Arc::clone(&storage);
-                    let id = open.as_ref().map(|(_, u)| u.id.clone()).unwrap_or_default();
+                    let id = open.get(&object).map(|u| u.id.clone()).unwrap_or_default();
                     parts.spawn(async move {
                         let size = body.len() as u64;
                         let etag =
                             retrying(|| storage.upload_part(&path, &id, number, body.clone()))
                                 .await?;
-                        Ok((number, etag, size))
+                        Ok((object, number, etag, size))
                     });
+                }
+                Job::Barrier(ack) => {
+                    while let Some(finished) = parts.join_next().await {
+                        let (o, n, etag, size) = joined(finished)?;
+                        done.entry(o).or_default().push((n, etag));
+                        bytes += size;
+                    }
+                    let _ = ack.send(());
                 }
                 Job::Complete { object } => {
                     while let Some(finished) = parts.join_next().await {
-                        let (n, etag, size) = joined(finished)?;
-                        done.push((n, etag));
+                        let (o, n, etag, size) = joined(finished)?;
+                        done.entry(o).or_default().push((n, etag));
                         bytes += size;
                     }
-                    if let Some((index, upload)) = open.take() {
-                        if index == object {
-                            done.sort_unstable_by_key(|(n, _)| *n);
-                            storage
-                                .complete_multipart(
-                                    &upload.path,
-                                    &upload.id,
-                                    std::mem::take(&mut done),
-                                )
-                                .await?;
-                        }
+                    if let Some(upload) = open.remove(&object) {
+                        let mut etags = done.remove(&object).unwrap_or_default();
+                        etags.sort_unstable_by_key(|(n, _)| *n);
+                        storage
+                            .complete_multipart(&upload.path, &upload.id, etags)
+                            .await?;
                     }
                 }
             }
@@ -787,9 +915,9 @@ async fn upload(
         Ok(())
     }
     .await;
-    if result.is_err() || open.is_some() {
+    if result.is_err() || !open.is_empty() {
         parts.abort_all();
-        if let Some((_, upload)) = open.take() {
+        for (_, upload) in open.drain() {
             if let Err(e) = storage.abort_multipart(&upload.path, &upload.id).await {
                 tracing::warn!(error = %e, uri = %upload.path.uri, "could not abort multipart upload");
             }
@@ -822,8 +950,8 @@ where
 }
 
 fn joined(
-    finished: Result<Result<(i32, String, u64), DatalakeError>, tokio::task::JoinError>,
-) -> Result<(i32, String, u64), DatalakeError> {
+    finished: Result<Result<PartDone, DatalakeError>, tokio::task::JoinError>,
+) -> Result<PartDone, DatalakeError> {
     finished.map_err(|e| DatalakeError::storage("stream", format!("part upload failed: {e}")))?
 }
 
@@ -1399,5 +1527,202 @@ mod tests {
             .unwrap();
         assert!(err.to_string().contains("Tokio runtime"));
         let _ = Array::len(&Int64Array::from(vec![1]));
+    }
+}
+
+#[cfg(test)]
+mod event_time_tests {
+    //! Event-day partitioning and time-based closing of stream objects.
+    use super::*;
+    use crate::contracts::ContractRegistry;
+    use crate::pipeline::PipelineConfig;
+    use crate::storage::InMemoryStorage;
+    use crate::tenant::TenantId;
+    use arrow::array::{AsArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimestampMicrosecondType};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use serde_json::json;
+
+    const CONTRACT: &str = "app/log/1.0.0";
+
+    fn pipeline(storage: &InMemoryStorage, partitioned: bool) -> Arc<BronzePipeline> {
+        let mut schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "x-dl-domain": "app",
+            "x-dl-datatype": "log",
+            "x-dl-schema_version": "1.0.0",
+            "required": ["id"],
+            "properties": {
+                "id": {"type": "string"},
+                "at": {"type": "string", "format": "date-time", "x-dl-type": "timestamp"},
+                "msg": {"type": "string"}
+            }
+        });
+        if partitioned {
+            schema["x-dl-partition_by"] = json!("at");
+        }
+        let mut r = ContractRegistry::default();
+        r.register(&schema).unwrap();
+        let config = PipelineConfig {
+            max_future_skew: None,
+            ..PipelineConfig::default()
+        };
+        Arc::new(BronzePipeline::new(Arc::new(r), Arc::new(storage.clone()), config).unwrap())
+    }
+
+    fn tenant() -> Arc<TenantProfile> {
+        Arc::new(
+            TenantProfile::for_bucket(TenantId::new("acme-001").unwrap(), "acme-lake")
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// `n` rows from `start`; row `i` happens on 2026-03-0`1 + i % days`.
+    fn chunk(start: usize, n: usize, days: usize) -> RecordSource {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("at", DataType::Utf8, true),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let range = start..start + n;
+        let ids = range.clone().map(|i| format!("r{i:08}"));
+        let at = range
+            .clone()
+            .map(|i| format!("2026-03-0{}T{:02}:00:00Z", 1 + i % days, i % 24));
+        let msg = range.map(|i| format!("message {i} {}", "y".repeat(60)));
+        RecordSource::Arrow(vec![RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from_iter_values(ids)),
+                Arc::new(StringArray::from_iter_values(at)),
+                Arc::new(StringArray::from_iter_values(msg)),
+            ],
+        )
+        .unwrap()])
+    }
+
+    fn small(id: &str, max_open_days: usize) -> StreamOptions {
+        StreamOptions {
+            stream_id: Some(id.to_owned()),
+            target_object_bytes: 256 * 1024,
+            part_bytes: 64 * 1024,
+            row_group_bytes: 32 * 1024,
+            chunk_rows: 2_000,
+            max_inflight_parts: 3,
+            max_open_days,
+            ..StreamOptions::default()
+        }
+    }
+
+    /// Event days (as `YYYYMMDD`) of every row of an object.
+    fn days_of(storage: &InMemoryStorage, uri: &str) -> Vec<String> {
+        let body = storage
+            .get(uri.strip_prefix("s3://").unwrap())
+            .unwrap()
+            .body;
+        let mut days = Vec::new();
+        for batch in ParquetRecordBatchReaderBuilder::try_new(body)
+            .unwrap()
+            .build()
+            .unwrap()
+        {
+            let batch = batch.unwrap();
+            let at = batch.column_by_name("at").unwrap();
+            for micros in at.as_primitive::<TimestampMicrosecondType>() {
+                let t = DateTime::from_timestamp_micros(micros.unwrap()).unwrap();
+                days.push(t.format("%Y%m%d").to_string());
+            }
+        }
+        days
+    }
+
+    async fn run(
+        storage: &InMemoryStorage,
+        id: &str,
+        days: usize,
+        max_open_days: usize,
+    ) -> StreamReport {
+        let source: Vec<_> = (0..8).map(|c| Ok(chunk(c * 3_000, 3_000, days))).collect();
+        pipeline(storage, true)
+            .ingest_stream(tenant(), CONTRACT, None, source, small(id, max_open_days))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rows_land_in_the_object_of_their_event_day() {
+        for (days, max_open) in [(3, 4), (3, 2), (5, 1)] {
+            let storage = InMemoryStorage::new();
+            let id = Ulid::generate().to_string();
+            let report = run(&storage, &id, days, max_open).await;
+            assert_eq!(report.records_ok, 24_000);
+            let mut rows = 0;
+            for uri in &report.data_uris {
+                let name = uri.rsplit('/').next().unwrap();
+                let day = &name[id.len() + 1..id.len() + 9];
+                let partition = format!("year=2026/month=03/day={}/", &day[6..]);
+                assert!(uri.contains(&partition), "{uri}");
+                let found = days_of(&storage, uri);
+                assert!(found.iter().all(|d| d == day), "{uri} holds other days");
+                rows += found.len();
+            }
+            assert_eq!(rows, 24_000);
+            if max_open >= days {
+                // Each day's object grows to the target size before closing.
+                assert!(report.data_uris.len() < 24, "{}", report.data_uris.len());
+            }
+            let keys = storage.keys();
+            let again = run(&storage, &id, days, max_open).await;
+            assert_eq!(again.data_uris, report.data_uris, "retries reuse the keys");
+            assert_eq!(storage.keys(), keys);
+        }
+    }
+
+    #[test]
+    fn open_days_are_bounded() {
+        let options = StreamOptions {
+            max_open_days: 0,
+            ..StreamOptions::default()
+        };
+        assert!(options.validate().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_and_age_close_objects_early() {
+        let storage = InMemoryStorage::new();
+        let p = pipeline(&storage, false);
+        let id = Ulid::generate().to_string();
+        let mut options = small(&id, 4);
+        options.max_object_age = Some(std::time::Duration::ZERO);
+        let report = tokio::task::spawn_blocking({
+            let storage = storage.clone();
+            move || {
+                let mut stream = p.stream(tenant(), CONTRACT, None, options).unwrap();
+                stream.push(chunk(0, 10, 1)).unwrap();
+                stream.flush().unwrap();
+                // The first object is complete while the stream is open.
+                let visible = storage.keys().len();
+                // An age of zero closes an open object before each push;
+                // Arrow rows still gather up to `chunk_rows` first, so the
+                // last two pushes share one object.
+                stream.push(chunk(10, 10, 1)).unwrap();
+                stream.flush().unwrap();
+                stream.push(chunk(20, 10, 1)).unwrap();
+                stream.push(chunk(30, 10, 1)).unwrap();
+                (visible, stream.finish().unwrap())
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(report.0, 1);
+        let report = report.1;
+        assert_eq!(report.records_ok, 40);
+        assert_eq!(report.data_uris.len(), 3, "{:?}", report.data_uris);
+        for (i, uri) in report.data_uris.iter().enumerate() {
+            assert!(uri.ends_with(&format!("{id}-{i:05}.parquet")), "{uri}");
+        }
     }
 }

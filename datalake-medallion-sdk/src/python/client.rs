@@ -41,6 +41,7 @@ pub(crate) struct PyIngestReport {
     records_quarantined: usize,
     rejections: BTreeMap<String, usize>,
     data_uri: Option<String>,
+    data_uris: Vec<String>,
     dlq_uris: Vec<String>,
     pii_protection: String,
 }
@@ -55,6 +56,7 @@ impl From<IngestReport> for PyIngestReport {
             records_quarantined: r.records_quarantined,
             rejections: r.rejections,
             data_uri: r.data_uri,
+            data_uris: r.data_uris,
             dlq_uris: r.dlq_uris,
             pii_protection: r.pii_protection,
         }
@@ -330,7 +332,10 @@ impl PyBronzeIngestionClient {
     /// of chunks, each one anything `ingest` accepts. With
     /// `parse_text_columns`, text columns of `integer`, `number` and
     /// `boolean` fields are parsed (CSV read as text). With `json_lines`,
-    /// `str`/`bytes` chunks are JSON Lines.
+    /// `str`/`bytes` chunks are JSON Lines. `max_object_seconds` closes an
+    /// object once it is that old (checked as chunks arrive); `max_open_days`
+    /// bounds the objects open at once when the contract partitions by event
+    /// time.
     #[pyo3(signature = (
         source,
         *,
@@ -344,6 +349,8 @@ impl PyBronzeIngestionClient {
         max_inflight_parts = 4,
         parse_text_columns = false,
         json_lines = false,
+        max_object_seconds = None,
+        max_open_days = 4,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn ingest_stream<'py>(
@@ -360,8 +367,17 @@ impl PyBronzeIngestionClient {
         max_inflight_parts: usize,
         parse_text_columns: bool,
         json_lines: bool,
+        max_object_seconds: Option<f64>,
+        max_open_days: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
         const MIB: usize = 1024 * 1024;
+        let max_object_age = max_object_seconds
+            .map(|s| {
+                std::time::Duration::try_from_secs_f64(s).map_err(|_| {
+                    DatalakeError::config("max_object_seconds must be a non-negative number")
+                })
+            })
+            .transpose()?;
         let tenant = self.resolve(tenant)?;
         self.parts.registry.get(contract)?;
         let options = StreamOptions {
@@ -371,6 +387,8 @@ impl PyBronzeIngestionClient {
             row_group_bytes: row_group_mb.saturating_mul(MIB),
             chunk_rows,
             max_inflight_parts,
+            max_object_age,
+            max_open_days,
             ..StreamOptions::default()
         };
         let input = if source.hasattr("__arrow_c_stream__")? {

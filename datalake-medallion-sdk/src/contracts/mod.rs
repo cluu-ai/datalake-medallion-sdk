@@ -26,5 +26,6 @@ pub mod registry;
 
 pub use provider::{EmbeddedSchemaProvider, FileSystemSchemaProvider, SchemaEntry, SchemaProvider};
 pub use registry::{
-    Contract, ContractRegistry, FieldKind, FieldSpec, FlexibilityMode, DEFAULT_EXTENSION_PREFIX,
+    BronzeCompression, Contract, ContractRegistry, FieldKind, FieldSpec, FlexibilityMode,
+    DEFAULT_EXTENSION_PREFIX,
 };

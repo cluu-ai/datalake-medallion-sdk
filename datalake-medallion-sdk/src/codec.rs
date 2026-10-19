@@ -7,10 +7,14 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
+    TimestampMicrosecondBuilder,
+};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::json::LineDelimitedWriter;
 use arrow::record_batch::RecordBatch;
+use chrono::DateTime;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
@@ -27,6 +31,86 @@ pub(crate) fn storage_kind(field: &FieldSpec, pii_masked: bool) -> FieldKind {
     } else {
         field.kind
     }
+}
+
+/// Arrow type of a declared field in Bronze: [`arrow_type`] of its storage
+/// kind, or `timestamp(us, UTC)` for unprotected `x-dl-type: timestamp` fields.
+pub(crate) fn storage_type(field: &FieldSpec, pii_masked: bool) -> DataType {
+    if field.timestamp && !(field.pii && pii_masked) {
+        timestamp_type()
+    } else {
+        arrow_type(storage_kind(field, pii_masked))
+    }
+}
+
+pub(crate) fn timestamp_type() -> DataType {
+    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+}
+
+/// Rows of `batch` grouped by the UTC day of `field` (a timestamp or RFC 3339
+/// text column), in day order. Rows without a usable value go to the day of
+/// `fallback`. Each group is returned with the start of its day.
+pub(crate) fn event_day_groups(
+    batch: &RecordBatch,
+    field: &str,
+    fallback: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<(chrono::DateTime<chrono::Utc>, RecordBatch)>, DatalakeError> {
+    use arrow::array::UInt32Array;
+    use arrow::datatypes::TimestampMicrosecondType;
+    use std::collections::BTreeMap;
+
+    let column = batch.column_by_name(field);
+    let day_of = |i: usize| -> Option<chrono::NaiveDate> {
+        let c = column?;
+        if c.is_null(i) {
+            return None;
+        }
+        match c.data_type() {
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                let micros = c.as_primitive::<TimestampMicrosecondType>().value(i);
+                chrono::DateTime::from_timestamp_micros(micros).map(|t| t.date_naive())
+            }
+            DataType::Utf8 => DateTime::parse_from_rfc3339(c.as_string::<i32>().value(i))
+                .ok()
+                .map(|t| t.with_timezone(&chrono::Utc).date_naive()),
+            _ => None,
+        }
+    };
+    let mut groups: BTreeMap<chrono::NaiveDate, Vec<u32>> = BTreeMap::new();
+    for i in 0..batch.num_rows() {
+        let day = day_of(i).unwrap_or_else(|| fallback.date_naive());
+        let row = u32::try_from(i).map_err(|_| {
+            DatalakeError::storage("arrow", "batch too large to partition by event time")
+        })?;
+        groups.entry(day).or_default().push(row);
+    }
+    groups
+        .into_iter()
+        .map(|(day, rows)| {
+            let part = arrow::compute::take_record_batch(batch, &UInt32Array::from(rows))
+                .map_err(|e| DatalakeError::storage("arrow", e.to_string()))?;
+            let start = day.and_time(chrono::NaiveTime::MIN).and_utc();
+            Ok((start, part))
+        })
+        .collect()
+}
+
+/// Microseconds since the epoch of an RFC 3339 date-time.
+pub(crate) fn timestamp_micros(text: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|t| t.timestamp_micros())
+}
+
+/// A text column of RFC 3339 date-times as `timestamp(us, UTC)`; values that
+/// do not parse become null (callers flag those rows beforehand).
+pub(crate) fn timestamps_from_text(array: &ArrayRef) -> ArrayRef {
+    let text = array.as_string::<i32>();
+    let mut b = TimestampMicrosecondBuilder::with_capacity(text.len()).with_timezone("UTC");
+    for v in text {
+        b.append_option(v.and_then(timestamp_micros));
+    }
+    Arc::new(b.finish())
 }
 
 pub(crate) fn arrow_type(kind: FieldKind) -> DataType {
@@ -91,8 +175,16 @@ pub(crate) fn check_types(
 ) -> Option<Rejection> {
     contract.fields().iter().find_map(|f| {
         let kind = storage_kind(f, pii_masked);
+        let as_timestamp = f.timestamp && !(f.pii && pii_masked);
         match record.get(&f.name) {
             None | Some(Value::Null) => None,
+            Some(Value::String(s)) if as_timestamp && timestamp_micros(s).is_none() => {
+                Some(Rejection::new(
+                    level::TYPE_COERCION,
+                    codes::TYPE_COERCION,
+                    format!("field '{}' expects an RFC 3339 date-time", f.name),
+                ))
+            }
             Some(v) if fits(kind, v) => None,
             Some(_) => Some(Rejection::new(
                 level::TYPE_COERCION,
@@ -113,7 +205,7 @@ pub(crate) fn bronze_schema(
     let mut fields: Vec<Field> = contract
         .fields()
         .iter()
-        .map(|f| Field::new(&f.name, arrow_type(storage_kind(f, pii_masked)), true))
+        .map(|f| Field::new(&f.name, storage_type(f, pii_masked), true))
         .collect();
     if contract.mode().keeps_undeclared() {
         fields.push(Field::new(prefix.extra_column(), DataType::Utf8, true));
@@ -156,7 +248,23 @@ pub(crate) fn declared_columns(
         let values = records
             .iter()
             .map(|r| r.get(&field.name).filter(|v| !v.is_null()));
+        let as_timestamp = field.timestamp && !(field.pii && pii_masked);
         let column: ArrayRef = match storage_kind(field, pii_masked) {
+            FieldKind::String if as_timestamp => {
+                let mut b = TimestampMicrosecondBuilder::with_capacity(rows).with_timezone("UTC");
+                for v in values {
+                    match v {
+                        None => b.append_null(),
+                        Some(Value::String(s)) => {
+                            b.append_value(
+                                timestamp_micros(s).ok_or_else(|| mismatch(&field.name))?,
+                            );
+                        }
+                        Some(_) => return Err(mismatch(&field.name)),
+                    }
+                }
+                Arc::new(b.finish())
+            }
             FieldKind::String => {
                 let mut b = StringBuilder::with_capacity(rows, rows * 16);
                 for v in values {

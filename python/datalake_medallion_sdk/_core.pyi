@@ -225,7 +225,11 @@ class IngestReport:
         """Quarantined records per error code."""
     @property
     def data_uri(self) -> str | None:
-        """``s3://`` URI of the Parquet object, if any record was valid."""
+        """``s3://`` URI of the Parquet object, if any record was valid (the
+        first one when the contract partitions by event time)."""
+    @property
+    def data_uris(self) -> list[str]:
+        """``s3://`` URIs of every Parquet object: one, or one per event day."""
     @property
     def pii_protection(self) -> str:
         """PII scheme of the tenant profile (``none`` when stored as received)."""
@@ -325,6 +329,8 @@ class BronzeIngestionClient:
         max_inflight_parts: int = 4,
         parse_text_columns: bool = False,
         json_lines: bool = False,
+        max_object_seconds: float | None = None,
+        max_open_days: int = 4,
     ) -> StreamReport:
         """Ingest an Arrow stream or an iterable of chunks with bounded memory."""
     @property

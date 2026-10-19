@@ -39,7 +39,7 @@ bytes = "1"
 # Columnar data
 # `chrono-tz`: timestamps with named zones (pyarrow writes "UTC") print as text.
 arrow = { version = "60", features = ["json", "ffi", "chrono-tz"] }
-parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
 
 # Contracts and validation
 # No remote or file $ref resolution: contracts must be self-contained, and

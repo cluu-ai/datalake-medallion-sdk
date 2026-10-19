@@ -160,8 +160,11 @@ pub struct IngestReport {
     pub records_quarantined: usize,
     /// Quarantined records per error code.
     pub rejections: BTreeMap<String, usize>,
-    /// URI of the Parquet object, if any record was valid.
+    /// URI of the Parquet object, if any record was valid (the first one
+    /// when the contract partitions by event time).
     pub data_uri: Option<String>,
+    /// URIs of every Parquet object: one, or one per event day.
+    pub data_uris: Vec<String>,
     /// URIs of dead-letter objects, one per error code.
     pub dlq_uris: Vec<String>,
     /// PII scheme of the tenant profile: `none`, `sha256`, `hmac-sha256`,
@@ -179,7 +182,7 @@ struct PendingObject {
 pub struct PreparedBatch {
     report: IngestReport,
     dead_letters: Vec<PendingObject>,
-    data: Option<PendingObject>,
+    data: Vec<PendingObject>,
 }
 
 impl PreparedBatch {
@@ -316,8 +319,12 @@ impl BronzePipeline {
         &self.storage
     }
 
-    pub(crate) fn encoder(&self) -> &ParquetEncoder {
-        &self.encoder
+    /// Encoder with the contract's compression.
+    pub(crate) fn encoder_for(&self, contract: &Contract) -> ParquetEncoder {
+        match contract.compression() {
+            crate::contracts::BronzeCompression::Snappy => self.encoder.clone(),
+            other => ParquetEncoder::for_contract(other),
+        }
     }
 
     /// Validates and ingests in one step.
@@ -993,13 +1000,27 @@ impl BronzePipeline {
                 content_type: NDJSON_CONTENT_TYPE,
             });
         }
-        let data = match &output.batch {
-            None => None,
-            Some(batch) => Some(PendingObject {
+        let encoder = self.encoder_for(contract);
+        let data = match (&output.batch, contract.partition_by()) {
+            (None, _) => Vec::new(),
+            (Some(batch), None) => vec![PendingObject {
                 path: tenant.data_path(contract.data_type(), &now, batch_id)?,
-                body: self.encoder.encode(std::slice::from_ref(batch))?,
+                body: encoder.encode(std::slice::from_ref(batch))?,
                 content_type: PARQUET_CONTENT_TYPE,
-            }),
+            }],
+            // One object per event day, named after the batch and the day so
+            // a retry with the same batch id rewrites the same keys.
+            (Some(batch), Some(field)) => codec::event_day_groups(batch, field, now)?
+                .into_iter()
+                .map(|(day, part)| {
+                    let file_id = format!("{batch_id}-{}", day.format("%Y%m%d"));
+                    Ok(PendingObject {
+                        path: tenant.data_path(contract.data_type(), &day, &file_id)?,
+                        body: encoder.encode(std::slice::from_ref(&part))?,
+                        content_type: PARQUET_CONTENT_TYPE,
+                    })
+                })
+                .collect::<Result<_, DatalakeError>>()?,
         };
         let records_quarantined = rejections.values().sum();
         Ok(PreparedBatch {
@@ -1010,7 +1031,8 @@ impl BronzePipeline {
                 records_ok: output.records_ok,
                 records_quarantined,
                 rejections,
-                data_uri: data.as_ref().map(|d| d.path.uri.clone()),
+                data_uri: data.first().map(|d| d.path.uri.clone()),
+                data_uris: data.iter().map(|d| d.path.uri.clone()).collect(),
                 dlq_uris: dead_letters.iter().map(|d| d.path.uri.clone()).collect(),
                 pii_protection: pii_protection.to_owned(),
             },
@@ -2333,7 +2355,7 @@ mod columnar_equivalence {
     }
 
     fn outcome(prepared: PreparedBatch) -> Outcome {
-        let data = prepared.data.map(|d| {
+        let data = prepared.data.into_iter().next().map(|d| {
             let batch = ParquetRecordBatchReaderBuilder::try_new(d.body)
                 .unwrap()
                 .build()
@@ -2561,5 +2583,342 @@ mod columnar_equivalence {
             .unwrap();
         assert!(with_hook.columnar.is_none());
         assert_eq!(with_hook.raws.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod storage_option_tests {
+    //! Contract storage options: compression and typed timestamps.
+    use super::*;
+    use crate::storage::InMemoryStorage;
+    use crate::tenant::TenantId;
+    use crate::validation::pii::Sha256Hasher;
+    use arrow::array::{AsArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit, TimestampMicrosecondType};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use serde_json::json;
+
+    const CONTRACT: &str = "app/log/1.0.0";
+
+    fn schema(extra: &Value) -> Value {
+        let mut s = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "x-dl-domain": "app",
+            "x-dl-datatype": "log",
+            "x-dl-schema_version": "1.0.0",
+            "required": ["id"],
+            "properties": {
+                "id": {"type": "string"},
+                "at": {"type": "string", "format": "date-time", "x-dl-type": "timestamp"},
+                "user": {"type": "string", "format": "date-time", "x-dl-type": "timestamp", "x-dl-pii": true}
+            }
+        });
+        if let (Some(base), Some(more)) = (s.as_object_mut(), extra.as_object()) {
+            for (k, v) in more {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        s
+    }
+
+    fn pipeline(storage: &InMemoryStorage, schema: &Value) -> BronzePipeline {
+        let mut r = ContractRegistry::default();
+        r.register(schema).unwrap();
+        BronzePipeline::new(
+            Arc::new(r),
+            Arc::new(storage.clone()),
+            PipelineConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn tenant(hash: bool) -> Arc<TenantProfile> {
+        let p: Option<Arc<dyn FieldProtector>> = if hash {
+            Some(Arc::new(Sha256Hasher))
+        } else {
+            None
+        };
+        Arc::new(
+            TenantProfile::for_bucket(TenantId::new("acme-001").unwrap(), "acme-lake")
+                .unwrap()
+                .pii_protection(p)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn body(storage: &InMemoryStorage, uri: &str) -> bytes::Bytes {
+        storage
+            .get(uri.strip_prefix("s3://").unwrap())
+            .unwrap()
+            .body
+    }
+
+    fn batch(storage: &InMemoryStorage, uri: &str) -> RecordBatch {
+        ParquetRecordBatchReaderBuilder::try_new(body(storage, uri))
+            .unwrap()
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn contract_storage_keywords_are_validated() {
+        for bad in [
+            json!({"x-dl-compression": "brotli"}),
+            json!({"x-dl-compression": "snappy", "x-dl-compression_level": 3}),
+            json!({"x-dl-compression": "zstd", "x-dl-compression_level": 30}),
+            json!({"x-dl-compression": 1}),
+        ] {
+            let mut r = ContractRegistry::default();
+            assert!(r.register(&schema(&bad)).is_err(), "{bad}");
+        }
+        let mut wrong_field = schema(&json!({}));
+        wrong_field["properties"]["id"]["x-dl-type"] = json!("timestamp");
+        assert!(ContractRegistry::default().register(&wrong_field).is_err());
+        let mut r = ContractRegistry::default();
+        r.register(&schema(
+            &json!({"x-dl-compression": "zstd", "x-dl-compression_level": 7}),
+        ))
+        .unwrap();
+        assert_eq!(
+            r.get(CONTRACT).unwrap().compression(),
+            crate::contracts::BronzeCompression::Zstd(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn timestamps_are_stored_typed_on_both_paths() {
+        let rows = vec![
+            json!({"id": "a", "at": "2026-03-01T10:00:00Z"}),
+            json!({"id": "b", "at": "2026-03-01T12:30:00.123456+02:00"}),
+            json!({"id": "c"}),
+        ];
+        let storage = InMemoryStorage::new();
+        let p = pipeline(&storage, &schema(&json!({})));
+        let json_report = p
+            .ingest(IngestRequest::new(
+                tenant(false),
+                CONTRACT,
+                RecordSource::Values(rows),
+            ))
+            .await
+            .unwrap();
+        let arrow_input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("at", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(StringArray::from(vec![
+                    Some("2026-03-01T10:00:00Z"),
+                    Some("2026-03-01T12:30:00.123456+02:00"),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let arrow_report = p
+            .ingest(IngestRequest::new(
+                tenant(false),
+                CONTRACT,
+                RecordSource::Arrow(vec![arrow_input]),
+            ))
+            .await
+            .unwrap();
+        let read = |uri: &str| -> Vec<Option<i64>> {
+            let b = batch(&storage, uri);
+            let col = b.column_by_name("at").unwrap();
+            assert_eq!(
+                col.data_type(),
+                &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            );
+            col.as_primitive::<TimestampMicrosecondType>()
+                .iter()
+                .collect()
+        };
+        let expected = vec![
+            Some(1_772_359_200_000_000),
+            Some(1_772_361_000_123_456),
+            None,
+        ];
+        assert_eq!(read(json_report.data_uri.as_deref().unwrap()), expected);
+        assert_eq!(read(arrow_report.data_uri.as_deref().unwrap()), expected);
+    }
+
+    #[tokio::test]
+    async fn unparseable_timestamps_are_quarantined_and_protected_pii_stays_text() {
+        let storage = InMemoryStorage::new();
+        let p = pipeline(
+            &storage,
+            &schema(&json!({"x-dl-flexibility_mode": "schema_on_read"})),
+        );
+        let r = p
+            .ingest(IngestRequest::new(
+                tenant(false),
+                CONTRACT,
+                RecordSource::Values(vec![
+                    json!({"id": "a", "at": "2026-03-01T10:00:00Z"}),
+                    json!({"id": "b", "at": "yesterday"}),
+                ]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!((r.records_ok, r.records_quarantined), (1, 1));
+        assert_eq!(r.rejections.get(codes::TYPE_COERCION).copied(), Some(1));
+
+        let hashed = p
+            .ingest(IngestRequest::new(
+                tenant(true),
+                CONTRACT,
+                RecordSource::Values(vec![json!({"id": "a", "user": "2026-03-01T10:00:00Z"})]),
+            ))
+            .await
+            .unwrap();
+        let b = batch(&storage, hashed.data_uri.as_deref().unwrap());
+        assert_eq!(
+            b.column_by_name("user").unwrap().data_type(),
+            &DataType::Utf8
+        );
+    }
+
+    #[tokio::test]
+    async fn zstd_objects_record_their_codec() {
+        let storage = InMemoryStorage::new();
+        let p = pipeline(
+            &storage,
+            &schema(&json!({"x-dl-compression": "zstd", "x-dl-compression_level": 3})),
+        );
+        let r = p
+            .ingest(IngestRequest::new(
+                tenant(false),
+                CONTRACT,
+                RecordSource::Values(vec![json!({"id": "a", "at": "2026-03-01T10:00:00Z"})]),
+            ))
+            .await
+            .unwrap();
+        let reader =
+            SerializedFileReader::new(body(&storage, r.data_uri.as_deref().unwrap())).unwrap();
+        let codec = reader.metadata().row_group(0).column(0).compression();
+        assert!(
+            matches!(codec, parquet::basic::Compression::ZSTD(_)),
+            "{codec:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod partition_tests {
+    //! Event-time partitioning (`x-dl-partition_by`).
+    use super::*;
+    use crate::storage::InMemoryStorage;
+    use crate::tenant::TenantId;
+    use serde_json::json;
+
+    const CONTRACT: &str = "app/log/1.0.0";
+
+    fn pipeline(storage: &InMemoryStorage, timestamp: bool) -> BronzePipeline {
+        let mut at = json!({"type": "string", "format": "date-time"});
+        if timestamp {
+            at["x-dl-type"] = json!("timestamp");
+        }
+        let mut r = ContractRegistry::default();
+        r.register(&json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "x-dl-domain": "app",
+            "x-dl-datatype": "log",
+            "x-dl-schema_version": "1.0.0",
+            "x-dl-partition_by": "at",
+            "required": ["id"],
+            "properties": {"id": {"type": "string"}, "at": at}
+        }))
+        .unwrap();
+        let config = PipelineConfig {
+            max_future_skew: None,
+            ..PipelineConfig::default()
+        };
+        BronzePipeline::new(Arc::new(r), Arc::new(storage.clone()), config).unwrap()
+    }
+
+    fn tenant() -> Arc<TenantProfile> {
+        Arc::new(
+            TenantProfile::for_bucket(TenantId::new("acme-001").unwrap(), "acme-lake")
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn rows() -> Vec<Value> {
+        vec![
+            json!({"id": "a", "at": "2026-03-01T23:59:59Z"}),
+            json!({"id": "b", "at": "2026-03-02T00:00:00+00:00"}),
+            json!({"id": "c", "at": "2026-03-01T22:00:00-05:00"}), // 03-02 UTC
+            json!({"id": "d"}),
+        ]
+    }
+
+    #[test]
+    fn partition_by_must_name_a_date_time_field() {
+        let mut r = ContractRegistry::default();
+        let bad = json!({
+            "type": "object", "x-dl-domain": "app", "x-dl-datatype": "log",
+            "x-dl-schema_version": "1.0.0", "x-dl-partition_by": "id",
+            "properties": {"id": {"type": "string"}}
+        });
+        assert!(r.register(&bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn one_object_per_event_day_with_stable_keys() {
+        for timestamp in [false, true] {
+            let storage = InMemoryStorage::new();
+            let p = pipeline(&storage, timestamp);
+            let id = Ulid::generate().to_string();
+            let report = p
+                .ingest(
+                    IngestRequest::new(tenant(), CONTRACT, RecordSource::Values(rows()))
+                        .with_batch_id(id.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(report.records_ok, 4);
+            let today = ulid_time(Ulid::from_string(&id).unwrap())
+                .format("%Y%m%d")
+                .to_string();
+            let mut expected = vec![
+                format!("year=2026/month=03/day=01/{id}-20260301.parquet"),
+                format!("year=2026/month=03/day=02/{id}-20260302.parquet"),
+            ];
+            if today != "20260301" && today != "20260302" {
+                expected.push(format!("{id}-{today}.parquet"));
+            }
+            assert_eq!(
+                report.data_uris.len(),
+                expected.len(),
+                "{:?}",
+                report.data_uris
+            );
+            for (uri, tail) in report.data_uris.iter().zip(&expected) {
+                assert!(uri.ends_with(tail), "{uri} vs {tail}");
+            }
+            assert_eq!(report.data_uri.as_ref(), report.data_uris.first());
+            let keys = storage.keys();
+            let again = p
+                .ingest(
+                    IngestRequest::new(tenant(), CONTRACT, RecordSource::Values(rows()))
+                        .with_batch_id(id.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(again.data_uris, report.data_uris);
+            assert_eq!(storage.keys(), keys, "a retry rewrites the same objects");
+        }
     }
 }
