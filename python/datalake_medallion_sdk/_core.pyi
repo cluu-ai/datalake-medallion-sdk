@@ -22,6 +22,7 @@ __all__ = [
     "SchemaViolationError",
     "SemanticViolationError",
     "StorageError",
+    "StreamReport",
     "TenantProfile",
     "TenantRegistry",
     "TenantViolationError",
@@ -233,6 +234,36 @@ class IngestReport:
         """``s3://`` URIs of the dead-letter objects, one per error code."""
 
 @final
+class StreamReport:
+    """Outcome of :meth:`BronzeIngestionClient.ingest_stream`."""
+
+    @property
+    def stream_id(self) -> str:
+        """ULID of the stream; prefix of every object it wrote."""
+    @property
+    def tenant_id(self) -> str: ...
+    @property
+    def records_received(self) -> int: ...
+    @property
+    def records_ok(self) -> int: ...
+    @property
+    def records_quarantined(self) -> int: ...
+    @property
+    def rejections(self) -> dict[str, int]:
+        """Quarantined records per error code."""
+    @property
+    def data_uris(self) -> list[str]:
+        """``s3://`` URIs of the Parquet objects, in order."""
+    @property
+    def dlq_uris(self) -> list[str]:
+        """``s3://`` URIs of the quarantine objects."""
+    @property
+    def bytes_written(self) -> int:
+        """Bytes uploaded (Parquet and quarantine objects)."""
+    @property
+    def pii_protection(self) -> str: ...
+
+@final
 class BronzeIngestionClient:
     """Validating Bronze writer for S3 and S3-compatible object stores.
 
@@ -279,6 +310,22 @@ class BronzeIngestionClient:
             RecordRejectedError: a record is invalid and ``on_invalid="raise"``.
             StorageError: encoding or upload failed.
         """
+    async def ingest_stream(
+        self,
+        source: Any,
+        *,
+        tenant: TenantProfile | str,
+        contract: str,
+        stream_id: str | None = None,
+        target_object_mb: int = 256,
+        part_mb: int = 16,
+        row_group_mb: int = 64,
+        chunk_rows: int = 131072,
+        max_inflight_parts: int = 4,
+        parse_text_columns: bool = False,
+        json_lines: bool = False,
+    ) -> StreamReport:
+        """Ingest an Arrow stream or an iterable of chunks with bounded memory."""
     @property
     def tenant_ids(self) -> list[str]: ...
     @property

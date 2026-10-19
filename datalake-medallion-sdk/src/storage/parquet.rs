@@ -42,6 +42,12 @@ impl ParquetEncoder {
         Self { properties }
     }
 
+    /// Writer properties (compression, statistics, version).
+    #[must_use]
+    pub fn properties(&self) -> &WriterProperties {
+        &self.properties
+    }
+
     /// Encodes `batches` (all with the same schema) into one Parquet file.
     ///
     /// # Errors

@@ -24,6 +24,17 @@ pub struct StoredObject {
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryStorage {
     objects: Arc<Mutex<BTreeMap<String, StoredObject>>>,
+    uploads: Arc<Mutex<Uploads>>,
+}
+
+/// Content type and parts (by number) of an unfinished upload.
+type OpenUpload = (String, BTreeMap<i32, Bytes>);
+
+/// Unfinished multipart uploads by id.
+#[derive(Debug, Default)]
+struct Uploads {
+    next_id: u64,
+    open: BTreeMap<String, OpenUpload>,
 }
 
 impl InMemoryStorage {
@@ -37,6 +48,18 @@ impl InMemoryStorage {
         self.objects
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn uploads(&self) -> MutexGuard<'_, Uploads> {
+        self.uploads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Multipart uploads started and neither completed nor aborted.
+    #[must_use]
+    pub fn open_uploads(&self) -> usize {
+        self.uploads().open.len()
     }
 
     /// Copy of the object at `bucket/key` (an `s3://` URI without the scheme).
@@ -79,6 +102,66 @@ impl ObjectStorage for InMemoryStorage {
                 content_type: content_type.to_owned(),
             },
         );
+        Ok(())
+    }
+
+    async fn create_multipart(
+        &self,
+        path: &ObjectPath,
+        content_type: &str,
+    ) -> Result<String, DatalakeError> {
+        let mut uploads = self.uploads();
+        uploads.next_id += 1;
+        let id = format!("{}#{}", path.uri, uploads.next_id);
+        uploads
+            .open
+            .insert(id.clone(), (content_type.to_owned(), BTreeMap::new()));
+        Ok(id)
+    }
+
+    async fn upload_part(
+        &self,
+        _path: &ObjectPath,
+        upload_id: &str,
+        part_number: i32,
+        body: Bytes,
+    ) -> Result<String, DatalakeError> {
+        let mut uploads = self.uploads();
+        let (_, parts) = uploads
+            .open
+            .get_mut(upload_id)
+            .ok_or_else(|| DatalakeError::storage("memory", "unknown upload id"))?;
+        parts.insert(part_number, body);
+        Ok(format!("etag-{part_number}"))
+    }
+
+    async fn complete_multipart(
+        &self,
+        path: &ObjectPath,
+        upload_id: &str,
+        parts: Vec<(i32, String)>,
+    ) -> Result<(), DatalakeError> {
+        let (content_type, stored) = self
+            .uploads()
+            .open
+            .remove(upload_id)
+            .ok_or_else(|| DatalakeError::storage("memory", "unknown upload id"))?;
+        let mut body = Vec::new();
+        for (number, _) in &parts {
+            let part = stored
+                .get(number)
+                .ok_or_else(|| DatalakeError::storage("memory", "missing part"))?;
+            body.extend_from_slice(part);
+        }
+        self.put(path, Bytes::from(body), &content_type).await
+    }
+
+    async fn abort_multipart(
+        &self,
+        _path: &ObjectPath,
+        upload_id: &str,
+    ) -> Result<(), DatalakeError> {
+        self.uploads().open.remove(upload_id);
         Ok(())
     }
 }

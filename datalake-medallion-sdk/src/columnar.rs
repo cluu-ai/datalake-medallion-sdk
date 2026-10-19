@@ -312,6 +312,13 @@ impl ColumnarPlan {
                 (_, FieldKind::String, DataType::LargeUtf8 | DataType::Utf8View) => {
                     cast(array, &DataType::Utf8).map_err(arrow_error)?
                 }
+                // Dates and timestamps (pyarrow infers them from CSV and
+                // Parquet) as the same text the row path's JSON gives them.
+                (
+                    _,
+                    FieldKind::String,
+                    DataType::Timestamp(..) | DataType::Date32 | DataType::Date64,
+                ) => cast(array, &DataType::Utf8).map_err(arrow_error)?,
                 (
                     _,
                     FieldKind::Integer | FieldKind::Number,

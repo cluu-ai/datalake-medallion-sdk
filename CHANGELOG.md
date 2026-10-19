@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0rc6] - 2026-10-18
+
+### Added
+
+- Streaming ingestion with bounded memory: `BronzeIngestionClient.ingest_stream(source, ...)` for any Arrow stream or iterable of chunks, and `ingest_file(path, ...)` for CSV, TSV, JSON Lines and Parquet files, local or on S3, optionally compressed. Chunks are validated exactly like `ingest`. Accepted rows go to Parquet objects of about `target_object_mb` (256 MB), uploaded with S3 multipart upload in parallel parts while the next chunk is validated. Objects are named after the stream id, so a retry with the same `stream_id` rewrites the same keys. Unfinished uploads are aborted on error. Returns a `StreamReport`.
+- Rust: `BronzePipeline::stream` / `ingest_stream`, `BronzeStream`, `StreamOptions`, `StreamReport`; `ObjectStorage` gains multipart methods (S3 and in-memory adapters implement them; other stores fall back to one `put` per object).
+- `RecordSource::JsonLines` (one record per line, a malformed line quarantined alone) and `RecordSource::ArrowText` (text columns parsed with the contract's types, as for CSV).
+- JSON Lines that fit the contract are parsed straight into typed Arrow columns and validated column by column; lines with `null`, and blocks that do not fit, keep the row path, with identical results.
+
+### Fixed
+
+- Arrow input with timestamps in a named time zone (pyarrow's `timestamp[..., tz=UTC]`, inferred from CSV and Parquet) failed with "Invalid timezone"; dates and timestamps given for `string` fields are now stored as their date-time text, on the columnar path.
+
 ## [0.2.0rc5] - 2026-10-18
 
 ### Added

@@ -22,6 +22,7 @@ use crate::pipeline::{
     DEFAULT_MAX_RECORD_BYTES,
 };
 use crate::storage::{InMemoryStorage, S3Options, S3Storage, StaticCredentials};
+use crate::stream::{BronzeStream, StreamOptions, StreamReport};
 use crate::tenant::{TenantDirectory, TenantProfile, TenantRegistry};
 use crate::validation::hooks::RecordHook;
 
@@ -58,6 +59,66 @@ impl From<IngestReport> for PyIngestReport {
             pii_protection: r.pii_protection,
         }
     }
+}
+
+/// Outcome of `BronzeIngestionClient.ingest_stream`.
+#[pyclass(
+    name = "StreamReport",
+    module = "datalake_medallion_sdk._core",
+    frozen,
+    get_all
+)]
+pub(crate) struct PyStreamReport {
+    stream_id: String,
+    tenant_id: String,
+    records_received: usize,
+    records_ok: usize,
+    records_quarantined: usize,
+    rejections: BTreeMap<String, usize>,
+    data_uris: Vec<String>,
+    dlq_uris: Vec<String>,
+    bytes_written: u64,
+    pii_protection: String,
+}
+
+impl From<StreamReport> for PyStreamReport {
+    fn from(r: StreamReport) -> Self {
+        Self {
+            stream_id: r.stream_id,
+            tenant_id: r.tenant_id,
+            records_received: r.records_received,
+            records_ok: r.records_ok,
+            records_quarantined: r.records_quarantined,
+            rejections: r.rejections,
+            data_uris: r.data_uris,
+            dlq_uris: r.dlq_uris,
+            bytes_written: r.bytes_written,
+            pii_protection: r.pii_protection,
+        }
+    }
+}
+
+#[pymethods]
+impl PyStreamReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "StreamReport(tenant_id={:?}, stream_id={:?}, records_received={}, records_ok={}, records_quarantined={}, objects={})",
+            self.tenant_id,
+            self.stream_id,
+            self.records_received,
+            self.records_ok,
+            self.records_quarantined,
+            self.data_uris.len()
+        )
+    }
+}
+
+/// Where a stream's chunks come from.
+enum StreamInput {
+    /// An Arrow C stream, read batch by batch without the GIL.
+    Arrow(ArrowArrayStreamReader),
+    /// A Python iterator of chunks, each converted like an `ingest` batch.
+    Iter(Py<PyAny>),
 }
 
 #[pymethods]
@@ -253,6 +314,90 @@ impl PyBronzeIngestionClient {
         })
     }
 
+    /// Ingests input of any size with bounded memory: validated in chunks,
+    /// written as Parquet objects of about `target_object_mb` uploaded in
+    /// parts while the next chunk is validated.
+    ///
+    /// `source` is an Arrow stream (any object with `__arrow_c_stream__`:
+    /// a pyarrow `RecordBatchReader` or `Table`, a Polars data frame, a
+    /// `DuckDB` result...), read batch by batch without the GIL; or an iterable
+    /// of chunks, each one anything `ingest` accepts. With
+    /// `parse_text_columns`, text columns of `integer`, `number` and
+    /// `boolean` fields are parsed (CSV read as text). With `json_lines`,
+    /// `str`/`bytes` chunks are JSON Lines.
+    #[pyo3(signature = (
+        source,
+        *,
+        tenant,
+        contract,
+        stream_id = None,
+        target_object_mb = 256,
+        part_mb = 16,
+        row_group_mb = 64,
+        chunk_rows = 131_072,
+        max_inflight_parts = 4,
+        parse_text_columns = false,
+        json_lines = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_stream<'py>(
+        &self,
+        py: Python<'py>,
+        source: &Bound<'py, PyAny>,
+        tenant: &Bound<'py, PyAny>,
+        contract: &str,
+        stream_id: Option<String>,
+        target_object_mb: usize,
+        part_mb: usize,
+        row_group_mb: usize,
+        chunk_rows: usize,
+        max_inflight_parts: usize,
+        parse_text_columns: bool,
+        json_lines: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        const MIB: usize = 1024 * 1024;
+        let tenant = self.resolve(tenant)?;
+        self.parts.registry.get(contract)?;
+        let options = StreamOptions {
+            stream_id,
+            target_object_bytes: target_object_mb.saturating_mul(MIB),
+            part_bytes: part_mb.saturating_mul(MIB),
+            row_group_bytes: row_group_mb.saturating_mul(MIB),
+            chunk_rows,
+            max_inflight_parts,
+            ..StreamOptions::default()
+        };
+        let input = if source.hasattr("__arrow_c_stream__")? {
+            StreamInput::Arrow(ArrowArrayStreamReader::from_pyarrow_bound(source)?)
+        } else {
+            StreamInput::Iter(source.try_iter()?.into_any().unbind())
+        };
+        let hook = self.hooks.get(contract).cloned();
+        let contract = contract.to_owned();
+        let parts = Arc::clone(&self.parts);
+        let cell = Arc::clone(&self.pipeline);
+        future_into_py(py, async move {
+            let pipeline = cell
+                .get_or_try_init(|| async {
+                    let storage = S3Storage::connect(parts.s3.clone()).await;
+                    BronzePipeline::new(
+                        Arc::clone(&parts.registry),
+                        Arc::new(storage),
+                        parts.config.clone(),
+                    )
+                    .map(Arc::new)
+                })
+                .await?;
+            let stream = pipeline.stream(tenant, &contract, hook, options)?;
+            let report = tokio::task::spawn_blocking(move || {
+                drive(stream, input, parse_text_columns, json_lines)
+            })
+            .await
+            .map_err(|e| DatalakeError::storage("runtime", format!("stream task failed: {e}")))??;
+            Ok(PyStreamReport::from(report))
+        })
+    }
+
     /// Tenant ids of the client's `tenants` registry (empty without one).
     #[getter]
     fn tenant_ids(&self) -> Vec<String> {
@@ -299,6 +444,69 @@ impl PyBronzeIngestionClient {
         })?;
         Ok(registry.resolve(&tenant_id)?)
     }
+}
+
+/// Feeds every chunk of `input` to `stream` and finishes it. Runs on a
+/// blocking thread; takes the GIL only to pull Python chunks.
+fn drive(
+    mut stream: BronzeStream,
+    input: StreamInput,
+    parse_text_columns: bool,
+    json_lines: bool,
+) -> PyResult<StreamReport> {
+    match input {
+        StreamInput::Arrow(reader) => {
+            for batch in reader {
+                let batch = batch.map_err(|e| DatalakeError::MalformedPayload {
+                    reason: format!("cannot read Arrow stream: {e}"),
+                })?;
+                stream.push(if parse_text_columns {
+                    RecordSource::ArrowText(vec![batch])
+                } else {
+                    RecordSource::Arrow(vec![batch])
+                })?;
+            }
+        }
+        StreamInput::Iter(iterator) => {
+            while let Some(records) = Python::attach(|py| {
+                next_chunk(py, iterator.bind(py), parse_text_columns, json_lines)
+            })? {
+                stream.push(records)?;
+            }
+        }
+    }
+    Ok(stream.finish()?)
+}
+
+/// Next chunk of a Python iterator, converted like an `ingest` batch.
+fn next_chunk(
+    py: Python<'_>,
+    iterator: &Bound<'_, PyAny>,
+    parse_text_columns: bool,
+    json_lines: bool,
+) -> PyResult<Option<RecordSource>> {
+    let item = match iterator.call_method0("__next__") {
+        Ok(item) => item,
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if json_lines {
+        if let Ok(text) = item.extract::<String>() {
+            return Ok(Some(RecordSource::JsonLines(text)));
+        }
+        if let Ok(raw) = item.cast::<PyBytes>() {
+            let text = String::from_utf8(raw.as_bytes().to_vec()).map_err(|e| {
+                DatalakeError::MalformedPayload {
+                    reason: format!("chunk is not UTF-8: {e}"),
+                }
+            })?;
+            return Ok(Some(RecordSource::JsonLines(text)));
+        }
+    }
+    Ok(Some(match to_source(py, &item)? {
+        RecordSource::Arrow(batches) if parse_text_columns => RecordSource::ArrowText(batches),
+        other => other,
+    }))
 }
 
 fn to_source(py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<RecordSource> {

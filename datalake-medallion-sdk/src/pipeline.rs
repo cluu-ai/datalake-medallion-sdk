@@ -86,6 +86,14 @@ pub enum RecordSource {
     Values(Vec<Value>),
     /// Arrow batches; each row is validated like a JSON object.
     Arrow(Vec<RecordBatch>),
+    /// JSON Lines text: one JSON object per line, blank lines ignored. A
+    /// malformed line is quarantined on its own.
+    JsonLines(String),
+    /// Arrow batches whose text columns hold values of other declared types,
+    /// as read from CSV: `integer`, `number` and `boolean` fields are parsed
+    /// from text. A value that does not parse quarantines its record with the
+    /// original text.
+    ArrowText(Vec<RecordBatch>),
 }
 
 /// One ingest call. The tenant profile decides where the records go and how
@@ -183,6 +191,8 @@ impl PreparedBatch {
 enum Raw {
     Text(Box<RawValue>),
     Parsed(Value),
+    /// A line of a JSON Lines chunk, not parsed yet.
+    Line(Arc<str>, std::ops::Range<usize>),
 }
 
 enum State {
@@ -191,11 +201,24 @@ enum State {
 }
 
 /// Values fixed for one ingest call and shared by the later stages.
-struct CallContext<'a> {
-    tenant: &'a TenantProfile,
-    batch_id: String,
-    now: DateTime<Utc>,
-    protector: Option<&'a dyn FieldProtector>,
+pub(crate) struct CallContext<'a> {
+    pub(crate) tenant: &'a TenantProfile,
+    pub(crate) batch_id: String,
+    pub(crate) now: DateTime<Utc>,
+    pub(crate) protector: Option<&'a dyn FieldProtector>,
+    /// Index of the first record within its call or stream (dead letters
+    /// report positions in the whole input).
+    pub(crate) index_offset: usize,
+}
+
+/// Validated output of one chunk, before encoding.
+pub(crate) struct ChunkOutput {
+    pub(crate) received: usize,
+    pub(crate) records_ok: usize,
+    /// Accepted records with their lineage columns.
+    pub(crate) batch: Option<RecordBatch>,
+    /// Rejected records by error code.
+    pub(crate) dead_letters: BTreeMap<String, Vec<DeadLetter>>,
 }
 
 /// Decoded input: rows already accepted by the columnar path, and the rest,
@@ -277,6 +300,14 @@ impl BronzePipeline {
         &self.config
     }
 
+    pub(crate) fn storage(&self) -> &Arc<dyn ObjectStorage> {
+        &self.storage
+    }
+
+    pub(crate) fn encoder(&self) -> &ParquetEncoder {
+        &self.encoder
+    }
+
     /// Validates and ingests in one step.
     ///
     /// # Errors
@@ -308,26 +339,41 @@ impl BronzePipeline {
             batch_id: Ulid::generate().to_string(),
             now: Utc::now(),
             protector: bound.as_deref(),
+            index_offset: 0,
         };
+        let output =
+            self.validate_chunk(&contract, &call, request.records, request.hook.as_ref())?;
+        self.package(&contract, &call, &output)
+    }
+
+    /// Levels 2 to 8 for one chunk of records: accepted rows as one batch with
+    /// lineage columns, rejected ones as dead letters. Performs no I/O.
+    pub(crate) fn validate_chunk(
+        &self,
+        contract: &Arc<Contract>,
+        call: &CallContext<'_>,
+        records: RecordSource,
+        hook: Option<&Arc<dyn RecordHook>>,
+    ) -> Result<ChunkOutput, DatalakeError> {
         let Decoded {
             received,
             columnar,
             raws,
-        } = self.decode(&contract, &call, request.records, request.hook.is_some())?;
+        } = self.decode(contract, call, records, hook.is_some())?;
 
         let mut slots: Vec<Slot> = if raws.len() >= PARALLEL_THRESHOLD {
             raws.into_par_iter()
-                .map(|(i, raw)| self.admit(&contract, i, raw))
+                .map(|(i, raw)| self.admit(contract, i, raw))
                 .collect()
         } else {
             raws.into_iter()
-                .map(|(i, raw)| self.admit(&contract, i, raw))
+                .map(|(i, raw)| self.admit(contract, i, raw))
                 .collect()
         };
 
-        if let Some(hook) = &request.hook {
+        if let Some(hook) = hook {
             for slot in &mut slots {
-                self.run_hook(&contract, hook.as_ref(), slot);
+                self.run_hook(contract, hook.as_ref(), slot);
             }
         }
 
@@ -352,10 +398,10 @@ impl BronzePipeline {
         if slots.len() >= PARALLEL_THRESHOLD {
             slots
                 .par_iter_mut()
-                .for_each(|slot| self.finish(&contract, &call, slot));
+                .for_each(|slot| self.finish(contract, call, slot));
         } else {
             for slot in &mut slots {
-                self.finish(&contract, &call, slot);
+                self.finish(contract, call, slot);
             }
         }
 
@@ -364,11 +410,14 @@ impl BronzePipeline {
                 State::Rejected(r, _) => Some((s.index, r)),
                 State::Valid(_) => None,
             }) {
-                return Err(DatalakeError::rejected(index, rejection));
+                return Err(DatalakeError::rejected(
+                    call.index_offset + index,
+                    rejection,
+                ));
             }
         }
 
-        self.assemble(&contract, &call, received, slots, columnar)
+        self.collect(contract, call, received, slots, columnar)
     }
 
     /// Uploads a prepared batch: dead-letter objects first, then data.
@@ -409,6 +458,12 @@ impl BronzePipeline {
         source: RecordSource,
         has_hook: bool,
     ) -> Result<Decoded, DatalakeError> {
+        let source = match source {
+            RecordSource::ArrowText(batches) => {
+                return self.decode_text(contract, call, &batches, has_hook);
+            }
+            other => other,
+        };
         if let RecordSource::Arrow(batches) = &source {
             // Hooks see and may rewrite whole records, so they need the row path.
             if self.config.arrow_fast_path && !has_hook {
@@ -417,12 +472,156 @@ impl BronzePipeline {
                 }
             }
         }
+        let source = match source {
+            RecordSource::JsonLines(text) if self.config.arrow_fast_path && !has_hook => {
+                return self.decode_json_lines(contract, call, text);
+            }
+            other => other,
+        };
         let raws = decode_rows(source)?;
         Ok(Decoded {
             received: raws.len(),
             columnar: None,
             raws: raws.into_iter().enumerate().collect(),
         })
+    }
+
+    /// JSON Lines through the columnar screen: lines are parsed straight to
+    /// typed Arrow with the contract's schema. Lines with an explicit `null`
+    /// (which JSON Schema treats differently from an absent field) or above
+    /// the size limit, and every line of a block that does not parse as the
+    /// declared types, take the row path, so results match it exactly.
+    fn decode_json_lines(
+        &self,
+        contract: &Contract,
+        call: &CallContext<'_>,
+        text: String,
+    ) -> Result<Decoded, DatalakeError> {
+        let text: Arc<str> = Arc::from(text);
+        let lines = line_ranges(&text);
+        let schema = match (contract.columnar(), codec::json_input_schema(contract)) {
+            (Some(_), Some(schema)) => Arc::new(schema),
+            _ => {
+                return Ok(Decoded {
+                    received: lines.len(),
+                    columnar: None,
+                    raws: lines
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, r)| (i, Raw::Line(Arc::clone(&text), r)))
+                        .collect(),
+                })
+            }
+        };
+        let max = self.config.max_record_bytes;
+        let (typed, rows): (Vec<usize>, Vec<usize>) = (0..lines.len()).partition(|&i| {
+            let line = &text.as_bytes()[lines[i].clone()];
+            line.len() <= max && !contains(line, b"null")
+        });
+        let row_path = |indices: &[usize]| -> Vec<(usize, Raw)> {
+            indices
+                .iter()
+                .map(|&i| (i, Raw::Line(Arc::clone(&text), lines[i].clone())))
+                .collect()
+        };
+        let parsed = if typed.is_empty() {
+            None
+        } else {
+            let mut buffer = Vec::with_capacity(text.len());
+            for &i in &typed {
+                buffer.extend_from_slice(&text.as_bytes()[lines[i].clone()]);
+                buffer.push(b'\n');
+            }
+            parse_json_lines(&buffer, &schema).filter(|b| b.num_rows() == typed.len())
+        };
+        let Some(batch) = parsed else {
+            let all: Vec<usize> = (0..lines.len()).collect();
+            return Ok(Decoded {
+                received: lines.len(),
+                columnar: None,
+                raws: row_path(&all),
+            });
+        };
+        let Some(mut decoded) = self.decode_columnar(contract, call, &[batch])? else {
+            let all: Vec<usize> = (0..lines.len()).collect();
+            return Ok(Decoded {
+                received: lines.len(),
+                columnar: None,
+                raws: row_path(&all),
+            });
+        };
+        // Indices refer to the parsed lines; map them back to the chunk.
+        if let Some(columnar) = decoded.columnar.as_mut() {
+            for i in &mut columnar.indices {
+                *i = typed[*i];
+            }
+        }
+        for (i, _) in &mut decoded.raws {
+            *i = typed[*i];
+        }
+        decoded.raws.extend(row_path(&rows));
+        decoded.raws.sort_unstable_by_key(|(i, _)| *i);
+        decoded.received = lines.len();
+        Ok(decoded)
+    }
+
+    /// Text columns parsed into their declared types; rows whose values do
+    /// not parse keep their original text and go to the row path, where the
+    /// contract rejects them.
+    fn decode_text(
+        &self,
+        contract: &Contract,
+        call: &CallContext<'_>,
+        batches: &[RecordBatch],
+        has_hook: bool,
+    ) -> Result<Decoded, DatalakeError> {
+        let batch = match batches {
+            [] => {
+                return Ok(Decoded {
+                    received: 0,
+                    columnar: None,
+                    raws: Vec::new(),
+                })
+            }
+            [one] => one.clone(),
+            [first, ..] => concat_batches(&first.schema(), batches).map_err(|e| {
+                DatalakeError::MalformedPayload {
+                    reason: format!("cannot combine Arrow batches: {e}"),
+                }
+            })?,
+        };
+        let received = batch.num_rows();
+        let coerced = codec::coerce_text(contract, &batch)?;
+        let mut decoded = if coerced.typed.num_rows() == 0 {
+            Decoded {
+                received: 0,
+                columnar: None,
+                raws: Vec::new(),
+            }
+        } else {
+            let typed = RecordSource::Arrow(vec![coerced.typed]);
+            self.decode(contract, call, typed, has_hook)?
+        };
+        // Indices refer to the parsed rows; map them back to the input.
+        let original = |i: usize| coerced.kept[i];
+        if let Some(columnar) = decoded.columnar.as_mut() {
+            for i in &mut columnar.indices {
+                *i = original(*i);
+            }
+        }
+        for (i, _) in &mut decoded.raws {
+            *i = original(*i);
+        }
+        if let Some((rest, indices)) = coerced.unparsed {
+            decoded.raws.extend(
+                indices
+                    .into_iter()
+                    .zip(codec::arrow_rows(&[rest])?.into_iter().map(Raw::Text)),
+            );
+            decoded.raws.sort_unstable_by_key(|(i, _)| *i);
+        }
+        decoded.received = received;
+        Ok(decoded)
     }
 
     fn decode_columnar(
@@ -491,7 +690,31 @@ impl BronzePipeline {
                 None,
             ),
         };
+        let parse = |text: &str| -> Result<(usize, Value), Slot> {
+            let bytes = text.len();
+            if bytes > max {
+                return Err(too_large(bytes));
+            }
+            serde_json::from_str::<Value>(text)
+                .map(|v| (bytes, v))
+                .map_err(|e| Slot {
+                    index,
+                    bytes,
+                    state: State::Rejected(
+                        Rejection::new(
+                            level::PAYLOAD,
+                            codes::RECORD_NOT_OBJECT,
+                            format!("record is not valid JSON: {e}"),
+                        ),
+                        None,
+                    ),
+                })
+        };
         let (bytes, value) = match raw {
+            Raw::Line(chunk, range) => match parse(&chunk[range]) {
+                Ok(parsed) => parsed,
+                Err(slot) => return slot,
+            },
             Raw::Text(text) => {
                 let bytes = text.get().len();
                 if bytes > max {
@@ -613,14 +836,14 @@ impl BronzePipeline {
         }
     }
 
-    fn assemble(
+    fn collect(
         &self,
         contract: &Contract,
         call: &CallContext<'_>,
         received: usize,
         slots: Vec<Slot>,
         columnar: Option<ColumnarRows>,
-    ) -> Result<PreparedBatch, DatalakeError> {
+    ) -> Result<ChunkOutput, DatalakeError> {
         let (tenant, batch_id, now) = (call.tenant, call.batch_id.as_str(), call.now);
         let pii_protection = tenant.pii_scheme();
         let mut valid = Vec::new();
@@ -640,7 +863,7 @@ impl BronzePipeline {
                         .or_default()
                         .push(DeadLetter {
                             batch_id: batch_id.to_owned(),
-                            record_index: slot.index,
+                            record_index: call.index_offset + slot.index,
                             tenant_id: tenant.tenant_id().to_string(),
                             contract: contract.key().to_owned(),
                             data_type: contract.data_type().to_owned(),
@@ -657,19 +880,8 @@ impl BronzePipeline {
             }
         }
 
-        let mut dead_letters = Vec::with_capacity(by_code.len());
-        let mut rejections = BTreeMap::new();
-        for (code, entries) in &by_code {
-            rejections.insert(code.clone(), entries.len());
-            dead_letters.push(PendingObject {
-                path: tenant.dlq_path(contract.data_type(), code, &now, batch_id)?,
-                body: dlq::encode_ndjson(entries)?,
-                content_type: NDJSON_CONTENT_TYPE,
-            });
-        }
-
         let records_ok = valid.len() + columnar.as_ref().map_or(0, |c| c.indices.len());
-        let data = if records_ok == 0 {
+        let batch = if records_ok == 0 {
             None
         } else {
             let envelope = Envelope {
@@ -692,28 +904,57 @@ impl BronzePipeline {
                     &valid_indices,
                 )?,
             };
-            let batch = codec::finish_batch(
+            Some(codec::finish_batch(
                 contract,
                 &self.config.envelope_prefix,
                 columns,
                 &envelope,
                 pii_masked,
                 records_ok,
-            )?;
-            Some(PendingObject {
-                path: tenant.data_path(contract.data_type(), &now, batch_id)?,
-                body: self.encoder.encode(&[batch])?,
-                content_type: PARQUET_CONTENT_TYPE,
-            })
+            )?)
         };
+        Ok(ChunkOutput {
+            received,
+            records_ok,
+            batch,
+            dead_letters: by_code,
+        })
+    }
 
+    /// Objects and report of a single-call ingest.
+    fn package(
+        &self,
+        contract: &Contract,
+        call: &CallContext<'_>,
+        output: &ChunkOutput,
+    ) -> Result<PreparedBatch, DatalakeError> {
+        let (tenant, batch_id, now) = (call.tenant, call.batch_id.as_str(), call.now);
+        let pii_protection = tenant.pii_scheme();
+        let mut dead_letters = Vec::with_capacity(output.dead_letters.len());
+        let mut rejections = BTreeMap::new();
+        for (code, entries) in &output.dead_letters {
+            rejections.insert(code.clone(), entries.len());
+            dead_letters.push(PendingObject {
+                path: tenant.dlq_path(contract.data_type(), code, &now, batch_id)?,
+                body: dlq::encode_ndjson(entries)?,
+                content_type: NDJSON_CONTENT_TYPE,
+            });
+        }
+        let data = match &output.batch {
+            None => None,
+            Some(batch) => Some(PendingObject {
+                path: tenant.data_path(contract.data_type(), &now, batch_id)?,
+                body: self.encoder.encode(std::slice::from_ref(batch))?,
+                content_type: PARQUET_CONTENT_TYPE,
+            }),
+        };
         let records_quarantined = rejections.values().sum();
         Ok(PreparedBatch {
             report: IngestReport {
                 batch_id: batch_id.to_owned(),
                 tenant_id: tenant.tenant_id().to_string(),
-                records_received: received,
-                records_ok,
+                records_received: output.received,
+                records_ok: output.records_ok,
                 records_quarantined,
                 rejections,
                 data_uri: data.as_ref().map(|d| d.path.uri.clone()),
@@ -724,6 +965,43 @@ impl BronzePipeline {
             data,
         })
     }
+}
+
+/// Byte ranges of the non-blank lines of `text`, without line breaks.
+fn line_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        if !content.trim().is_empty() {
+            out.push(start..start + content.len());
+        }
+        start += line.len();
+    }
+    out
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Parses newline-delimited JSON objects into one batch of `schema`; `None`
+/// when a value does not fit its declared type or a field is undeclared.
+fn parse_json_lines(buffer: &[u8], schema: &Arc<arrow::datatypes::Schema>) -> Option<RecordBatch> {
+    let mut decoder = arrow::json::ReaderBuilder::new(Arc::clone(schema))
+        .with_strict_mode(true)
+        .with_batch_size(buffer.len().max(1))
+        .build_decoder()
+        .ok()?;
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let read = decoder.decode(&buffer[offset..]).ok()?;
+        if read == 0 {
+            break;
+        }
+        offset += read;
+    }
+    decoder.flush().ok()?
 }
 
 fn decode_rows(source: RecordSource) -> Result<Vec<Raw>, DatalakeError> {
@@ -745,10 +1023,19 @@ fn decode_rows(source: RecordSource) -> Result<Vec<Raw>, DatalakeError> {
             }
         }
         RecordSource::Values(values) => Ok(values.into_iter().map(Raw::Parsed).collect()),
-        RecordSource::Arrow(batches) => Ok(codec::arrow_rows(&batches)?
-            .into_iter()
-            .map(Raw::Text)
-            .collect()),
+        RecordSource::JsonLines(text) => {
+            let text: Arc<str> = Arc::from(text);
+            Ok(line_ranges(&text)
+                .into_iter()
+                .map(|r| Raw::Line(Arc::clone(&text), r))
+                .collect())
+        }
+        RecordSource::Arrow(batches) | RecordSource::ArrowText(batches) => {
+            Ok(codec::arrow_rows(&batches)?
+                .into_iter()
+                .map(Raw::Text)
+                .collect())
+        }
     }
 }
 
@@ -2111,6 +2398,7 @@ mod columnar_equivalence {
             batch_id: String::new(),
             now: Utc::now(),
             protector: tenant.protector(),
+            index_offset: 0,
         };
         let decoded = p
             .decode(
@@ -2145,6 +2433,7 @@ mod columnar_equivalence {
             batch_id: String::new(),
             now: Utc::now(),
             protector: None,
+            index_offset: 0,
         };
         let one = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)])),

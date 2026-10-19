@@ -15,6 +15,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<registry::PyContractRegistry>()?;
     m.add_class::<client::PyBronzeIngestionClient>()?;
     m.add_class::<client::PyIngestReport>()?;
+    m.add_class::<client::PyStreamReport>()?;
     m.add_class::<tenancy::PyPiiProtection>()?;
     m.add_class::<tenancy::PyTenantProfile>()?;
     m.add_class::<tenancy::PyTenantRegistry>()?;

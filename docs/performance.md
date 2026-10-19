@@ -30,6 +30,30 @@ To reproduce, run these from the `datalake-medallion-sdk/` folder:
 - `DL_BENCH_MB=200 cargo run --release --example throughput`: the table above.
 - `cargo bench`: the Criterion micro-benchmarks (contract checks, PII schemes, Parquet encoding, `prepare` by input type).
 
+## Streaming ingestion (`ingest_file`, `ingest_stream`)
+
+**Setup**
+- Inputs: 500 MB files, and one 2 GB JSON Lines file (6.7 M records).
+- Defaults: 8 MB read blocks, 131,072-row chunks, 64 MB row groups, 16 MB parts, 4 parts in flight.
+- S3 is an emulator running in another process, so the memory shown is the SDK process alone.
+- Measured on 2026-10-18 on the 16-thread laptop. Times include S3 uploads to the emulator.
+
+| Input | One `ingest` call | `ingest_file` (streaming) |
+|---|---|---|
+| CSV, 500 MB (3.16 M records) | 6.9 s, peak 2,743 MB | 7.0 s, peak **765 MB** |
+| JSON Lines, 500 MB (1.68 M records) | 22.5 s, peak 4,489 MB | 6.4 s, peak **276 MB** |
+| Parquet, 264 MB (3.16 M records) | 6.7 s, peak 2,326 MB | 6.8 s, peak **798 MB** |
+| JSON Lines, 2 GB (6.7 M records) | (about 18 GB of memory) | 30.6 s, peak **436 MB**, 2 objects |
+
+Findings:
+- **Memory stays bounded.** It does not grow with the input: 4x the data costs 160 MB more, which is the second object's parts.
+- **Streaming is as fast as one call** for CSV and Parquet, because validating a chunk overlaps with uploading the previous one.
+- **Streaming JSON Lines is 3.5x faster** than one call. Lines that fit the contract are parsed straight into typed columns, and only lines with `null` take the row path.
+- **Tuning:**
+  - 8 MB blocks were faster and lighter than 32 MB (CSV peak 765 vs 1,226 MB).
+  - 32 MB row groups save about 100 MB more but cost about 20% throughput.
+  - On real S3, raise `max_inflight_parts` when the network allows; uploads then overlap more.
+
 ## Reading (`LakeReader`)
 
 **Data**

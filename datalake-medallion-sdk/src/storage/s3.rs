@@ -12,6 +12,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 
@@ -123,6 +124,102 @@ impl ObjectStorage for S3Storage {
                 )
             })
     }
+
+    async fn create_multipart(
+        &self,
+        path: &ObjectPath,
+        content_type: &str,
+    ) -> Result<String, DatalakeError> {
+        let out = self
+            .client
+            .create_multipart_upload()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .content_type(content_type)
+            .send()
+            .await
+            .map_err(|e| s3_error("CreateMultipartUpload", path, &e))?;
+        out.upload_id().map(str::to_owned).ok_or_else(|| {
+            DatalakeError::storage("s3", "CreateMultipartUpload returned no upload id")
+        })
+    }
+
+    async fn upload_part(
+        &self,
+        path: &ObjectPath,
+        upload_id: &str,
+        part_number: i32,
+        body: Bytes,
+    ) -> Result<String, DatalakeError> {
+        let out = self
+            .client
+            .upload_part()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .map_err(|e| s3_error("UploadPart", path, &e))?;
+        out.e_tag()
+            .map(str::to_owned)
+            .ok_or_else(|| DatalakeError::storage("s3", "UploadPart returned no ETag"))
+    }
+
+    async fn complete_multipart(
+        &self,
+        path: &ObjectPath,
+        upload_id: &str,
+        parts: Vec<(i32, String)>,
+    ) -> Result<(), DatalakeError> {
+        let completed = CompletedMultipartUpload::builder()
+            .set_parts(Some(
+                parts
+                    .into_iter()
+                    .map(|(number, etag)| {
+                        CompletedPart::builder()
+                            .part_number(number)
+                            .e_tag(etag)
+                            .build()
+                    })
+                    .collect(),
+            ))
+            .build();
+        self.client
+            .complete_multipart_upload()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .upload_id(upload_id)
+            .multipart_upload(completed)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| s3_error("CompleteMultipartUpload", path, &e))
+    }
+
+    async fn abort_multipart(
+        &self,
+        path: &ObjectPath,
+        upload_id: &str,
+    ) -> Result<(), DatalakeError> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| s3_error("AbortMultipartUpload", path, &e))
+    }
+}
+
+fn s3_error(op: &str, path: &ObjectPath, e: &dyn std::error::Error) -> DatalakeError {
+    DatalakeError::storage(
+        "s3",
+        format!("{op} {} failed: {}", path.uri, DisplayErrorContext(e)),
+    )
 }
 
 #[cfg(test)]
