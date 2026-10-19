@@ -465,6 +465,62 @@ state["watermark"] = changes.watermark  # store it with the job's output
 
 On AWS Lambda against S3, warm queries over 3.1 M rows take 22–67 ms with Polars and `cache_mb`, and 100–950 ms with DuckDB without a cache; Iceberg tables take 67–147 ms without a cache. Athena takes 0.9–2.1 s for the same queries. Details in [docs/performance.md](docs/performance.md).
 
+## Writing Silver and Gold (Iceberg)
+
+`LakeWriter` writes a tenant's rows to Iceberg tables through a catalog (AWS Glue, REST, SQL…), and `LakeMaintenance` keeps those tables compact. Install with `pip install "datalake-medallion-sdk[write]"` (PyIceberg 0.12).
+
+```python
+from pyiceberg.catalog import load_catalog
+from datalake_medallion_sdk import LakeWriter, LakeMaintenance, TableRef
+
+catalog = load_catalog("lake", type="glue")
+writer = LakeWriter(tenants, catalog=catalog)
+
+logins = TableRef.iceberg("silver", "logins", identifier="silver.logins")  # shared by tenants
+writer.create_table("acme-001", logins, arrow_schema, partition_by=["day"], keys=["event_id"])
+
+writer.append("acme-001", logins, table, batch_id=batch_id)  # Arrow, Polars, dicts
+writer.upsert("acme-001", logins, changed_rows, batch_id=batch_id)  # by keys, one commit
+writer.replace("acme-001", logins, day_rows, where=[("day", "==", "2026-10-19")])
+```
+
+- **Tenant isolation.** A shared table (named with `identifier=`) has a required `tenant_id` column and is partitioned by it first. The writer sets or checks `tenant_id` on every row, rejects rows of another tenant, and scopes every `upsert` and `replace` to the tenant, even when another tenant has the same keys. A table that belongs to one tenant (`TableRef.iceberg("silver", "events")`) lives below the tenant's Silver or Gold location and is registered as `silver.events__<tenant>`. `LakeReader` reads both kinds.
+- **Concurrent writers.** Commits are optimistic. A commit that raced with an unrelated one (another tenant's partition) is retried by PyIceberg; when another writer changed the same rows, the writer reloads the table and applies the operation again on the new state (`conflict_retries`, default 3). Nothing is lost: verified with two writers on the same snapshot, in every combination.
+- **Idempotency.** `batch_id=` is stored in the snapshot summary with the tenant, and a batch already committed is skipped (`WriteResult.skipped`). Snapshot expiry bounds how far back batches are remembered.
+- **Results.** `WriteResult` gives the rows inserted, updated and deleted, the files added, the snapshot and the attempts.
+- **Upserts** replace the rows whose keys appear in the data in one commit; keys must be unique within the data. They rewrite the files that hold those rows (copy-on-write), so upsert batches that touch few partitions.
+
+### Incremental Bronze to Silver
+
+With [commit manifests](#incremental-reads-changes-since-a-watermark), a job processes each new Bronze batch exactly once, even if it crashes before saving its watermark:
+
+```python
+changes = reader.changes("acme-001", TableRef.bronze("login_event"), since=watermark)
+for entry in changes.entries:
+    rows = reader.read_changes(
+        "acme-001", TableRef.bronze("login_event"), ChangeSet([entry], changes.watermark)
+    )
+    writer.upsert("acme-001", logins, transform(rows), batch_id=entry["batch_id"])
+save(changes.watermark)
+```
+
+`read_changes` refuses objects outside the tenant's table. A batch already in Silver is skipped, so running the job again after a crash writes nothing twice.
+
+### Maintenance, outside the write path
+
+Run `LakeMaintenance` on a schedule (an EventBridge rule, cron, Airflow), never inside ingestion or writes:
+
+```python
+maintenance = LakeMaintenance(writer)
+maintenance.compact("acme-001", logins, target_file_mb=128)  # small files -> large ones
+maintenance.expire_snapshots("acme-001", logins, older_than_hours=168, retain_last=10)
+```
+
+- `compact` rewrites the tenant's small files partition by partition (exact files, one commit per partition). If a writer changed a partition meanwhile, that partition is left for the next run: writers always win and no row is lost or resurrected.
+- `expire_snapshots` removes snapshots older than the limit except the last `retain_last`; their batch ids are then forgotten by the idempotency check.
+
+Measured locally (one tenant, a table partitioned by day): append 1 M rows 0.57 s, upsert 10 k rows into 1 M (5 k updated, 5 k inserted) 1.25 s, replace one day of 100 k rows 0.13 s, compact 21 small files 0.5 s, a repeated batch skipped in 0.05 s; about 0.4 GB of memory.
+
 ## Object layout
 
 ```

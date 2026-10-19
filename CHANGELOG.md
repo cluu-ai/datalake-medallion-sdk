@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `LakeWriter` (extra `[write]`, PyIceberg 0.12): `append`, `upsert(keys)` and `replace(where)` of a tenant's rows in Silver and Gold Iceberg tables through a catalog (AWS Glue, REST, SQL…), and `create_table` for tables shared by tenants (required `tenant_id`, partitioned by it) or owned by one tenant (below its location). Rows of another tenant are rejected and every `upsert` / `replace` is scoped to the tenant. On a real conflict with another writer the operation is applied again on the new state; `batch_id` makes writes idempotent. `WriteResult` with inserted, updated and deleted rows.
+- `LakeMaintenance`, for scheduled jobs outside the write path: `compact` rewrites small files per partition and leaves a partition a writer changed meanwhile for the next run; `expire_snapshots(older_than_hours, retain_last)`.
+- `LakeReader.read_changes(tenant, table, changes)`: the rows of the objects of a `ChangeSet`, refusing objects of another tenant; with `LakeWriter(batch_id=...)` it makes incremental Bronze to Silver jobs exactly-once.
+
+### Fixed
+
+- Upserts with thousands of composite keys: PyIceberg's own upsert nests one `Or` per key and overflowed the stack with 10 k keys (always composite in shared tables). `LakeWriter.upsert` uses one overwrite with a shallow key filter instead.
+
+### Added
+
 - Commit manifests (opt-in, `BronzeIngestionClient(manifests=True)`, Rust `PipelineConfig::manifests`): after each committed batch, one immutable JSON entry with its objects, record counts, contract, schema hash and event-time range, written only after every object it lists. Streams write one entry per `flush()`, per object closed by age and at the end. `LakeReader.changes(tenant, table, since=)` returns the entries after a watermark in commit order (`ChangeSet`), for incremental jobs that should not list every object. `TenantProfile.manifest_prefix(data_type)`.
 - Optional OpenTelemetry instrumentation (`[otel]` extra, API only, no exporter): spans for ingests and reads and the metrics `datalake.records`, `datalake.bytes` and `datalake.operation.duration`. Without the package nothing is wrapped; installed but not configured, about 2 µs per call.
 
