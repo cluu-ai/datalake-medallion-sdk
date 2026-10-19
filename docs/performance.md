@@ -100,6 +100,24 @@ To keep memory low:
 
 ---
 
+## Logs on AWS (0.2.0rc10)
+
+The same 3.16 M records as application logs: event time typed with `x-dl-type: "timestamp"`, streamed in time order through `ingest_stream`. Upload time, not counting reading the source.
+
+| Contract | Objects | Time | Bronze written |
+|---|---|---|---|
+| zstd, ingest-day partitions, `max_object_seconds=2` | 2 | 3.4 s | 95 MiB |
+| zstd, `x-dl-partition_by` (212 event days) | 212 | 3.7 s | 125 MiB |
+| Snappy, `x-dl-partition_by` | 212 | 3.3 s | 192 MiB |
+| `ingest` of 200 k records over 212 days, zstd | 212 | 1.2 s | 9 MiB |
+| 500 k records out of time order, `max_open_days=4` | 848 | 1.8 s | 25 MiB |
+
+Small objects are uploaded concurrently within the stream's memory budget, so event-day partitions cost about the same as one large object to write; 0.2.0rc9 uploaded them one by one (13.7 s for the 212-day stream). Reading them is a different matter: many small objects make uncached scans slower, see the partitioning guidance in the README.
+
+Streams that write one large object were compared with 0.2.0rc9 in the same function, alternating the two versions, 6 runs each (median): DuckDB result 4.58 → 4.61 s, Parquet file 4.25 → 4.13 s, dataset scanner 4.09 → 4.14 s, CSV file 5.37 → 5.49 s. The differences are within the spread of each version (about ±8%).
+
+---
+
 ## Reading: `LakeReader`
 
 Bronze table of 3.16 M records in one object. Warm queries are the median of 5 calls in the same process, on AWS:
