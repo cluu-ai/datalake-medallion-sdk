@@ -118,7 +118,7 @@ def traced(
         # Positions of the arguments read, computed once (binding a signature
         # on every call costs microseconds).
         params = list(inspect.signature(fn).parameters)
-        positions = {
+        positions: dict[str, int] = {
             n: params.index(n)
             for n in ("tenant", "default_tenant", "contract", "table")
             if n in params
