@@ -432,24 +432,66 @@ impl PyTenantProfile {
     }
 }
 
-/// A Python column as one Arrow `StringArray` (chunks combined, other
-/// string types cast).
-fn string_array(py: Python<'_>, values: &Bound<'_, PyAny>) -> PyResult<StringArray> {
+/// The chunks of a Python column (pyarrow, Polars...) as Arrow `StringArray`s,
+/// shared with Python without copying when they already are UTF-8.
+fn string_chunks(py: Python<'_>, values: &Bound<'_, PyAny>) -> PyResult<Vec<StringArray>> {
     use arrow::array::{make_array, ArrayData};
     use arrow::pyarrow::FromPyArrow;
 
+    let column = py
+        .import("pyarrow")?
+        .call_method1("chunked_array", (values,))?;
+    let mut out = Vec::new();
+    for chunk in column.getattr("chunks")?.try_iter()? {
+        let array = make_array(ArrayData::from_pyarrow_bound(&chunk?)?);
+        let utf8 = arrow::compute::cast(&array, &arrow::datatypes::DataType::Utf8)
+            .map_err(|e| PyTypeError::new_err(format!("expected a column of strings: {e}")))?;
+        out.push(
+            utf8.as_any()
+                .downcast_ref::<StringArray>()
+                .cloned()
+                .ok_or_else(|| PyTypeError::new_err("expected a column of strings"))?,
+        );
+    }
+    Ok(out)
+}
+
+/// A key reference column as dictionary indices and distinct values.
+fn key_ref_dictionary(
+    py: Python<'_>,
+    values: &Bound<'_, PyAny>,
+) -> PyResult<(arrow::array::Int32Array, StringArray)> {
+    use arrow::array::{make_array, ArrayData, DictionaryArray};
+    use arrow::datatypes::{DataType, Int32Type};
+    use arrow::pyarrow::FromPyArrow;
+
     let pa = py.import("pyarrow")?;
-    let combined = pa
-        .call_method1("chunked_array", (values,))?
+    let mut column = pa.call_method1("chunked_array", (values,))?;
+    let is_dictionary: bool = pa
+        .getattr("types")?
+        .call_method1("is_dictionary", (column.getattr("type")?,))?
+        .extract()?;
+    if !is_dictionary {
+        column = column.call_method0("dictionary_encode")?;
+    }
+    let combined = column
+        .call_method0("unify_dictionaries")?
         .call_method0("combine_chunks")?;
     let array = make_array(ArrayData::from_pyarrow_bound(&combined)?);
-    let utf8 = arrow::compute::cast(&array, &arrow::datatypes::DataType::Utf8)
-        .map_err(|e| PyTypeError::new_err(format!("expected a column of strings: {e}")))?;
-    Ok(utf8
+    let target = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    let array = arrow::compute::cast(&array, &target)
+        .map_err(|e| PyTypeError::new_err(format!("expected key references as strings: {e}")))?;
+    let dictionary = array
+        .as_any()
+        .downcast_ref::<DictionaryArray<Int32Type>>()
+        .ok_or_else(|| PyTypeError::new_err("expected key references as strings"))?;
+    let values = dictionary
+        .values()
         .as_any()
         .downcast_ref::<StringArray>()
         .cloned()
-        .unwrap_or_else(|| StringArray::from(Vec::<Option<&str>>::new())))
+        .ok_or_else(|| PyTypeError::new_err("expected key references as strings"))?;
+    Ok((dictionary.keys().clone(), values))
 }
 
 /// Immutable directory of tenant profiles, resolved by tenant id on each call.
@@ -607,23 +649,45 @@ impl PyPiiDecryptor {
         field: &str,
         key_refs: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        let tokens = string_array(py, tokens)?;
-        let per_row = if key_refs.extract::<String>().is_ok() {
-            None
-        } else {
-            Some(string_array(py, key_refs)?)
-        };
+        // Token chunks are used as they come (no combined copy); key
+        // references become a dictionary (an index per row plus the few
+        // distinct references) instead of one long string per row.
+        let chunks = string_chunks(py, tokens)?;
         let one = key_refs.extract::<String>().ok();
+        let indexed = match one {
+            Some(_) => None,
+            None => Some(key_ref_dictionary(py, key_refs)?),
+        };
         let inner = Arc::clone(&self.inner);
-        let clear = py.detach(|| {
-            let refs = match (&one, &per_row) {
-                (Some(r), _) => KeyRefs::One(r),
-                (None, Some(column)) => KeyRefs::PerRow(column),
-                (None, None) => unreachable!("one of them is set"),
-            };
-            inner.decrypt_array(tenant_id, field, &tokens, refs)
+        let clear = py.detach(|| -> Result<Vec<StringArray>, DatalakeError> {
+            let mut offset = 0;
+            let mut out = Vec::with_capacity(chunks.len());
+            for chunk in &chunks {
+                let len = chunk.len();
+                let slice;
+                let refs = match (&one, &indexed) {
+                    (Some(r), _) => KeyRefs::One(r),
+                    (None, Some((indices, values))) => {
+                        slice = indices.slice(offset, len);
+                        KeyRefs::Indexed {
+                            indices: &slice,
+                            values,
+                        }
+                    }
+                    (None, None) => unreachable!("one of them is set"),
+                };
+                out.push(inner.decrypt_array(tenant_id, field, chunk, refs)?);
+                offset += len;
+            }
+            Ok(out)
         })?;
-        Ok(clear.into_data().to_pyarrow(py)?.unbind())
+        let arrays = clear
+            .into_iter()
+            .map(|a| a.into_data().to_pyarrow(py))
+            .collect::<PyResult<Vec<_>>>()?;
+        let pa = py.import("pyarrow")?;
+        let column = pa.call_method1("chunked_array", (arrays, pa.call_method0("string")?))?;
+        Ok(column.call_method0("combine_chunks")?.unbind())
     }
 
     /// Decrypts a column (``None`` stays ``None``) without holding the GIL.
