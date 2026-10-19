@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "datalake-medallion-sdk"
-version = "0.2.0rc11"
+version = "0.2.0rc12"
 description = "Contract-enforced ingestion and tenant-scoped reads for multi-tenant medallion data lakes on S3: JSON Schema validation, per-tenant locations, optional PII protection (hash, HMAC, AES-256-GCM with per-tenant KMS keys), quarantine of invalid records, and Parquet/Iceberg reads without Athena"
 readme = "README.md"
 requires-python = ">=3.12"
