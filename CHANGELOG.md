@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- OpenTelemetry logs: `datalake_medallion_sdk.otel.logs_contract()` (the Logs Data Model columns, typed timestamps, zstd) and `BronzeIngestionClient.ingest_otel_logs(body)`, which flattens an OTLP/JSON request, groups its records by the `tenant.id` resource attribute and writes each tenant once, in Rust and without pyarrow. `otel.flatten_logs()` returns the rows as pyarrow batches. Rust: `otel::flatten_logs_json`, `otel::flatten_logs_json_many`, `otel::logs_contract`.
+- Queue and stream batches: `ingest_otel_log_batch(bodies)` flattens many requests in parallel and returns a `TenantOutcome` per tenant (the requests that carried it, its report or error), so a consumer retries only the messages of a failed tenant or an unreadable message. `batch_id_for(message_ids, time_ms=)` gives a deterministic batch id, so a redelivered batch rewrites the same objects. Rust: `pipeline::batch_id_for`.
+- `examples/aws_lambda_handler.py`: a tested recipe for Kinesis, SQS and CloudWatch Logs events in AWS Lambda, with partial-batch failures.
+- `examples/otel_throughput.rs`. 200 k log records (84 MiB OTLP/JSON), no network: 0.66 s as one request, 0.24 s as 100 requests.
+
+### Fixed
+
+- Contracts with `contentMediaType`, `contentEncoding` or `contentSchema` sent every Arrow batch down the row path. These keywords are annotations in drafts 2019-09 and 2020-12 (the default), so such contracts now keep the columnar path there (OpenTelemetry logs: 1.5 s to 0.13 s for 200 k records); drafts 6 and 7 are unchanged.
+
 ### Changed
 
 - Small objects are uploaded concurrently. Streams bound uploads by bytes in flight (`max_inflight_parts` × `part_bytes`, the same memory as before) and at most 32 requests, so the many small objects of event-day partitions go out together instead of one by one; `ingest` writes up to 16 objects at once, dead letters first. On AWS, a stream of 3.1 M log records over 212 event days took 13.7 s in 0.2.0rc9 against 3.1 s without partitions.

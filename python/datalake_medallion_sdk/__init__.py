@@ -53,7 +53,7 @@ from ._core import (
     TenantViolationError,
     TypeCoercionError,
 )
-from .client import BronzeIngestionClient, ClientOptions
+from .client import BronzeIngestionClient, ClientOptions, TenantOutcome, batch_id_for
 from .decorators import datalake_retry, emit_metrics
 from .hooks import (
     Hook,
@@ -108,12 +108,14 @@ __all__ = [
     "StorageError",
     "StreamReport",
     "TableRef",
+    "TenantOutcome",
     "TenantProfile",
     "TenantRegistry",
     "TenantResolver",
     "TenantViolationError",
     "TypeCoercionError",
     "__version__",
+    "batch_id_for",
     "contract_validator",
     "datalake_retry",
     "default_hooks",

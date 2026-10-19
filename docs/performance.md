@@ -118,6 +118,19 @@ Streams that write one large object were compared with 0.2.0rc9 in the same func
 
 ---
 
+## OpenTelemetry logs (local)
+
+`examples/otel_throughput.rs`: OTLP/JSON logs requests with 3 attributes per record, trace context and 4 tenants, flattened, validated against `logs_contract()` and encoded with zstd into a store that discards the bytes. Median of 3 rounds.
+
+| Input | Time | Throughput |
+|---|---|---|
+| 200 k records in one request (84 MiB) | 0.66 s | 128 MiB/s, 0.30 M records/s |
+| 200 k records in 100 requests (one queue batch) | **0.24 s** | **350 MiB/s, 0.83 M records/s** |
+
+Requests of a batch are flattened in parallel. OTLP is read into typed structures with borrowed strings, and the rows take the columnar validation path; the first implementation, which built a JSON tree per record and fell back to the row path, took 3.98 s for the single request.
+
+---
+
 ## Reading: `LakeReader`
 
 Bronze table of 3.16 M records in one object. Warm queries are the median of 5 calls in the same process, on AWS:

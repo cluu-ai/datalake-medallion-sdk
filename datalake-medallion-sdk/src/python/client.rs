@@ -46,6 +46,36 @@ pub(crate) struct PyIngestReport {
     pii_protection: String,
 }
 
+/// Per-tenant result of `ingest_otel_logs`, converted to a Python tuple
+/// `(tenant, sources, report | None, exception | None)`.
+struct OtelOutcome {
+    tenant: Option<String>,
+    sources: Vec<usize>,
+    report: Result<IngestReport, OtelError>,
+}
+
+/// Why a tenant of `ingest_otel_logs` was not written.
+enum OtelError {
+    Datalake(DatalakeError),
+    /// The tenant could not be resolved (an exception of `resolve`).
+    Python(PyErr),
+}
+
+impl<'py> IntoPyObject<'py> for OtelOutcome {
+    type Target = PyTuple;
+    type Output = Bound<'py, PyTuple>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let (report, error): (Option<PyIngestReport>, Option<Py<PyAny>>) = match self.report {
+            Ok(r) => (Some(PyIngestReport::from(r)), None),
+            Err(OtelError::Datalake(e)) => (None, Some(PyErr::from(e).into_value(py).into_any())),
+            Err(OtelError::Python(e)) => (None, Some(e.into_value(py).into_any())),
+        };
+        (self.tenant, self.sources, report, error).into_pyobject(py)
+    }
+}
+
 impl From<IngestReport> for PyIngestReport {
     fn from(r: IngestReport) -> Self {
         Self {
@@ -319,6 +349,126 @@ impl PyBronzeIngestionClient {
             // retried here rather than by re-validating with a new batch id.
             let report = pipeline.commit_with_retries(&prepared, 4).await?;
             Ok(PyIngestReport::from(report))
+        })
+    }
+
+    /// Flattens an OTLP/JSON logs request and ingests each tenant's records
+    /// in one call, without pyarrow and without holding the GIL while parsing.
+    ///
+    /// `resolve(tenant_or_none)` maps each tenant found in `tenant_attribute`
+    /// (or `None` for records without it) to a `TenantProfile` or a tenant id.
+    /// Tenants are validated one by one and committed concurrently; every
+    /// tenant is attempted even when another fails. Returns one
+    /// `(tenant_or_none, request_indices, IngestReport | None, error | None)`
+    /// per tenant, in tenant order (tenants that could not be resolved after
+    /// the others), then `(None, [index], None, error)` per unreadable
+    /// request.
+    ///
+    /// `bodies` is a list of requests (for example the records of one queue
+    /// batch): their rows are merged by tenant, so each tenant is written once.
+    #[pyo3(signature = (bodies, *, contract, tenant_attribute, resolve, batch_id = None))]
+    fn ingest_otel_logs<'py>(
+        &self,
+        py: Python<'py>,
+        bodies: Vec<Vec<u8>>,
+        contract: &str,
+        tenant_attribute: &str,
+        resolve: &Bound<'py, PyAny>,
+        batch_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.parts.registry.get(contract)?;
+        let flattened = py.detach(|| {
+            let slices: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
+            crate::otel::flatten_logs_json_many(&slices, tenant_attribute)
+        })?;
+        let mut requests = Vec::with_capacity(flattened.tenants.len());
+        // A tenant that cannot be resolved fails alone; the others go on.
+        let mut unresolved = Vec::new();
+        for group in flattened.tenants {
+            let profile = match resolve
+                .call1((group.tenant.clone(),))
+                .and_then(|p| self.resolve(&p))
+            {
+                Ok(profile) => profile,
+                Err(e) => {
+                    unresolved.push(OtelOutcome {
+                        tenant: group.tenant,
+                        sources: group.sources,
+                        report: Err(OtelError::Python(e)),
+                    });
+                    continue;
+                }
+            };
+            let mut request =
+                IngestRequest::new(profile, contract, RecordSource::Arrow(vec![group.batch]));
+            if let Some(id) = &batch_id {
+                request = request.with_batch_id(id.clone());
+            }
+            if let Some(hook) = self.hooks.get(contract) {
+                request = request.with_hook(Arc::clone(hook));
+            }
+            requests.push((group.tenant, group.sources, request));
+        }
+        let malformed = flattened.malformed;
+        let parts = Arc::clone(&self.parts);
+        let cell = Arc::clone(&self.pipeline);
+        future_into_py(py, async move {
+            let pipeline = cell
+                .get_or_try_init(|| async {
+                    let storage = S3Storage::connect(parts.s3.clone()).await;
+                    BronzePipeline::new(
+                        Arc::clone(&parts.registry),
+                        Arc::new(storage),
+                        parts.config.clone(),
+                    )
+                    .map(Arc::new)
+                })
+                .await?;
+            let worker = Arc::clone(pipeline);
+            let prepared = tokio::task::spawn_blocking(move || {
+                requests
+                    .into_iter()
+                    .map(|(tenant, sources, request)| (tenant, sources, worker.prepare(request)))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|e| {
+                DatalakeError::storage("runtime", format!("validation task failed: {e}"))
+            })?;
+            let mut commits = tokio::task::JoinSet::new();
+            for (index, (tenant, sources, batch)) in prepared.into_iter().enumerate() {
+                let pipeline = Arc::clone(pipeline);
+                commits.spawn(async move {
+                    let report = match batch {
+                        Ok(batch) => pipeline.commit_with_retries(&batch, 4).await,
+                        Err(e) => Err(e),
+                    }
+                    .map_err(OtelError::Datalake);
+                    (
+                        index,
+                        OtelOutcome {
+                            tenant,
+                            sources,
+                            report,
+                        },
+                    )
+                });
+            }
+            let mut done = Vec::with_capacity(commits.len());
+            while let Some(finished) = commits.join_next().await {
+                done.push(finished.map_err(|e| {
+                    DatalakeError::storage("runtime", format!("upload task failed: {e}"))
+                })?);
+            }
+            done.sort_unstable_by_key(|(index, _)| *index);
+            let mut outcomes: Vec<OtelOutcome> = done.into_iter().map(|(_, o)| o).collect();
+            outcomes.extend(unresolved);
+            outcomes.extend(malformed.into_iter().map(|(index, e)| OtelOutcome {
+                tenant: None,
+                sources: vec![index],
+                report: Err(OtelError::Datalake(e)),
+            }));
+            Ok(outcomes)
         })
     }
 

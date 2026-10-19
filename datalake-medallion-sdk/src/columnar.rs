@@ -46,6 +46,19 @@ const ANNOTATIONS: &[&str] = &[
     "writeOnly",
 ];
 
+/// Content keywords: annotations only from draft 2019-09 on (the default
+/// draft is 2020-12), so they never reject a value there. Drafts 6 and 7 may
+/// assert them, so those contracts keep the row path.
+const CONTENT_ANNOTATIONS: &[&str] = &["contentMediaType", "contentEncoding", "contentSchema"];
+
+/// Whether the content keywords are annotations in the contract's draft.
+fn content_is_annotation(root: &Map<String, Value>) -> bool {
+    match root.get("$schema").and_then(Value::as_str) {
+        None => true,
+        Some(uri) => uri.contains("2019-09") || uri.contains("2020-12"),
+    }
+}
+
 /// Root keywords the plan accounts for. With every input column declared,
 /// `additionalProperties` (a boolean) cannot fail and `$defs` is unused
 /// because no property may contain `$ref`.
@@ -108,7 +121,12 @@ impl ColumnarPlan {
         mode: FlexibilityMode,
         extension_prefix: &str,
     ) -> Option<Self> {
-        let ignorable = |k: &str| k.starts_with(extension_prefix) || ANNOTATIONS.contains(&k);
+        let content = content_is_annotation(root);
+        let ignorable = |k: &str| {
+            k.starts_with(extension_prefix)
+                || ANNOTATIONS.contains(&k)
+                || (content && CONTENT_ANNOTATIONS.contains(&k))
+        };
         let root_ok = root.iter().all(|(k, v)| {
             ignorable(k)
                 || ROOT_KEYWORDS.contains(&k.as_str())

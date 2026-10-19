@@ -1186,6 +1186,32 @@ fn decode_rows(source: RecordSource) -> Result<Vec<Raw>, DatalakeError> {
 }
 
 /// Time of a ULID (its first 48 bits).
+/// Deterministic batch id for a set of source messages: a ULID whose time is
+/// `time` (it also sets the Bronze partition date and the reference of the
+/// future-skew check, so use the latest arrival time of the messages) and
+/// whose randomness is a SHA-256 of the message ids. The same messages give
+/// the same id, so a redelivered batch rewrites the same objects instead of
+/// adding rows.
+///
+/// Use it with [`IngestRequest::with_batch_id`] when consuming a queue or a
+/// stream (Kinesis sequence numbers, SQS message ids, Kafka offsets...).
+#[must_use]
+pub fn batch_id_for<S: AsRef<str>>(message_ids: &[S], time: DateTime<Utc>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for (i, id) in message_ids.iter().enumerate() {
+        if i > 0 {
+            hash.update([0x1f]);
+        }
+        hash.update(id.as_ref().as_bytes());
+    }
+    let digest = hash.finalize();
+    let mut random = [0u8; 16];
+    random[6..].copy_from_slice(&digest[..10]);
+    let ms = u64::try_from(time.timestamp_millis()).unwrap_or(0);
+    Ulid::from_parts(ms, u128::from_be_bytes(random)).to_string()
+}
+
 pub(crate) fn ulid_time(id: Ulid) -> DateTime<Utc> {
     use chrono::TimeZone;
     let ms = i64::try_from(id.timestamp_ms()).unwrap_or(0);
@@ -2855,6 +2881,27 @@ mod storage_option_tests {
             matches!(codec, parquet::basic::Compression::ZSTD(_)),
             "{codec:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_id_tests {
+    use super::*;
+
+    #[test]
+    fn batch_ids_are_deterministic_ulids_at_the_given_time() {
+        use chrono::TimeZone;
+        let t = Utc.with_ymd_and_hms(2026, 3, 1, 10, 0, 0).unwrap();
+        let a = batch_id_for(&["seq-1", "seq-2"], t);
+        assert_eq!(
+            a,
+            batch_id_for(&["seq-1", "seq-2"], t),
+            "same messages, same id"
+        );
+        assert_ne!(a, batch_id_for(&["seq-1", "seq-3"], t));
+        assert_ne!(a, batch_id_for(&["seq-1seq-2"], t), "ids are separated");
+        let parsed = Ulid::from_string(&a).unwrap();
+        assert_eq!(ulid_time(parsed), t);
     }
 }
 

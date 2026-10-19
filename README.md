@@ -112,11 +112,13 @@ The rest of this page covers each piece in depth.
 | A file, local or on S3: CSV, TSV, JSON Lines, Parquet, gz/zst | `client.ingest_file("s3://…")` | 3.16 M records: Parquet **4.0 s**, CSV 5.6 s, JSONL 10.2 s; **0.5–0.9 GB** of memory |
 | An Arrow stream: pyarrow dataset, DuckDB result, Polars, Kafka batches… | `client.ingest_stream(reader)` | 0.7–0.8 M records/s with bounded memory |
 | A DataFrame already in memory | `client.ingest(df)` | 0.5 M records/s (one object) |
+| Application logs in OTLP/JSON, from an API or a queue batch | `client.ingest_otel_logs(body)` / `ingest_otel_log_batch(bodies)` | 0.3–0.8 M records/s locally²; one object per tenant per batch |
 | Repeated per-tenant reads: APIs, dashboards | `LakeReader(cache_mb=1024)` (Polars) | **22–67 ms** per query on 3.1 M rows |
 | One-off or low-memory reads, SQL | `LakeReader(engine="duckdb")` | 100–950 ms, 0.3–0.7 GB |
 | Encrypted PII to read back | `PiiDecryptor.decrypt_column(...)` | 3.1 M values in **1.1 s** |
 
 ¹ AWS Lambda with 10 GB / 6 vCPU, reading from and writing to S3 in the same region. Methodology, local numbers and every configuration are in [docs/performance.md](docs/performance.md).
+² Measured without the network; see [Application logs](#application-logs-opentelemetry).
 
 Rules of thumb:
 - **Columnar input** (Parquet, Arrow) is 3–6x faster than JSON or dicts.
@@ -278,6 +280,78 @@ report = await client.ingest_stream(
 From Rust:
 - Use `BronzePipeline::ingest_stream(tenant, contract, hook, chunks, StreamOptions::default())` with any iterator of `RecordSource` chunks: `Arrow`, `JsonLines`, `ArrowText` for CSV read as text, `Json` or `Values`.
 - Or open a `BronzeStream` and `push` chunks yourself.
+
+## Application logs (OpenTelemetry)
+
+Applications that emit logs with [OpenTelemetry](https://opentelemetry.io/) can send them to the lake as OTLP/JSON. The SDK flattens each request into one row per log record, with the columns of the [OpenTelemetry Logs Data Model](https://opentelemetry.io/docs/specs/otel/logs/data-model/), groups the records by tenant and writes each tenant once. Parsing, validation and encoding run in Rust, without the GIL and without pyarrow.
+
+```python
+from datalake_medallion_sdk import BronzeIngestionClient, ContractRegistry, TenantRegistry
+from datalake_medallion_sdk.otel import logs_contract
+
+tenants = TenantRegistry.from_config({...})
+client = BronzeIngestionClient(
+    ContractRegistry.from_schemas([logs_contract()]),  # contract key "otel/logs/1.0.0"
+    tenants=tenants,
+)
+
+# One OTLP/JSON export request (bytes, str or the decoded dict). The tenant is the
+# resource attribute "tenant.id"; records without it go to default_tenant.
+reports = await client.ingest_otel_logs(body, contract="otel/logs/1.0.0", default_tenant="shared")
+for tenant_id, report in reports.items():
+    print(tenant_id, report.records_ok, report.records_quarantined, report.data_uri)
+```
+
+**The contract.** `logs_contract()` returns the JSON Schema of the flattened records:
+
+| Column | Type | From the OTLP record |
+|---|---|---|
+| `timestamp` | `timestamp(µs, UTC)`, required | `timeUnixNano`, or `observedTimeUnixNano` when unset |
+| `observed_timestamp` | `timestamp(µs, UTC)` | `observedTimeUnixNano` |
+| `severity_number`, `severity_text` | int64, text | severity |
+| `body` | text | a string body as is, a structured body as JSON text |
+| `attributes`, `resource_attributes` | JSON text | record and resource attributes |
+| `trace_id`, `span_id` | hex text | trace context (checked: 32 and 16 hex digits) |
+| `flags`, `event_name` | int64, text | |
+| `service_name`, `scope_name`, `scope_version` | text | `service.name` resource attribute, instrumentation scope |
+
+It uses zstd (logs are text-heavy) and ingest-day partitions. Change the defaults with `logs_contract(datatype=, schema_version=, compression=, partition_by_event_time=)`; turn event-day partitions on only for high daily volumes per tenant (see [Data contracts](#data-contracts)). Configure exporters with the OTLP/JSON encoding: protobuf requests are rejected with a clear error.
+
+**Queues and streams.** A consumer of Kinesis, SQS, Kafka or Pub/Sub ingests a whole batch of messages with one call, with one write per tenant instead of one object per message:
+
+```python
+from datalake_medallion_sdk import batch_id_for
+
+batch_id = batch_id_for([m.id for m in messages], time_ms=max(m.arrival_ms for m in messages))
+outcomes = await client.ingest_otel_log_batch(
+    [m.body for m in messages], contract="otel/logs/1.0.0", batch_id=batch_id
+)
+failed = {messages[i].id for o in outcomes if o.error for i in o.requests}
+```
+
+- `batch_id_for` derives the batch id from the message ids, so a batch delivered again (a timeout, a crash) rewrites the same objects instead of adding rows.
+- Each `TenantOutcome` lists the requests that carried that tenant's records. A tenant that fails (unknown tenant, upload error) or a message that cannot be read fails alone; retry or report only those messages.
+- Messages are flattened in parallel.
+
+[`examples/aws_lambda_handler.py`](examples/aws_lambda_handler.py) is a tested recipe for AWS Lambda: Kinesis, SQS and CloudWatch Logs subscriptions (CloudWatch events are mapped to the same OpenTelemetry columns, so every log ends up in one table), with `batchItemFailures` for partial failures. It is an example to copy and adapt, not part of the SDK API.
+
+**Reading logs back.** Filter the typed `timestamp` with text, dates or datetimes; values without a zone are UTC:
+
+```python
+from datalake_medallion_sdk import LakeReader, TableRef
+
+reader = LakeReader(tenants, cache_mb=1024)
+errors = reader.read(
+    "acme-001",
+    TableRef.bronze("logs"),
+    columns=["timestamp", "service_name", "severity_text", "body", "trace_id"],
+    where=[("timestamp", ">=", "2026-10-19T08:00:00Z"), ("severity_number", ">=", 17)],
+    order_by=[("timestamp", "desc")],
+    limit=100,
+)
+```
+
+**Performance** (local, no network; `examples/otel_throughput.rs`): 200 k log records, 84 MiB of OTLP/JSON, 4 tenants, flattened, validated and encoded in **0.66 s** as one request (128 MiB/s) and **0.24 s** as a batch of 100 requests (350 MiB/s, 0.83 M records/s).
 
 ## PII protection
 
@@ -464,7 +538,7 @@ The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, `TenantProfi
 
 ```toml
 [dependencies]
-datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc10", default-features = false, features = ["aws-kms"] }
+datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc11", default-features = false, features = ["aws-kms"] }
 ```
 
 The library is imported as `_core` (`use _core::pipeline::BronzePipeline;`). `default-features = false` builds without Python, for example for an AWS Lambda; the `aws-kms` feature adds the KMS data key provider. The Rust API may change before 1.0.
