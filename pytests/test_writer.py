@@ -1,0 +1,201 @@
+"""LakeWriter and LakeMaintenance: Iceberg Silver/Gold writes (moto S3, SQL catalog)."""
+
+from __future__ import annotations
+
+import os
+import tempfile
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+from datalake_medallion_sdk import (
+    LakeReader,
+    TableRef,
+    TenantProfile,
+    TenantRegistry,
+    TenantViolationError,
+)
+
+pa = pytest.importorskip("pyarrow")
+pytest.importorskip("pyiceberg")
+
+from datalake_medallion_sdk.writer import LakeMaintenance, LakeWriter  # noqa: E402
+
+SHARED = TableRef.iceberg("silver", "items", identifier="silver.items")
+OWN = TableRef.iceberg("silver", "events")
+SCHEMA = pa.schema([("id", pa.int64()), ("day", pa.string()), ("v", pa.string())])
+
+
+@pytest.fixture
+def tenants(bucket: str) -> TenantRegistry:
+    return TenantRegistry([TenantProfile.for_bucket(t, bucket) for t in ("acme-001", "tenant-b")])
+
+
+@pytest.fixture
+def catalog(s3_endpoint: str, bucket: str) -> Iterator[Any]:
+    from pyiceberg.catalog.sql import SqlCatalog
+
+    workdir = tempfile.mkdtemp()
+    cat = SqlCatalog(
+        "lake",
+        uri=f"sqlite:///{os.path.join(workdir, 'catalog.db')}",
+        warehouse=f"s3://{bucket}/warehouse",
+        **{
+            "s3.endpoint": s3_endpoint,
+            "s3.region": "us-east-1",
+            "s3.access-key-id": "test",
+            "s3.secret-access-key": "test",
+        },
+    )
+    yield cat
+    cat.engine.dispose()
+
+
+@pytest.fixture
+def writer(tenants: TenantRegistry, catalog: Any) -> LakeWriter:
+    w = LakeWriter(tenants, catalog=catalog)
+    w.create_table("acme-001", SHARED, SCHEMA, partition_by=["day"], keys=["id"])
+    return w
+
+
+@pytest.fixture
+def reader(s3_endpoint: str, tenants: TenantRegistry, catalog: Any) -> Iterator[LakeReader]:
+    r = LakeReader(
+        tenants,
+        catalog=catalog,
+        aws_region="us-east-1",
+        aws_endpoint_url=s3_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        max_staleness=0,
+    )
+    yield r
+    r.close()
+
+
+def rows(ids: range | list[int], v: str, day: str = "2026-10-19") -> Any:
+    ids = list(ids)
+    return pa.table({"id": ids, "day": [day] * len(ids), "v": [v] * len(ids)})
+
+
+def values(reader: LakeReader, tenant: str, table: TableRef = SHARED) -> dict[int, str]:
+    t = reader.read(tenant, table, order_by=["id"])
+    return dict(zip(t.column("id").to_pylist(), t.column("v").to_pylist(), strict=True))
+
+
+def test_tenants_only_write_their_rows(writer: LakeWriter, reader: LakeReader) -> None:
+    writer.append("acme-001", SHARED, rows(range(3), "a"))
+    writer.append("tenant-b", SHARED, rows(range(2), "b"))
+    assert values(reader, "acme-001") == {0: "a", 1: "a", 2: "a"}
+    assert values(reader, "tenant-b") == {0: "b", 1: "b"}
+    foreign = rows([9], "x").add_column(0, "tenant_id", pa.array(["tenant-b"]))
+    with pytest.raises(TenantViolationError):
+        writer.append("acme-001", SHARED, foreign)
+    # replace and upsert are scoped to the tenant even with the same keys.
+    writer.replace("acme-001", SHARED, rows([5], "a2"))
+    writer.upsert("acme-001", SHARED, rows([0, 1], "a3"))
+    assert values(reader, "acme-001") == {0: "a3", 1: "a3", 5: "a2"}
+    assert values(reader, "tenant-b") == {0: "b", 1: "b"}
+
+
+def test_batches_are_written_once(writer: LakeWriter, reader: LakeReader) -> None:
+    first = writer.append("acme-001", SHARED, rows(range(4), "a"), batch_id="B-1")
+    again = writer.append("acme-001", SHARED, rows(range(4), "a"), batch_id="B-1")
+    assert not first.skipped and first.rows_inserted == 4
+    assert again.skipped and again.snapshot_id == first.snapshot_id
+    other = writer.append("tenant-b", SHARED, rows(range(4), "b"), batch_id="B-1")
+    assert not other.skipped, "batch ids are per tenant"
+    assert len(values(reader, "acme-001")) == 4
+
+
+def test_upsert_and_replace_results(writer: LakeWriter, reader: LakeReader) -> None:
+    writer.append("acme-001", SHARED, rows(range(3), "a"))
+    up = writer.upsert("acme-001", SHARED, rows([2, 3], "new"))
+    assert (up.operation, up.rows_inserted, up.rows_updated) == ("upsert", 1, 1)
+    assert values(reader, "acme-001") == {0: "a", 1: "a", 2: "new", 3: "new"}
+    writer.append("acme-001", SHARED, rows([10, 11], "other day", day="2026-10-20"))
+    rep = writer.replace(
+        "acme-001", SHARED, rows([7], "replaced"), where=[("day", "==", "2026-10-19")]
+    )
+    assert (rep.rows_deleted, rep.rows_inserted) == (4, 1)
+    assert values(reader, "acme-001") == {7: "replaced", 10: "other day", 11: "other day"}
+
+
+def test_a_stale_writer_applies_its_change_again(
+    writer: LakeWriter, catalog: Any, reader: LakeReader
+) -> None:
+    writer.append("acme-001", SHARED, rows(range(3), "a"))
+    stale = catalog.load_table("silver.items")
+    writer.upsert("acme-001", SHARED, rows([1], "from-other-writer"))
+    loads = iter([stale])
+    original = writer._load
+
+    def load(identifier: str) -> Any:
+        return next(loads, None) or original(identifier)
+
+    writer._load = load  # type: ignore[method-assign]
+    result = writer.upsert("acme-001", SHARED, rows([2], "from-stale-writer"))
+    assert result.attempts == 2, "conflict detected, applied again on the new state"
+    assert values(reader, "acme-001") == {0: "a", 1: "from-other-writer", 2: "from-stale-writer"}
+
+
+def test_a_tenants_own_table_lives_in_its_location(
+    writer: LakeWriter, reader: LakeReader, bucket: str
+) -> None:
+    writer.create_table("acme-001", OWN, SCHEMA)
+    result = writer.append("acme-001", OWN, rows(range(2), "own"))
+    assert result.table == "silver.events__acme_001"
+    files = reader.files("acme-001", OWN)
+    assert files and files[0].startswith(
+        f"s3://{bucket}/silver/tenant_id=acme-001/data_type=events/"
+    )
+    assert values(reader, "acme-001", OWN) == {0: "own", 1: "own"}
+
+
+def test_compaction_rewrites_small_files_only_for_the_tenant(
+    writer: LakeWriter, catalog: Any, reader: LakeReader
+) -> None:
+    for i in range(6):
+        writer.append("acme-001", SHARED, rows([i], "a"))
+    for i in range(3):
+        writer.append("tenant-b", SHARED, rows([i], "b"))
+    table = catalog.load_table("silver.items")
+    before = len(table.inspect.files())
+    result = LakeMaintenance(writer).compact("acme-001", SHARED, min_files=4)
+    assert (result.partitions, result.files_removed, result.files_added) == (1, 6, 1)
+    after = catalog.load_table("silver.items").inspect.files()
+    assert len(after) == before - 5
+    assert values(reader, "acme-001") == {i: "a" for i in range(6)}
+    assert values(reader, "tenant-b") == {i: "b" for i in range(3)}
+    assert LakeMaintenance(writer).compact("acme-001", SHARED).partitions == 0
+
+
+def test_compaction_backs_off_when_a_writer_changed_the_files(
+    writer: LakeWriter, catalog: Any, reader: LakeReader
+) -> None:
+    for i in range(5):
+        writer.append("acme-001", SHARED, rows([i], "a"))
+    maintenance = LakeMaintenance(writer)
+    stale = catalog.load_table("silver.items")
+    writer.upsert("acme-001", SHARED, rows([0], "updated meanwhile"))
+    loads = iter([stale, stale])
+    original = writer._load
+    writer._load = lambda identifier: next(loads, None) or original(identifier)  # type: ignore[method-assign]
+    result = maintenance.compact("acme-001", SHARED, min_files=4)
+    assert result.conflicts == 1 and result.partitions == 0
+    writer._load = original  # type: ignore[method-assign]
+    assert values(reader, "acme-001")[0] == "updated meanwhile", "the writer won"
+    assert len(values(reader, "acme-001")) == 5
+
+
+def test_expire_snapshots_keeps_the_latest(writer: LakeWriter, catalog: Any) -> None:
+    for i in range(5):
+        writer.append("acme-001", SHARED, rows([i], "a"), batch_id=f"B-{i}")
+    expired = LakeMaintenance(writer).expire_snapshots(
+        "acme-001", SHARED, older_than_hours=0, retain_last=2
+    )
+    assert expired == 3
+    assert len(catalog.load_table("silver.items").snapshots()) == 2
+    # Batches of expired snapshots are no longer recognized.
+    assert not writer.append("acme-001", SHARED, rows([0], "a"), batch_id="B-0").skipped
+    assert writer.append("acme-001", SHARED, rows([4], "a"), batch_id="B-4").skipped
