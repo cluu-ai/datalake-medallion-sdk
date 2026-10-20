@@ -399,3 +399,42 @@ def test_large_upserts_never_duplicate_a_key_a_concurrent_writer_added(
     ids = t.column("id").to_pylist()
     assert len(ids) == len(set(ids)) == 5_001, "no key stored twice"
     assert values(reader, "acme-001")[5_000] == "upserted"
+
+
+def test_orphan_files_are_removed_and_referenced_files_kept(
+    writer: LakeWriter, catalog: Any, reader: LakeReader
+) -> None:
+    for i in range(5):
+        writer.append("acme-001", SHARED, rows([i], "a"))
+    LakeMaintenance(writer).compact("acme-001", SHARED)  # old files stay referenced by snapshots
+    table = catalog.load_table("silver.items")
+    stray = f"{table.location()}/data/stray-from-a-failed-commit.parquet"
+    import pyarrow.parquet as pq
+
+    with table.io.new_output(stray).create() as out:
+        pq.write_table(pa.table({"x": [1]}), out)
+    maintenance = LakeMaintenance(writer)
+    preview = maintenance.remove_orphan_files("acme-001", SHARED, older_than_hours=0, dry_run=True)
+    assert preview.paths == [stray] and preview.files == 1
+    assert table.io.new_input(stray).exists(), "dry run deletes nothing"
+    done = maintenance.remove_orphan_files("acme-001", SHARED, older_than_hours=0)
+    assert done.files == 1 and not table.io.new_input(stray).exists()
+    assert maintenance.remove_orphan_files("acme-001", SHARED, older_than_hours=0).files == 0
+    assert values(reader, "acme-001") == {i: "a" for i in range(5)}
+    recent = maintenance.remove_orphan_files("acme-001", SHARED, dry_run=True)
+    assert recent.files == 0, "files newer than the safety window are never candidates"
+
+
+def test_add_columns(writer: LakeWriter, reader: LakeReader) -> None:
+    from datalake_medallion_sdk import ConfigurationError
+
+    writer.append("acme-001", SHARED, rows([1], "a"))
+    extended = rows([2], "b").append_column("score", pa.array([0.5]))
+    with pytest.raises(ConfigurationError, match="add_columns"):
+        writer.append("acme-001", SHARED, extended)
+    writer.add_columns("acme-001", SHARED, pa.schema([("score", pa.float64())]))
+    writer.append("acme-001", SHARED, extended)
+    t = reader.read("acme-001", SHARED, columns=["id", "score"], order_by=["id"])
+    assert t.column("score").to_pylist() == [None, 0.5]
+    with pytest.raises(ConfigurationError, match="another type"):
+        writer.add_columns("acme-001", SHARED, pa.schema([("score", pa.string())]))

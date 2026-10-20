@@ -72,7 +72,7 @@ from .metrics import (
 )
 from .reader import ChangeSet, LakeReader, TableRef
 from .tenancy import DataKeyProvider, FieldProtector, TenantResolver
-from .writer import CompactionResult, LakeMaintenance, LakeWriter, WriteResult
+from .writer import CompactionResult, LakeMaintenance, LakeWriter, OrphanResult, WriteResult
 
 # PEP 440 version of the installed distribution (the Rust crate uses SemVer,
 # e.g. 0.1.0-rc.1 for 0.1.0rc1).
@@ -103,6 +103,7 @@ __all__ = [
     "MalformedPayloadError",
     "Metric",
     "MetricsSink",
+    "OrphanResult",
     "PiiDecryptor",
     "PiiProtection",
     "PreIngestHookResult",

@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from pyiceberg.expressions import BooleanExpression
     from pyiceberg.table import Table
 
-__all__ = ["CompactionResult", "LakeMaintenance", "LakeWriter", "WriteResult"]
+__all__ = ["CompactionResult", "LakeMaintenance", "LakeWriter", "OrphanResult", "WriteResult"]
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,18 @@ class WriteResult:
     """The batch was already committed; nothing was written."""
     attempts: int = 1
     """Commits tried, counting re-applications after a conflict."""
+
+
+@dataclass(frozen=True, slots=True)
+class OrphanResult:
+    """Outcome of :meth:`LakeMaintenance.remove_orphan_files`."""
+
+    table: str
+    files: int
+    """Unreferenced files found (and removed unless ``dry_run``)."""
+    bytes: int
+    paths: list[str]
+    """Their locations (the first 1,000)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +272,12 @@ def _upsert_vectorized(
             rewrite.append_data_file(data_file)
     tx.commit_transaction()
     return len(rows) - matched_keys, matched_keys, matched.num_rows - matched_keys
+
+
+def pa_schema(fields: Sequence[Any]) -> pa.Schema:
+    import pyarrow as pa
+
+    return pa.schema(fields)
 
 
 def _require_pyiceberg() -> None:
@@ -463,6 +481,31 @@ class LakeWriter:
         except TableAlreadyExistsError:
             return self._catalog.load_table(identifier)
 
+    def add_columns(
+        self, tenant: TenantProfile | str, table: TableRef, columns: pa.Schema
+    ) -> Table:
+        """Adds ``columns`` to ``table`` as optional columns.
+
+        Only new columns are added; a column that exists with another type is
+        refused, so stored data never changes meaning. Existing rows read the
+        new columns as null.
+        """
+        identifier = self.identifier(self._profile(tenant), table)
+        iceberg = self._load(identifier)
+        current = iceberg.schema().as_arrow()
+        clash = [
+            f.name
+            for f in columns
+            if f.name in current.names and not current.field(f.name).type.equals(f.type)
+        ]
+        if clash:
+            raise ConfigurationError(f"columns exist with another type: {clash}")
+        new = [f.with_nullable(True) for f in columns if f.name not in current.names]
+        if new:
+            with iceberg.update_schema() as update:
+                update.union_by_name(pa_schema(new))
+        return self._load(identifier)
+
     def _load(self, identifier: str) -> Table:
         return self._catalog.load_table(identifier)
 
@@ -493,7 +536,9 @@ class LakeWriter:
         names = [f.name for f in target]
         missing = [n for n in rows.column_names if n not in names]
         if missing:
-            raise ConfigurationError(f"columns not in the table: {missing}")
+            raise ConfigurationError(
+                f"columns not in the table: {missing} (add them with LakeWriter.add_columns)"
+            )
         import pyarrow as pa
 
         columns = [
@@ -861,6 +906,74 @@ class LakeMaintenance:
             result["conflicts"],
             remaining=len(groups) - done,
         )
+
+    @traced("maintenance.remove_orphan_files")
+    def remove_orphan_files(
+        self,
+        tenant: TenantProfile | str,
+        table: TableRef,
+        *,
+        older_than_hours: float = 72.0,
+        dry_run: bool = False,
+    ) -> OrphanResult:
+        """Deletes files under the table's location that no snapshot or
+        metadata file references: leftovers of failed or abandoned commits.
+
+        Only files older than ``older_than_hours`` are considered, so files of
+        a commit in progress are never touched; keep it well above the
+        longest write. The table's location must not hold other tables.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        import pyarrow.fs as pafs
+
+        writer = self._writer
+        identifier = writer.identifier(writer._profile(tenant), table)
+        iceberg = writer._load(identifier)
+        io: Any = iceberg.io  # PyArrowFileIO: parse_location and fs_by_scheme
+        meta = iceberg.metadata
+        referenced = {iceberg.metadata_location}
+        referenced.update(entry.metadata_file for entry in meta.metadata_log)
+        referenced.update(stat.statistics_path for stat in meta.statistics)
+        manifests: dict[str, Any] = {}
+        for snapshot in iceberg.snapshots():
+            referenced.add(snapshot.manifest_list)
+            for manifest in snapshot.manifests(io):
+                manifests[manifest.manifest_path] = manifest
+        referenced.update(manifests)
+
+        def files_of(manifest: Any) -> list[str]:
+            return [
+                e.data_file.file_path
+                for e in manifest.fetch_manifest_entry(io, discard_deleted=False)
+            ]
+
+        with ThreadPoolExecutor(16) as pool:
+            for paths in pool.map(files_of, manifests.values()):
+                referenced.update(paths)
+
+        def key(location: str) -> str:
+            return location.split("://", 1)[-1]
+
+        known = {key(r) for r in referenced}
+        scheme, netloc, root = io.parse_location(meta.location, io.properties)
+        fs = io.fs_by_scheme(scheme, netloc)
+        cutoff_ns = int((time.time() - older_than_hours * 3600) * 1e9)
+        orphans = [
+            info
+            for info in fs.get_file_info(
+                pafs.FileSelector(root, recursive=True, allow_not_found=True)
+            )
+            if info.type == pafs.FileType.File
+            and key(info.path) not in known
+            and info.mtime_ns is not None
+            and info.mtime_ns < cutoff_ns
+        ]
+        paths = [f"{scheme}://{info.path}" for info in orphans]
+        if not dry_run and paths:
+            with ThreadPoolExecutor(16) as pool:
+                list(pool.map(io.delete, paths))
+        return OrphanResult(identifier, len(paths), sum(i.size or 0 for i in orphans), paths[:1000])
 
     @traced("maintenance.expire_snapshots")
     def expire_snapshots(
