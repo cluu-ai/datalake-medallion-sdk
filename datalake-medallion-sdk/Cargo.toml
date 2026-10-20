@@ -1,6 +1,6 @@
 [package]
 name = "datalake-medallion-sdk"
-description = "Contract-enforced Bronze ingestion for multi-tenant medallion data lakes: JSON Schema validation, per-tenant locations, optional PII protection with per-tenant KMS data keys, quarantine of invalid records and Hive-partitioned Parquet on object storage"
+description = "Core of datalake-medallion-sdk for multi-tenant medallion data lakes: contract-checked ingestion into Bronze (JSON Schema validation, per-call tenant locations, optional PII protection with per-tenant KMS data keys, quarantine), streaming of inputs of any size, OpenTelemetry logs and Hive-partitioned Parquet on object storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

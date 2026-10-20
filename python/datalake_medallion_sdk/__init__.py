@@ -1,31 +1,22 @@
-"""Contract-enforced ingestion and tenant-scoped reads for medallion data lakes.
+"""Build and serve multi-tenant medallion data lakes on S3.
 
-Quick start (see the README for the contract file)::
+* ``BronzeIngestionClient``: contract-checked ingestion into Bronze (dicts,
+  JSON, Arrow, Polars, DuckDB, files, streams, OpenTelemetry logs).
+* ``LakeWriter`` / ``LakeMaintenance`` (extra ``[write]``): Silver and Gold
+  Iceberg tables, written per tenant, and their scheduled maintenance.
+* ``LakeReader`` (extra ``[read]``): tenant-scoped reads of Parquet and
+  Iceberg tables in any layer.
 
-    import asyncio
+Every client serves all tenants: each call names its tenant, whose profile
+decides where data lives and how PII is protected (off by default)::
+
     from datalake_medallion_sdk import BronzeIngestionClient, ContractRegistry, TenantProfile
 
     client = BronzeIngestionClient(ContractRegistry.from_directory("contracts"))
     acme = TenantProfile.for_bucket("acme-001", "acme-lake")
+    report = await client.ingest(rows, tenant=acme, contract="security/login_event/1.0.0")
 
-
-    async def main() -> None:
-        report = await client.ingest(
-            [{"event_id": "0b7d6a52-3c1e-4f5e-9a4b-1f2d3c4b5a69",
-              "occurred_at": "2026-10-01T12:00:00Z", "outcome": "SUCCESS"}],
-            tenant=acme,
-            contract="security/login_event/1.0.0",
-        )
-        print(report.records_ok, report.data_uri)
-
-
-    asyncio.run(main())
-
-Read it back with ``LakeReader`` (extra ``[read]``)::
-
-    from datalake_medallion_sdk import LakeReader, TableRef
-
-    table = LakeReader().read(acme, TableRef.bronze("login_event"))
+See the README for writing Silver and Gold and for reading the lake.
 """
 
 from __future__ import annotations

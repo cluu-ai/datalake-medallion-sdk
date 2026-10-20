@@ -5,20 +5,32 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org)
 
-Ingest data into a multi-tenant data lake on S3 with every record checked against a data contract, and read it back per tenant without Athena or Glue. Rust core, Python API.
+**Build and serve a multi-tenant medallion data lake on S3.** Ingest raw data into Bronze with every record checked against a contract, write Silver and Gold as Iceberg tables, and read any layer per tenant in milliseconds, without Athena, Glue jobs or Spark. Rust core, Python API.
 
-A *medallion* lake keeps data in layers: **Bronze** holds raw data as received (validated here), **Silver** cleaned and conformed data, **Gold** aggregates for consumers. This SDK writes Bronze and reads every layer:
+## Why this SDK
 
-- **Contract first**: each record is validated against a JSON Schema contract before anything is written. Valid records become one Hive-partitioned Parquet object with lineage columns; invalid records go to a quarantine location with the reason attached.
-- **Multi-tenant by design**: every call names its tenant, and the tenant's profile decides where its data lives (its own buckets or prefixes) and how its personal data is protected.
-- **PII protection, off by default**: fields marked as PII can be hashed, HMAC-ed, encrypted with a per-tenant KMS data key, or protected with your own scheme.
-- **Fast reads without a query service**: `LakeReader` scans a tenant's Parquet and Iceberg tables straight from S3 with Polars or DuckDB and returns Arrow.
+- **The whole lake, one SDK.** Bronze ingestion, Silver and Gold writes, incremental Bronze-to-Silver jobs, table maintenance and tenant-scoped reads.
+- **Micro-tenant by design.** Create a client once and use it for every tenant: each call names its tenant, and the tenant's profile decides where data is written to or read from (its own buckets or prefixes). Nothing is global.
+- **Any input.** Arrow tables and streams, pyarrow datasets, Polars and DuckDB results, dicts, JSON, CSV, JSON Lines and Parquet files, OpenTelemetry logs.
+- **Contract first.** Every record is validated against a JSON Schema contract before anything is written; invalid records go to quarantine with the reason, never to the lake.
+- **Privacy, off by default.** Fields marked as PII are stored as received unless the tenant's profile protects them (hash, HMAC, AES-256-GCM with per-tenant KMS data keys, or your own scheme).
+- **Open table formats.** Hive-partitioned Parquet in Bronze, Iceberg (or Parquet) in Silver and Gold, readable by any engine.
+- **Fast and safe to retry.** Columnar paths in Rust, bounded memory for inputs of any size, idempotent writes that never duplicate rows, and correct results with concurrent writers.
+
+## The lake at a glance
+
+| Layer | Stored as | Write with | Guarantees |
+|---|---|---|---|
+| **Bronze**: data as received | Parquet, partitioned by tenant, table and day | `BronzeIngestionClient` | contract validation, quarantine, lineage columns, optional PII protection, optional commit manifests |
+| **Silver**: cleaned and conformed | Iceberg tables (shared by tenants or per tenant) | `LakeWriter` | tenant isolation, append / upsert / replace in one commit, conflict-safe, idempotent by batch |
+| **Gold**: aggregates for consumers | Iceberg tables | `LakeWriter` | the same |
+| any layer | | `LakeReader` reads, `LakeMaintenance` compacts and expires | reads always filtered to the tenant; maintenance never in the write path |
 
 ## Install
 
 ```bash
-pip install datalake-medallion-sdk            # ingestion
-pip install "datalake-medallion-sdk[read]"    # + LakeReader with Polars (recommended)
+pip install datalake-medallion-sdk                    # Bronze ingestion
+pip install "datalake-medallion-sdk[read,write]"      # + LakeReader and LakeWriter
 ```
 
 | Extra | Adds | For |
@@ -26,13 +38,15 @@ pip install "datalake-medallion-sdk[read]"    # + LakeReader with Polars (recomm
 | *(none)* | nothing | ingestion of dicts, JSON and Arrow (via the [PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html)) |
 | `[read]` | Polars, pyarrow, pyiceberg | `LakeReader` with the default engine |
 | `[duckdb]` | DuckDB, pyarrow | `LakeReader(engine="duckdb")` |
-| `[pyarrow]`, `[polars]` | that library | building Arrow input yourself |
+| `[write]` | pyarrow, pyiceberg 0.12 | `LakeWriter`, `LakeMaintenance` |
+| `[otel]` | opentelemetry-api | spans and metrics of the SDK's own operations |
+| `[pyarrow]`, `[polars]` | that library | building Arrow input yourself, `ingest_file` |
 
 Wheels are `abi3` (one wheel per platform for CPython 3.12+) for Linux (glibc and musl, x86_64 and aarch64), macOS on Apple silicon and Windows x86_64. Other platforms build from the source distribution and need a Rust toolchain.
 
 ## Quickstart
 
-**1. Write a contract.** Save this as `contracts/security/login_event.schema.json` (a fuller version is in [`examples/contracts`](examples/contracts)). `ContractRegistry.from_directory` loads every `*.schema.json` below a folder.
+**1. Describe the data.** A contract is a JSON Schema with a few `x-dl-` keywords. Save it as `contracts/security/login_event.schema.json` (more in [`examples/contracts`](examples/contracts)):
 
 ```json
 {
@@ -46,17 +60,14 @@ Wheels are `abi3` (one wheel per platform for CPython 3.12+) for Linux (glibc an
     "event_id":    {"type": "string", "format": "uuid"},
     "occurred_at": {"type": "string", "format": "date-time"},
     "outcome":     {"type": "string", "enum": ["SUCCESS", "FAILURE", "LOCKED"]},
-    "attempts":    {"type": "integer", "minimum": 1},
     "user_email":  {"type": "string", "format": "email", "x-dl-pii": true}
   }
 }
 ```
 
-**2. Ingest.** Credentials come from the AWS default chain (environment, profile, SSO, role). The bucket must exist.
+**2. Set up the clients once.** Tenants are profiles (locations and protection); the client serves all of them. Credentials come from the AWS default chain.
 
 ```python
-import asyncio
-
 from datalake_medallion_sdk import (
     BronzeIngestionClient,
     ContractRegistry,
@@ -64,42 +75,53 @@ from datalake_medallion_sdk import (
     TenantRegistry,
 )
 
-contracts = ContractRegistry.from_directory("contracts")  # compiles every contract, all-or-nothing
-tenants = TenantRegistry([TenantProfile.for_bucket("acme-001", "acme-lake")])
-client = BronzeIngestionClient(contracts, tenants=tenants)
-
-
-async def main() -> None:
-    report = await client.ingest(
-        [
-            {
-                "event_id": "0b7d6a52-3c1e-4f5e-9a4b-1f2d3c4b5a69",
-                "occurred_at": "2026-10-01T12:00:00Z",
-                "outcome": "SUCCESS",
-                "user_email": "ana@example.com",
-            },
-            {"event_id": 42},  # invalid: quarantined, not written to Bronze
-        ],
-        tenant="acme-001",
-        contract="security/login_event/1.0.0",
-    )
-    print(report.records_ok, report.records_quarantined, report.rejections)
-    # 1 1 {'ERR_SCHEMA_VIOLATION': 1}
-    print(report.data_uri)
-    # s3://acme-lake/bronze/tenant_id=acme-001/data_type=login_event/year=…/<batch_id>.parquet
-
-
-asyncio.run(main())
+tenants = TenantRegistry(
+    [
+        TenantProfile.for_bucket("acme-001", "acme-lake"),  # its own bucket
+        TenantProfile.for_bucket("globex-002", "globex-lake"),  # another one; PII stays as received
+    ]
+)
+client = BronzeIngestionClient(ContractRegistry.from_directory("contracts"), tenants=tenants)
 ```
 
-**3. Read it back** (`pip install "datalake-medallion-sdk[read]"`):
+**3. Ingest into Bronze**, naming the tenant on each call. Any input works: dicts, JSON, Arrow, Polars, files, streams.
 
 ```python
-from datalake_medallion_sdk import LakeReader, TableRef
+report = await client.ingest(
+    [
+        {
+            "event_id": "0b7d6a52-3c1e-4f5e-9a4b-1f2d3c4b5a69",
+            "occurred_at": "2026-10-01T12:00:00Z",
+            "outcome": "SUCCESS",
+            "user_email": "ana@example.com",
+        },
+        {"event_id": 42},  # invalid: quarantined, not written
+    ],
+    tenant="acme-001",
+    contract="security/login_event/1.0.0",
+)
+print(report.records_ok, report.records_quarantined)  # 1 1
+await client.ingest_file(
+    "s3://landing/globex/logins.csv.gz", tenant="globex-002", contract="security/login_event/1.0.0"
+)
+```
 
-reader = LakeReader(tenants=tenants)
-events = reader.read("acme-001", TableRef.bronze("login_event"), columns=["event_id", "outcome"])
-print(events.num_rows)  # a pyarrow.Table
+**4. Write Silver and read it back** (`pip install "datalake-medallion-sdk[read,write]"`):
+
+```python
+from pyiceberg.catalog import load_catalog
+from datalake_medallion_sdk import LakeReader, LakeWriter, TableRef
+
+catalog = load_catalog("lake", type="glue")  # or REST, SQL...
+reader = LakeReader(tenants, catalog=catalog)
+writer = LakeWriter(tenants, catalog=catalog)
+
+logins = TableRef.iceberg("silver", "logins", identifier="silver.logins")  # shared by tenants
+bronze = reader.read("acme-001", TableRef.bronze("login_event"), columns=["event_id", "outcome"])
+writer.create_table("acme-001", logins, bronze.schema, keys=["event_id"])
+writer.upsert("acme-001", logins, bronze, batch_id="2026-10-01")  # idempotent
+
+print(reader.read("acme-001", logins).num_rows)  # only acme-001's rows, as Arrow
 ```
 
 The rest of this page covers each piece in depth.
@@ -113,7 +135,9 @@ The rest of this page covers each piece in depth.
 | An Arrow stream: pyarrow dataset, DuckDB result, Polars, Kafka batches… | `client.ingest_stream(reader)` | 0.7–0.8 M records/s with bounded memory |
 | A DataFrame already in memory | `client.ingest(df)` | 0.5 M records/s (one object) |
 | Application logs in OTLP/JSON, from an API or a queue batch | `client.ingest_otel_logs(body)` / `ingest_otel_log_batch(bodies)` | 1 M records (396 MiB) in **2.5 s**, one object per tenant |
-| Repeated per-tenant reads: APIs, dashboards | `LakeReader(cache_mb=1024)` (Polars) | **22–67 ms** per query on 3.1 M rows |
+| Cleaned or aggregated data for Silver and Gold | `LakeWriter.append / upsert / replace` | 3.16 M rows appended in **8.1 s**; 29 k-row upsert in **2.5 s** |
+| Small files and old snapshots to clean up | `LakeMaintenance` on a schedule | 210 small files compacted into 7 in 67 s |
+| Repeated per-tenant reads: APIs, dashboards | `LakeReader(cache_mb=1024)` (Polars) | **6–67 ms** per query (Gold and Bronze, 2–3 M rows) |
 | One-off or low-memory reads, SQL | `LakeReader(engine="duckdb")` | 100–950 ms, 0.3–0.7 GB |
 | Encrypted PII to read back | `PiiDecryptor.decrypt_column(...)` | 3.1 M values in **1.1 s** |
 
@@ -650,7 +674,7 @@ Minimum supported Rust version: 1.94.1. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Scope
 
-The SDK covers Bronze ingestion to S3 and S3-compatible stores (single calls and streams of any size), and tenant-scoped reads of Parquet and Iceberg tables in every layer. Silver/Gold transformations, writing Iceberg or Delta tables, catalog registration and other object stores are not part of this release.
+The SDK covers the data plane of a medallion lake on S3 and S3-compatible stores: contract-checked ingestion into Bronze (single calls, streams and files of any size, OpenTelemetry logs), Silver and Gold writes to Iceberg through any PyIceberg catalog, their maintenance, and tenant-scoped reads of Parquet and Iceberg tables. Provisioning (buckets, catalogs, IAM, KMS keys) and orchestration (schedulers, queues) stay in your infrastructure; [`examples/`](examples) shows common setups.
 
 ## License
 

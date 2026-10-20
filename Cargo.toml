@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/cluu-ai/datalake-medallion-sdk"
 homepage = "https://github.com/cluu-ai/datalake-medallion-sdk"
 documentation = "https://docs.rs/datalake-medallion-sdk"
-keywords = ["datalake", "medallion", "parquet", "arrow", "data-contracts"]
+keywords = ["datalake", "medallion", "lakehouse", "parquet", "data-contracts"]
 categories = ["database", "encoding", "api-bindings"]
 
 [profile.dev]
