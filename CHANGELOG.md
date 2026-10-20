@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0rc1] - 2026-10-20
+
 ### Added
 
 - `LakeWriter` (extra `[write]`, PyIceberg 0.12): `append`, `upsert(keys)` and `replace(where)` of a tenant's rows in Silver and Gold Iceberg tables through a catalog (AWS Glue, REST, SQL…), and `create_table` for tables shared by tenants (required `tenant_id`, partitioned by it) or owned by one tenant (below its location). Rows of another tenant are rejected and every `upsert` / `replace` is scoped to the tenant. On a real conflict with another writer the operation is applied again on the new state; `batch_id` makes writes idempotent. `WriteResult` with inserted, updated and deleted rows.
