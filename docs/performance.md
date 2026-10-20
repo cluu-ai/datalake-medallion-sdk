@@ -160,6 +160,36 @@ What this means:
 
 ---
 
+## Iceberg writes on AWS (0.3.0)
+
+`LakeWriter` on AWS Lambda (10 GB / 6 vCPU) with the AWS Glue catalog, S3 in the same region; a shared table partitioned by `tenant_id` and day.
+
+| Operation | Time | Notes |
+|---|---|---|
+| Append 3.16 M rows | 8.1 s | one commit |
+| The same batch again | 0.36 s | skipped by `batch_id` |
+| Upsert 29 k rows of 2 days, `partition_scoped=True` | 2.5 s | only those partitions rewritten |
+| Upsert 100 k keys spread over every partition | 14.1 s | matched in Arrow; 545 s before (PyIceberg binds its `In` filter again per data file) |
+| Replace one day | 2.7 s | |
+| 16 appends by 4 tenants at once | all committed | catalog conflicts retried, no error |
+| Two upserts of the same 29 k keys at once | the second re-applied | no key stored twice |
+| Compact 210 small files into 7 | 67 s | within a 600 s budget |
+| Expire 35 snapshots | 0.95 s | |
+
+Writing the same 1 M rows with DuckDB 1.5 through the Glue Iceberg REST catalog took 53.5 s against 8.1 s for 3.16 M rows with `LakeWriter`: the writer is built on PyIceberg, the only engine with commit retries and conflict validation for overwrite and upsert.
+
+## Serving Gold on AWS
+
+An API pattern over Gold Iceberg tables (scan lookup, family total, page of 100 rows), 1.92 M rows for 4 tenants over 12 monthly partitions, 60 requests across tenants after one cold request:
+
+| Reader | p50 | p95 | First request |
+|---|---|---|---|
+| `LakeReader(engine="polars", cache_mb=2048)` | **6.3 ms** | **36.4 ms** | 2.3 s |
+| DuckDB attached to the Glue Iceberg REST catalog, `MAX_TABLE_STALENESS '2 minutes'` | 208 ms | 555 ms | 2.7 s |
+| `LakeReader(engine="duckdb")`, no cache | 823 ms | 1,166 ms | 3.1 s |
+
+The cache keeps the tenant's data files in memory (about 1.8 GB for these tables); see [serving-gold.md](serving-gold.md).
+
 ## Configuration in brief
 
 | Setting | Default | When to change it |

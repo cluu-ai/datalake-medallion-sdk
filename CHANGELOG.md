@@ -11,10 +11,15 @@ All notable changes to this project are documented here. The format follows
 - `LakeWriter` (extra `[write]`, PyIceberg 0.12): `append`, `upsert(keys)` and `replace(where)` of a tenant's rows in Silver and Gold Iceberg tables through a catalog (AWS Glue, REST, SQL…), and `create_table` for tables shared by tenants (required `tenant_id`, partitioned by it) or owned by one tenant (below its location). Rows of another tenant are rejected and every `upsert` / `replace` is scoped to the tenant. On a real conflict with another writer the operation is applied again on the new state; `batch_id` makes writes idempotent. `WriteResult` with inserted, updated and deleted rows.
 - `LakeMaintenance`, for scheduled jobs outside the write path: `compact` rewrites small files per partition and leaves a partition a writer changed meanwhile for the next run; `expire_snapshots(older_than_hours, retain_last)`.
 - `LakeReader.read_changes(tenant, table, changes)`: the rows of the objects of a `ChangeSet`, refusing objects of another tenant; with `LakeWriter(batch_id=...)` it makes incremental Bronze to Silver jobs exactly-once.
+- `LakeWriter.upsert(partition_scoped=True)` and Arrow matching for upserts of more than 1,000 keys (100 k keys over a whole table on AWS: 545 s to 14.1 s); exact counts when keys were stored twice. `LakeWriter.add_columns` for additive schema changes. `LakeMaintenance.remove_orphan_files`; `compact` reads files in parallel, works in bounded groups and stops within `max_seconds` (reports `remaining`).
+- Commits rejected by the catalog (`CommitFailedException`) are applied again by the writer; new tables get more PyIceberg commit retries.
+- `LakeReader(cache_mb=...)` also caches the data files of Iceberg tables (the tenant's partition of a shared table): an API pattern over Gold tables went from a p50 of 229 ms to 6.3 ms on AWS. `docs/serving-gold.md`.
 
 ### Fixed
 
 - Upserts with thousands of composite keys: PyIceberg's own upsert nests one `Or` per key and overflowed the stack with 10 k keys (always composite in shared tables). `LakeWriter.upsert` uses one overwrite with a shallow key filter instead.
+
+## [0.2.0rc12] - 2026-10-19
 
 ### Added
 
