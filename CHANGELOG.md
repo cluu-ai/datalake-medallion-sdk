@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-20
+
+The SDK now covers the whole medallion lake: contract-checked Bronze ingestion, Silver and Gold Iceberg writes with their maintenance, and tenant-scoped reads of every layer. This release includes everything in 0.2.0rc6 to 0.3.0rc1 below.
+
+### Changed
+
+- README, package metadata and repository description present the SDK for Bronze, Silver and Gold.
+
+### Fixed
+
+- `docs/iam.md`: the least-privilege ingestion and reader policies now include the `_manifests/` prefix used with `manifests=True` and `LakeReader.changes()`; policies for `LakeWriter` and `LakeMaintenance` added.
+
 ## [0.3.0rc1] - 2026-10-20
 
 ### Added
