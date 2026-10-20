@@ -187,6 +187,81 @@ def _partition_scope(
     return cast("BooleanExpression", out)
 
 
+# Above this many distinct keys an upsert matches rows in Arrow instead of
+# with an Iceberg ``In`` expression: PyIceberg binds that expression again for
+# every data file, a cost of files x keys (113 s for 30 k keys over 300 files).
+VECTORIZED_UPSERT_KEYS = 1_000
+
+
+def _upsert_vectorized(
+    table: Table,
+    rows: pa.Table,
+    keys: list[str],
+    scope: BooleanExpression,
+    props: dict[str, str],
+    threads: int = 16,
+) -> tuple[int, int, int] | None:
+    """Copy-on-write upsert with the matching done in Arrow, in one commit.
+
+    Reads the key columns of the files in ``scope`` in parallel, rewrites only
+    the files holding a matched key (without those rows) and adds ``rows``.
+    The commit replaces exact files, so PyIceberg fails it if a writer
+    deleted or rewrote one of them meanwhile, or (serializable isolation)
+    added any file: the caller then applies the upsert again. Returns None
+    when the table has delete files (the caller falls back to the filter path).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+    from pyiceberg.io.pyarrow import _dataframe_to_data_files
+
+    tasks = list(table.scan(row_filter=scope).plan_files())
+    if any(task.delete_files for task in tasks):
+        return None
+    io = table.io
+    target = table.schema().as_arrow()
+    wanted = rows.select(keys).group_by(keys).aggregate([])
+    single = len(keys) == 1
+    value_set = wanted.column(keys[0]) if single else None
+
+    def matches(task: Any) -> tuple[Any, pa.BooleanArray | None, pa.Table | None]:
+        found = pq.read_table(io.new_input(task.file.file_path).open(), columns=keys)
+        if single:
+            mask = pc.is_in(found.column(keys[0]), value_set=value_set)
+        else:
+            numbered = found.append_column("__row", pa.array(range(found.num_rows), pa.int64()))
+            hit = numbered.join(wanted, keys=keys, join_type="inner").column("__row")
+            mask = pc.is_in(pa.array(range(found.num_rows), pa.int64()), value_set=hit)
+        if not pc.any(mask).as_py():
+            return task, None, None
+        return task, mask, found.filter(mask)
+
+    with ThreadPoolExecutor(max(1, threads)) as pool:
+        hits = [h for h in pool.map(matches, tasks) if h[1] is not None]
+
+        def kept(hit: tuple[Any, Any, Any]) -> pa.Table:
+            task, mask, _ = hit
+            data = pq.read_table(io.new_input(task.file.file_path).open())
+            return data.filter(pc.invert(mask)).select(target.names).cast(target)
+
+        survivors = list(pool.map(kept, hits))
+    matched = pa.concat_tables([h[2] for h in hits]) if hits else pa.table({k: [] for k in keys})
+    matched_keys = matched.group_by(keys).aggregate([]).num_rows if matched.num_rows else 0
+    new_rows = pa.concat_tables([*survivors, rows.select(target.names).cast(target)])
+    tx = table.transaction()
+    with tx.update_snapshot(snapshot_properties=props).overwrite() as rewrite:
+        for task, _, _ in hits:
+            rewrite.delete_data_file(task.file)
+        for data_file in _dataframe_to_data_files(
+            table_metadata=tx.table_metadata, df=new_rows, io=io
+        ):
+            rewrite.append_data_file(data_file)
+    tx.commit_transaction()
+    return len(rows) - matched_keys, matched_keys, matched.num_rows - matched_keys
+
+
 def _require_pyiceberg() -> None:
     try:
         import pyiceberg  # noqa: F401
@@ -605,7 +680,7 @@ class LakeWriter:
         """
 
         def apply(
-            t: Table, rows: pa.Table, props: dict[str, str], _: Any
+            t: Table, rows: pa.Table, props: dict[str, str], scope: BooleanExpression
         ) -> tuple[int, int, int] | None:
             join = (
                 list(keys)
@@ -623,6 +698,13 @@ class LakeWriter:
             for k in join:
                 if rows.column(k).null_count:
                     raise ConfigurationError(f"upsert key {k!r} has null values")
+            if rows.select(join).group_by(join).aggregate([]).num_rows > VECTORIZED_UPSERT_KEYS:
+                region = (
+                    scope if partition_scoped is False else _partition_scope(t, rows, join, scope)
+                )
+                counts = _upsert_vectorized(t, rows, join, region, props)
+                if counts is not None:
+                    return counts
             match = _key_filter(rows, join)
             if partition_scoped:
                 match = _partition_scope(t, rows, join, match)

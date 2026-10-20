@@ -377,3 +377,25 @@ def test_iceberg_reads_are_served_from_the_object_cache(
         cached.close()
     finally:
         reader_module._ObjectCache._read = original  # type: ignore[method-assign]
+
+
+def test_large_upserts_never_duplicate_a_key_a_concurrent_writer_added(
+    writer: LakeWriter, catalog: Any, reader: LakeReader
+) -> None:
+    """The Arrow-matched path (> 1,000 keys) commits an exact file swap; under
+    serializable isolation a file added meanwhile fails it and the upsert is
+    applied again, so a key is never stored twice."""
+    writer.append("acme-001", SHARED, rows(range(3_000), "a"))
+    stale = catalog.load_table("silver.items")
+    writer.append("acme-001", SHARED, rows([5_000], "concurrent"))  # a key the upsert also writes
+    loads = iter([stale])
+    original = writer._load
+    writer._load = lambda identifier: next(loads, None) or original(identifier)  # type: ignore[method-assign]
+    result = writer.upsert("acme-001", SHARED, rows(range(2_000, 5_001), "upserted"))
+    writer._load = original  # type: ignore[method-assign]
+    assert result.attempts == 2, "the stale commit was rejected and applied again"
+    assert (result.rows_updated, result.rows_inserted) == (1_001, 2_000)
+    t = reader.read("acme-001", SHARED)
+    ids = t.column("id").to_pylist()
+    assert len(ids) == len(set(ids)) == 5_001, "no key stored twice"
+    assert values(reader, "acme-001")[5_000] == "upserted"
