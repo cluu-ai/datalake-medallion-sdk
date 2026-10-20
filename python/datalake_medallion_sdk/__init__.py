@@ -72,6 +72,7 @@ from .metrics import (
 )
 from .reader import ChangeSet, LakeReader, TableRef
 from .tenancy import DataKeyProvider, FieldProtector, TenantResolver
+from .writer import CompactionResult, LakeMaintenance, LakeWriter, OrphanResult, WriteResult
 
 # PEP 440 version of the installed distribution (the Rust crate uses SemVer,
 # e.g. 0.1.0-rc.1 for 0.1.0rc1).
@@ -81,6 +82,7 @@ __all__ = [
     "BronzeIngestionClient",
     "ChangeSet",
     "ClientOptions",
+    "CompactionResult",
     "ConfigurationError",
     "ContractBootError",
     "ContractRegistry",
@@ -94,11 +96,14 @@ __all__ = [
     "HookStatus",
     "InMemoryMetricsSink",
     "IngestReport",
+    "LakeMaintenance",
     "LakeReader",
+    "LakeWriter",
     "LoggingMetricsSink",
     "MalformedPayloadError",
     "Metric",
     "MetricsSink",
+    "OrphanResult",
     "PiiDecryptor",
     "PiiProtection",
     "PreIngestHookResult",
@@ -115,6 +120,7 @@ __all__ = [
     "TenantResolver",
     "TenantViolationError",
     "TypeCoercionError",
+    "WriteResult",
     "__version__",
     "batch_id_for",
     "contract_validator",

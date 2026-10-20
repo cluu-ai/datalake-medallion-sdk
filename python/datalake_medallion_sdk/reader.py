@@ -400,6 +400,9 @@ class _ObjectCache:
         self._lock = threading.Lock()
 
     def _load(self, path: str) -> pa.Table:
+        return self._read(path, hive=True)
+
+    def _read(self, path: str, hive: bool) -> pa.Table:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
@@ -409,7 +412,7 @@ class _ObjectCache:
             filesystem=self._s3.filesystem(),
             read_dictionary=_constant_columns(handle) or None,
         )
-        for key, value in _partition_values(path).items():
+        for key, value in _partition_values(path).items() if hive else ():
             if key in table.column_names:
                 continue
             if key in _INTEGER_PARTITIONS and value.isdigit():
@@ -419,9 +422,11 @@ class _ObjectCache:
             table = table.append_column(key, column)
         return table
 
-    def table(self, files: Sequence[tuple[str, str]]) -> pa.Table | None:
+    def table(self, files: Sequence[tuple[str, str]], *, hive: bool = True) -> pa.Table | None:
         """All ``(path, version)`` objects as one table, fetching only the
-        missing ones; None when they do not fit in the cache."""
+        missing ones; None when they do not fit in the cache. ``hive`` adds
+        the ``key=value`` folders of Bronze paths as columns (Iceberg data
+        files already hold their partition columns)."""
         import pyarrow as pa
 
         keys = [f"{path}#{version}" for path, version in files]
@@ -431,7 +436,8 @@ class _ObjectCache:
             ]
         if missing:
             with ThreadPoolExecutor(min(32, len(missing))) as pool:
-                tables = list(pool.map(self._load, [p for _, p in missing]))
+                load = self._load if hive else (lambda p: self._read(p, hive=False))
+                tables = list(pool.map(load, [p for _, p in missing]))
             with self._lock:
                 for (key, _), table in zip(missing, tables, strict=True):
                     if key not in self._tables:
@@ -958,6 +964,42 @@ class LakeReader:
         watermark = chosen[-1].split("/", 1)[1].removesuffix(".json") if chosen else since
         return ChangeSet(entries, watermark)
 
+    @traced("read_changes")
+    def read_changes(
+        self,
+        tenant: TenantProfile | str,
+        table: TableRef,
+        changes: ChangeSet,
+        *,
+        columns: Sequence[str] | None = None,
+    ) -> pa.Table:
+        """Rows of the data objects of ``changes`` (from :meth:`changes`), as
+        one Arrow table: the input of an incremental job. Every object must
+        belong to ``tenant``'s ``table``, so a change set of another tenant is
+        refused."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        profile = self._profile(tenant)
+        prefix = self._prefix(profile, table).rstrip("/") + "/"
+        uris = changes.data_uris
+        foreign = [u for u in uris if not u.startswith(prefix)]
+        if foreign:
+            raise TenantViolationError(
+                f"{len(foreign)} objects are not in {profile.tenant_id!r}'s {table.name} table"
+            )
+        if not uris:
+            return pa.table({c: pa.nulls(0) for c in columns or ()})
+        cols = None if columns is None else [_check_identifier(c, "column") for c in columns]
+        fs = self._s3.filesystem()
+
+        def load(uri: str) -> pa.Table:
+            return pq.read_table(uri.removeprefix("s3://"), filesystem=fs, columns=cols)
+
+        with ThreadPoolExecutor(min(16, len(uris))) as pool:
+            parts = list(pool.map(load, uris))
+        return _plain_strings(pa.concat_tables(parts, promote_options="default"))
+
     def files(self, tenant: TenantProfile | str, table: TableRef) -> list[str]:
         """Objects (Parquet) or the metadata file (Iceberg) a read of ``table`` scans."""
         _, entry = self._entry(tenant, table)
@@ -1035,15 +1077,58 @@ class LakeReader:
             files = tuple(path for path, _ in listed)
             cached = self._objects.table(listed) if self._objects is not None and files else None
             return _Source(files=files, table=cached)
+        loaded: Any = None
+        metadata: str | None
         if table.metadata_location is not None:
-            return _Source(metadata_location=table.metadata_location)
-        if table.identifier is not None:
+            metadata = table.metadata_location
+        elif table.identifier is not None:
             if self._catalog is None:
                 raise ConfigurationError("Iceberg tables named by identifier need catalog=")
             loaded = self._catalog.load_table(table.identifier)
-            return _Source(metadata_location=loaded.metadata_location)
-        location = table.location or self._prefix(profile, table)
-        return _Source(metadata_location=self._current_metadata(location))
+            metadata = loaded.metadata_location
+        else:
+            metadata = self._current_metadata(table.location or self._prefix(profile, table))
+        if metadata is not None and self._objects is not None:
+            cached = self._iceberg_cached(metadata, loaded, profile, table)
+            if cached is not None:
+                return cached
+        return _Source(metadata_location=metadata)
+
+    def _iceberg_cached(
+        self, metadata: str, loaded: Any, profile: TenantProfile, table: TableRef
+    ) -> _Source | None:
+        """The data files of the current snapshot (only the tenant's in a
+        shared table), served from the object cache: Iceberg data files are
+        immutable, so warm reads cost no S3 request. None, and the engine
+        scans the table, when the snapshot has delete files or the schema
+        evolved (the cache reads files by column name), or it does not fit."""
+        import pyiceberg.expressions
+        from pyiceberg.table import StaticTable
+
+        ex: Any = pyiceberg.expressions  # pydantic constructors type checkers cannot read
+        if self._objects is None:
+            return None
+        iceberg = loaded or StaticTable.from_metadata(
+            metadata, properties=self._s3.iceberg_properties()
+        )
+        if len(iceberg.metadata.schemas) > 1:
+            return None
+        if table.shared and TENANT_COLUMN not in iceberg.schema().column_names:
+            return None  # the engine refuses the table
+        scope = ex.EqualTo(TENANT_COLUMN, profile.tenant_id) if table.shared else ex.AlwaysTrue()
+        tasks = list(iceberg.scan(row_filter=scope).plan_files())
+        if any(task.delete_files for task in tasks):
+            return None
+        listed = sorted((t.file.file_path, str(t.file.file_size_in_bytes)) for t in tasks)
+        if not listed:
+            return None
+        cached = self._objects.table(listed, hive=False)
+        if cached is None:
+            return None
+        # Keep the metadata location: files() reports it for Iceberg tables.
+        return _Source(
+            files=tuple(path for path, _ in listed), table=cached, metadata_location=metadata
+        )
 
     def _current_metadata(self, location: str) -> str | None:
         """Newest ``metadata/*.metadata.json`` below ``location`` (None if absent).

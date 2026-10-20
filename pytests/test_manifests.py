@@ -103,3 +103,22 @@ async def test_no_manifests_by_default(
     await make_client().ingest(rows(0, 5), tenant="acme-001", contract=CONTRACT)
     assert not any("_manifests" in k for k in store.keys())
     assert reader.changes("acme-001", EVENTS, settle_seconds=0).entries == []
+
+
+async def test_read_changes_returns_the_new_rows_of_the_tenant(
+    make_client: MakeClient, reader: LakeReader, bucket: str
+) -> None:
+    from datalake_medallion_sdk import TenantViolationError
+
+    client = make_client(manifests=True)
+    await client.ingest(rows(0, 20), tenant="acme-001", contract=CONTRACT)
+    first = reader.changes("acme-001", EVENTS, settle_seconds=0)
+    await client.ingest(rows(100, 10), tenant="acme-001", contract=CONTRACT)
+    new = reader.changes("acme-001", EVENTS, since=first.watermark, settle_seconds=0)
+    table = reader.read_changes("acme-001", EVENTS, new, columns=["event_id", "attempts"])
+    # e109 is invalid: quarantined, not in Bronze.
+    assert sorted(table.column("event_id").to_pylist()) == sorted(f"e{i}" for i in range(100, 109))
+    assert table.column_names == ["event_id", "attempts"]
+    other = TenantProfile.for_bucket("tenant-b", bucket)
+    with pytest.raises(TenantViolationError, match="not in 'tenant-b'"):
+        reader.read_changes(other, EVENTS, new)

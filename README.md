@@ -439,7 +439,7 @@ by_outcome = (
   - `TableRef.bronze(data_type)`: the ingestion client's output.
   - `TableRef.parquet(layer, name)`: Hive-partitioned Parquet in Silver or Gold, below `profile.table_uri(layer, name)`.
   - `TableRef.iceberg(layer, name)`: an Iceberg table in the tenant's location, or a table shared by tenants named with `location=`, `metadata_location=` or `identifier=` (with `catalog=`, any [pyiceberg catalog](https://py.iceberg.apache.org/configuration/): REST, Glue, SQL, …). Without a catalog the current snapshot is the newest `metadata/*.metadata.json`; use a catalog when several writers commit concurrently.
-- **Caching.** Listings, Iceberg snapshots and scan plans are reused for `max_staleness` seconds (default 60); `reader.refresh(tenant)` makes new data visible at once. With `cache_mb=512` (off by default), the contents of Parquet objects stay in memory as well: the SDK never rewrites an object, so warm reads fetch only new ones. Use it in services that read Bronze repeatedly.
+- **Caching.** Listings, Iceberg snapshots and scan plans are reused for `max_staleness` seconds (default 60); `reader.refresh(tenant)` makes new data visible at once. With `cache_mb=512` (off by default), the contents of the files stay in memory as well: Bronze objects and the data files of an Iceberg table's current snapshot (only the tenant's partition of a shared table). Neither is ever rewritten in place, so warm reads fetch only new files. Use it in services that read the same tables repeatedly; tables with delete files or an evolved schema are scanned by the engine instead.
 - **Pruning.** Filters on `year`, `month` and `day` (the Bronze partition columns) skip whole objects.
 - **Engines.** `engine="polars"` (default, extra `[read]`) is the fastest with `cache_mb`. `engine="duckdb"` (extra `[duckdb]`) is the better choice without a cache and uses the least memory and `scan()` returns a DuckDB relation that accepts SQL (`relation.query("t", "SELECT ...")`). DuckDB downloads its `httpfs` and `iceberg` extensions on first use; on AWS Lambda pass `duckdb_config={"home_directory": "/tmp"}`, or point `extension_directory` at pre-installed extensions for offline environments.
 - **Credentials.** The same options as the client (`aws_region`, `aws_endpoint_url`, keys) or the AWS default chain. The reader role needs `s3:ListBucket` and `s3:GetObject` on the tenant's locations only ([policy examples](docs/iam.md)).
@@ -463,7 +463,82 @@ state["watermark"] = changes.watermark  # store it with the job's output
 - A retried upload rewrites the same entry; ingesting the same `batch_id` again adds another entry for the same objects. Treat `batch_id` (or the object URI) as the unit your job replaces, so reprocessing is idempotent.
 - Off by default; it adds one small `PUT` per batch.
 
+Serving Gold tables to an API: [docs/serving-gold.md](docs/serving-gold.md).
+
 On AWS Lambda against S3, warm queries over 3.1 M rows take 22–67 ms with Polars and `cache_mb`, and 100–950 ms with DuckDB without a cache; Iceberg tables take 67–147 ms without a cache. Athena takes 0.9–2.1 s for the same queries. Details in [docs/performance.md](docs/performance.md).
+
+## Writing Silver and Gold (Iceberg)
+
+`LakeWriter` writes a tenant's rows to Iceberg tables through a catalog (AWS Glue, REST, SQL…), and `LakeMaintenance` keeps those tables compact. Install with `pip install "datalake-medallion-sdk[write]"` (PyIceberg 0.12).
+
+```python
+from pyiceberg.catalog import load_catalog
+from datalake_medallion_sdk import LakeWriter, LakeMaintenance, TableRef
+
+catalog = load_catalog("lake", type="glue")
+writer = LakeWriter(tenants, catalog=catalog)
+
+logins = TableRef.iceberg("silver", "logins", identifier="silver.logins")  # shared by tenants
+writer.create_table("acme-001", logins, arrow_schema, partition_by=["day"], keys=["event_id"])
+
+writer.append("acme-001", logins, table, batch_id=batch_id)  # Arrow, Polars, dicts
+writer.upsert("acme-001", logins, changed_rows, batch_id=batch_id)  # by keys, one commit
+writer.replace("acme-001", logins, day_rows, where=[("day", "==", "2026-10-19")])
+```
+
+- **Tenant isolation.** A shared table (named with `identifier=`) has a required `tenant_id` column and is partitioned by it first. The writer sets or checks `tenant_id` on every row, rejects rows of another tenant, and scopes every `upsert` and `replace` to the tenant, even when another tenant has the same keys. A table that belongs to one tenant (`TableRef.iceberg("silver", "events")`) lives below the tenant's Silver or Gold location and is registered as `silver.events__<tenant>`. `LakeReader` reads both kinds.
+- **Concurrent writers.** Commits are optimistic. A commit that raced with an unrelated one (another tenant's partition) is retried by PyIceberg; when another writer changed the same rows, the writer reloads the table and applies the operation again on the new state (`conflict_retries`, default 3). Nothing is lost: verified with two writers on the same snapshot, in every combination.
+- **Idempotency.** `batch_id=` is stored in the snapshot summary with the tenant, and a batch already committed is skipped (`WriteResult.skipped`). Snapshot expiry bounds how far back batches are remembered.
+- **Results.** `WriteResult` gives the rows inserted, updated and deleted, the files added, the snapshot and the attempts.
+- **Upserts** replace the rows whose keys appear in the data in one commit; keys must be unique within the data, and rows already stored twice under one key are collapsed. They rewrite the files that hold matched rows (copy-on-write), so their cost follows how many partitions the keys reach: include the partition columns in `keys`, or pass `partition_scoped=True` when a row never changes partition (an event's day), to match only in the partitions of the data. Above 1,000 keys the rows are matched in Arrow, reading key columns in parallel. Concurrent writers never store a key twice: a commit raced by another writer is applied again.
+- **Schema.** `writer.add_columns(tenant, table, pa_schema)` adds optional columns; existing rows read them as null. Changing a column's type is refused.
+
+### Incremental Bronze to Silver
+
+With [commit manifests](#incremental-reads-changes-since-a-watermark), a job processes each new Bronze batch exactly once, even if it crashes before saving its watermark:
+
+```python
+from datalake_medallion_sdk import ChangeSet
+
+changes = reader.changes("acme-001", TableRef.bronze("login_event"), since=watermark)
+for entry in changes.entries:
+    rows = reader.read_changes(
+        "acme-001", TableRef.bronze("login_event"), ChangeSet([entry], changes.watermark)
+    )
+    writer.upsert("acme-001", logins, transform(rows), batch_id=entry["batch_id"])
+save(changes.watermark)
+```
+
+`read_changes` refuses objects outside the tenant's table. A batch already in Silver is skipped, so running the job again after a crash writes nothing twice.
+
+### Maintenance, outside the write path
+
+Run `LakeMaintenance` on a schedule (an EventBridge rule, cron, Airflow), never inside ingestion or writes:
+
+```python
+maintenance = LakeMaintenance(writer)
+maintenance.compact("acme-001", logins, target_file_mb=128)  # small files -> large ones
+maintenance.expire_snapshots("acme-001", logins, older_than_hours=168, retain_last=10)
+maintenance.remove_orphan_files("acme-001", logins, older_than_hours=72)
+```
+
+- `compact` rewrites the tenant's small files in groups of about twice `target_file_mb`, most fragmented partitions first, reading files in parallel. It stops after `max_seconds` (default 600) and reports what is left in `remaining`, so a scheduled run fits its time limit and the next one continues. A group a writer changed meanwhile is left for the next run: writers always win and no row is lost or resurrected.
+- `expire_snapshots` removes snapshots older than the limit except the last `retain_last`; their batch ids are then forgotten by the idempotency check.
+- `remove_orphan_files` deletes files under the table's location that no snapshot or metadata references (leftovers of failed commits), only past the safety window; `dry_run=True` lists them first.
+
+On AWS Lambda (10 GB) with an AWS Glue catalog and S3 in the same region:
+
+| Operation | Time |
+|---|---|
+| Append 3.16 M rows | 8.1 s |
+| Upsert 29 k changed rows of 2 days (`partition_scoped=True`) | 2.5 s |
+| Upsert 100 k keys spread over every partition | 14.1 s |
+| Replace one day | 2.7 s |
+| 16 appends by 4 tenants at once to one shared table | all committed, no error |
+| Compact 210 small files into 7 | 67 s |
+| A batch already committed, skipped | 0.36 s |
+
+Details and the comparison with DuckDB writes are in [docs/performance.md](docs/performance.md).
 
 ## Object layout
 
@@ -557,7 +632,7 @@ The core is usable from Rust (`BronzePipeline`, `ContractRegistry`, `TenantProfi
 
 ```toml
 [dependencies]
-datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.2.0rc12", default-features = false, features = ["aws-kms"] }
+datalake-medallion-sdk = { git = "https://github.com/cluu-ai/datalake-medallion-sdk", tag = "v0.3.0rc1", default-features = false, features = ["aws-kms"] }
 ```
 
 The library is imported as `_core` (`use _core::pipeline::BronzePipeline;`). `default-features = false` builds without Python, for example for an AWS Lambda; the `aws-kms` feature adds the KMS data key provider. The Rust API may change before 1.0.
