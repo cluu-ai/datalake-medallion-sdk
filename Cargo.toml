@@ -27,6 +27,10 @@ panic = "abort"
 
 [profile.bench]
 inherits = "release"
+# Thin LTO and multiple codegen units keep memory within CI runner limits while
+# preserving release-grade optimization for benchmarks.
+lto = "thin"
+codegen-units = 4
 # Line tables are enough for profilers and use far less memory than full debug info.
 debug = "line-tables-only"
 

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import tempfile
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -203,7 +203,7 @@ def iceberg_catalog(s3_endpoint: str, bucket: str) -> Iterator[Any]:
     workdir = tempfile.mkdtemp()
     catalog = SqlCatalog(
         "lake",
-        uri=f"sqlite:///{os.path.join(workdir, 'catalog.db')}",
+        uri=f"sqlite:///{Path(workdir, 'catalog.db').as_posix()}",
         warehouse=f"s3://{bucket}/warehouse",
         **{
             "s3.endpoint": s3_endpoint,
