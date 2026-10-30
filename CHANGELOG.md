@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0rc1] - 2026-10-30
+
+OTLP/protobuf and compressed log requests, with the same rows as OTLP/JSON and faster to read.
+
 ### Added
 
 - OTLP/protobuf logs: `ingest_otel_logs`, `ingest_otel_log_batch` and `otel.flatten_logs` read serialized `ExportLogsServiceRequest`s (what OTLP exporters and the Collector's `awss3exporter` write by default) as well as OTLP/JSON, with the same rows. A wire-format reader writes borrowed strings straight into the Arrow builders: no generated code, no copies.
