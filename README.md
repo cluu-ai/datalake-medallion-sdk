@@ -363,7 +363,7 @@ failed = {messages[i].id for o in outcomes if o.error for i in o.requests}
 
 - Kinesis records as written (raw protobuf, JSON or compressed);
 - SQS messages: JSON text, or protobuf in base64 (a `content-type` message attribute says which; without it, a body that does not start with `{` is decoded from base64);
-- S3 objects announced through SQS (`ObjectCreated` notifications): for example a landing bucket where the Collector's `awss3exporter` writes one request per object (`marshaler: otlp_proto`, optional `compression: gzip` or `zstd`). The batch id comes from the object keys and ETags, so a notification delivered twice rewrites the same Bronze objects;
+- S3 objects announced through SQS (`ObjectCreated` notifications): for example a landing bucket where the Collector's `awss3exporter` writes one request per object (`marshaler: otlp_proto`, optional `compression: gzip` or `zstd`). Each object is a batch of its own, named by its key and ETag, so a notification delivered twice rewrites the same Bronze objects however SQS groups it (an object uploaded again is a new event and is ingested again);
 - CloudWatch Logs subscriptions, mapped to the same OpenTelemetry columns, so every log ends up in one table.
 
 **Reading logs back.** Filter the typed `timestamp` with text, dates or datetimes; values without a zone are UTC:
@@ -382,7 +382,7 @@ errors = reader.read(
 )
 ```
 
-**Performance.** On AWS Lambda (10 GB / 6 vCPU), a batch of 500 requests with 1 M log records (396 MiB of OTLP/JSON) for 8 tenants is written to S3 in **2.5 s**, one object per tenant; the Lambda recipe handles a Kinesis batch of 100 requests in 0.5 s. Without the network (`examples/otel_throughput.rs`), 200 k records in 100 requests take 0.27 s as OTLP/JSON and 0.18 s as OTLP/protobuf; decoding alone is 2 to 2.8 times faster in protobuf, with 2.6 times fewer bytes. Details in [docs/performance.md](docs/performance.md).
+**Performance.** On AWS Lambda (10 GB / 6 vCPU), a batch of 500 requests with 1 M log records for 8 tenants is written to S3 in **1.43 s** as OTLP/protobuf (161 MiB) and 1.86 s as OTLP/JSON (421 MiB), one object per tenant; the Lambda recipe handles a Kinesis batch of 100 requests in 0.27 s (protobuf) or 0.37 s (JSON). Without the network (`examples/otel_throughput.rs`), 200 k records in 100 requests take 0.27 s as OTLP/JSON and 0.18 s as OTLP/protobuf; decoding alone is 2 to 2.8 times faster in protobuf, with 2.6 times fewer bytes. Details in [docs/performance.md](docs/performance.md).
 
 ## PII protection
 

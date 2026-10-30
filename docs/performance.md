@@ -145,6 +145,21 @@ On AWS (Lambda 10 GB / 6 vCPU, writing to S3 in the same region, 0.2.0rc11):
 
 Single-object streams were compared with 0.2.0rc10 in the same function, alternating versions (median of 3): dataset scanner 4.49 → 4.33 s, DuckDB result 4.78 → 4.60 s.
 
+OTLP/protobuf on AWS (Lambda 10 GB / 6 vCPU, S3 in the same region; 0.4.0rc1 and 0.3.0 installed from the package indexes, alternating, 6 rounds, medians):
+
+| `ingest_otel_log_batch`: 1 M records in 500 requests, 8 tenants | Size | 0.3.0 | 0.4.0rc1 |
+|---|---|---|---|
+| OTLP/JSON | 421 MiB | 2.19 s | **1.86 s** |
+| OTLP/protobuf | 161 MiB | | **1.43 s** |
+| OTLP/protobuf + zstd | 32 MiB | | **1.43 s** |
+| The Lambda recipe, a Kinesis batch of 100 requests (100 k records), OTLP/JSON | 42 MiB | 0.39 s | 0.37 s |
+| The same batch in OTLP/protobuf | 16 MiB | | **0.27 s** |
+
+- Times include the uploads; every run wrote all records.
+- OTLP/JSON is faster than in 0.3.0 because the requests are no longer copied from Python into the native module.
+- Peak memory of one JSON batch in a fresh function, including the requests generated in Python: 2,529 MB with 0.3.0, 2,530 MB with 0.4.0rc1.
+- The same wheel on arm64 (Graviton) read every encoding and compression with the same record counts.
+
 Requests of a batch are flattened in parallel. OTLP is read into typed structures with borrowed strings, and the rows take the columnar validation path; the first implementation, which built a JSON tree per record and fell back to the row path, took 3.98 s for the single request.
 
 ---

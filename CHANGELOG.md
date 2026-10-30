@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Lambda recipe: each S3 object announced through SQS is ingested as a batch of its own, named by its key and ETag. A duplicated or redelivered notification grouped with other messages produced a new batch id and wrote the object twice (found in an end-to-end test on AWS). `LambdaResult.reports` is now a list, since a tenant may appear in several objects.
+
 ## [0.4.0rc1] - 2026-10-30
 
 OTLP/protobuf and compressed log requests, with the same rows as OTLP/JSON and faster to read.

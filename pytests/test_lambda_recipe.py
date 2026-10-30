@@ -56,6 +56,19 @@ def otlp(tenant: str, n: int) -> bytes:
     return json.dumps(body).encode()
 
 
+def ok_by_tenant(result: Any) -> dict[str, int]:
+    """Records written per tenant, over every report of the result."""
+    out: dict[str, int] = {}
+    for report in result.reports:
+        out[report.tenant_id] = out.get(report.tenant_id, 0) + report.records_ok
+    return out
+
+
+def report_of(result: Any, tenant: str) -> Any:
+    (report,) = [r for r in result.reports if r.tenant_id == tenant]
+    return report
+
+
 def kinesis(*datas: bytes) -> dict[str, Any]:
     return {
         "Records": [
@@ -103,7 +116,7 @@ async def test_kinesis_otlp_batch(make_client: MakeClient, store: Bucket) -> Non
     ingest = recipe.LambdaIngestor(client(make_client), contract=LOGS, payload="otlp")
     event = kinesis(otlp("acme-001", 3), otlp("tenant-a", 2), b"not json", otlp("acme-001", 1))
     result = await ingest.ingest(event)
-    assert {t: r.records_ok for t, r in result.reports.items()} == {"acme-001": 4, "tenant-a": 2}
+    assert ok_by_tenant(result) == {"acme-001": 4, "tenant-a": 2}
     assert result.failed == ["49590002"], "only the unreadable message is retried"
     assert result.batch_id == batch_id_for(
         ["49590000", "49590001", "49590002", "49590003"], time_ms=NOW_MS
@@ -128,10 +141,10 @@ async def test_sqs_json_with_tenant_field(make_client: MakeClient, store: Bucket
         json.dumps({"event_id": "no tenant"}),
     )
     result = await ingest.ingest(event)
-    assert {t: r.records_ok for t, r in result.reports.items()} == {"acme-001": 2, "tenant-a": 1}
+    assert ok_by_tenant(result) == {"acme-001": 2, "tenant-a": 1}
     # The unknown tenant and the record without one fail alone.
     assert result.failed == ["msg-2", "msg-3"]
-    table = store.parquet(result.reports["acme-001"].data_uri)
+    table = store.parquet(report_of(result, "acme-001").data_uri)
     assert "tenant" not in table.column_names
     assert set(table.column("_dl_tenant_id").to_pylist()) == {"acme-001"}
 
@@ -148,13 +161,13 @@ async def test_cloudwatch_direct_and_through_kinesis(
         "awslogs": {"data": base64.b64encode(cloudwatch_payload("/app/acme-001", 5)).decode()}
     }
     result = await ingest.ingest(direct)
-    assert result.reports["acme-001"].records_ok == 5 and result.failed == []
-    table = store.parquet(result.reports["acme-001"].data_uri)
+    assert ok_by_tenant(result) == {"acme-001": 5} and result.failed == []
+    table = store.parquet(report_of(result, "acme-001").data_uri)
     assert table.column("service_name").to_pylist() == ["/app/acme-001"] * 5
     assert table.column("body").to_pylist()[0] == "msg 0"
 
     through = await ingest.ingest(kinesis(cloudwatch_payload("/app/tenant-a", 3)))
-    assert through.reports["tenant-a"].records_ok == 3
+    assert ok_by_tenant(through) == {"tenant-a": 3}
 
 
 def test_json_payload_needs_a_tenant(make_client: MakeClient) -> None:
@@ -215,7 +228,7 @@ async def test_kinesis_protobuf_and_compressed(make_client: MakeClient) -> None:
         gzip.compress(b"\x0b\x0c"),
     )
     result = await ingest.ingest(event)
-    assert {t: r.records_ok for t, r in result.reports.items()} == {"acme-001": 4, "tenant-a": 2}
+    assert ok_by_tenant(result) == {"acme-001": 4, "tenant-a": 2}
     assert result.failed == ["49590003"]
 
 
@@ -232,7 +245,7 @@ async def test_sqs_protobuf_in_base64(make_client: MakeClient) -> None:
         ("not base64 and not json", None),
     )
     result = await ingest.ingest(event)
-    assert {t: r.records_ok for t, r in result.reports.items()} == {"acme-001": 3, "tenant-a": 3}
+    assert ok_by_tenant(result) == {"acme-001": 3, "tenant-a": 3}
     assert result.failed == ["msg-3"]
 
 
@@ -264,18 +277,18 @@ async def test_s3_objects_through_sqs(make_client: MakeClient, s3: Any, store: B
         json.dumps({"Service": "Amazon S3", "Event": "s3:TestEvent", "Bucket": landing}),
     )
     result = await ingest.ingest(event)
-    assert {t: r.records_ok for t, r in result.reports.items()} == {"acme-001": 4, "tenant-a": 2}
+    assert ok_by_tenant(result) == {"acme-001": 4, "tenant-a": 2}
     assert result.failed == ["msg-3", "msg-4"], "missing and oversized objects are retried"
-    announced = [*list(objects)[:3], "logs/missing.binpb", "logs/huge.binpb"]
-    keys = [f"s3://{landing}/{k}@{etags.get(k, '0')}" for k in announced]
-    assert result.batch_id == batch_id_for(keys, time_ms=NOW_MS // 1000 * 1000), (
-        "from the object keys and ETags, at the event time"
-    )
+    assert result.batch_id == "", "no Kinesis or SQS payload of its own"
+    # Each object is a batch named by its key and ETag, at the event time.
+    first = f"s3://{landing}/logs/part 1.binpb.gz@{etags['logs/part 1.binpb.gz']}"
+    object_batch = batch_id_for([first], time_ms=NOW_MS // 1000 * 1000)
+    assert any(object_batch in r.data_uri for r in result.reports)
     written = store.keys()
-    # The same objects announced again (new SQS message ids): same batch, same Bronze keys.
-    again = sqs(*(r["body"] for r in event["Records"]))
-    for i, record in enumerate(again["Records"]):
-        record["messageId"] = f"redelivered-{i}"
+    # One object announced again, alone and under a new message id (SQS groups
+    # redeliveries differently): the same Bronze objects are rewritten.
+    again = sqs(notice("logs/part-3.binpb.zst"))
+    again["Records"][0]["messageId"] = "redelivered"
     second = await ingest.ingest(again)
-    assert second.batch_id == result.batch_id
+    assert ok_by_tenant(second) == {"acme-001": 1} and second.failed == []
     assert store.keys() == written
