@@ -15,6 +15,7 @@ __all__ = [
     "HookError",
     "IngestReport",
     "MalformedPayloadError",
+    "PayloadTooLargeError",
     "PiiDecryptor",
     "PiiProtection",
     "ProtectionError",
@@ -48,6 +49,9 @@ class TenantViolationError(DatalakeError):
 
 class MalformedPayloadError(DatalakeError):
     """The batch could not be decoded, or a record is malformed (Level 2)."""
+
+class PayloadTooLargeError(MalformedPayloadError):
+    """A compressed request expands beyond the configured limit."""
 
 class RecordRejectedError(DatalakeError):
     """A record failed validation while ``on_invalid="raise"``."""
@@ -329,11 +333,18 @@ class BronzeIngestionClient:
         tenant_attribute: str,
         resolve: Callable[[str | None], TenantProfile | str],
         batch_id: str | None = None,
-    ) -> list[tuple[str | None, list[int], IngestReport | None, DatalakeError | None]]:
-        """Flatten OTLP/JSON logs requests and ingest each tenant's records.
+        encoding: str = "auto",
+        compression: str = "auto",
+        max_decompressed_bytes: int = 67108864,
+    ) -> tuple[
+        list[tuple[str | None, list[int], IngestReport | None, DatalakeError | None]],
+        str | None,
+    ]:
+        """Flatten OTLP logs requests and ingest each tenant's records.
 
         One ``(tenant, request_indices, report, error)`` per tenant, then one
-        per unreadable request.
+        per unreadable request; and the encoding read (``"json"``,
+        ``"protobuf"``, ``"mixed"`` or ``None``).
         """
     async def ingest_stream(
         self,
@@ -410,5 +421,12 @@ def otel_logs_contract(
 def batch_id_for(message_ids: list[str], *, time_ms: int) -> str:
     """Deterministic batch id (a ULID) for a set of source message ids."""
 
-def flatten_otlp_logs(body: bytes, *, tenant_attribute: str) -> list[tuple[str | None, Any]]:
-    """Flatten an OTLP/JSON logs request into ``(tenant, pyarrow.RecordBatch)`` pairs."""
+def flatten_otlp_logs(
+    body: bytes,
+    *,
+    tenant_attribute: str,
+    encoding: str = "auto",
+    compression: str = "auto",
+    max_decompressed_bytes: int = 67108864,
+) -> list[tuple[str | None, Any]]:
+    """Flatten an OTLP logs request into ``(tenant, pyarrow.RecordBatch)`` pairs."""

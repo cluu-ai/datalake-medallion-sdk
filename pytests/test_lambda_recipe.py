@@ -160,3 +160,122 @@ async def test_cloudwatch_direct_and_through_kinesis(
 def test_json_payload_needs_a_tenant(make_client: MakeClient) -> None:
     with pytest.raises(Exception, match="tenant"):
         recipe.LambdaIngestor(client(make_client), contract=EVENTS, payload="json")
+
+
+def protobuf(tenant: str, n: int) -> bytes:
+    """The request of :func:`otlp`, serialized as OTLP/protobuf."""
+    from google.protobuf.json_format import ParseDict
+    from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+
+    message = ParseDict(json.loads(otlp(tenant, n)), ExportLogsServiceRequest())
+    return bytes(message.SerializeToString())
+
+
+def zstd(data: bytes) -> bytes:
+    try:
+        from compression import zstd as codec  # type: ignore[import-not-found]  # Python 3.14
+
+        return bytes(codec.compress(data))
+    except ImportError:
+        import zstandard
+
+        return zstandard.ZstdCompressor().compress(data)
+
+
+def sqs_messages(*messages: tuple[str, dict[str, Any] | None]) -> dict[str, Any]:
+    event = sqs(*(body for body, _ in messages))
+    for record, (_, attributes) in zip(event["Records"], messages, strict=True):
+        if attributes:
+            record["messageAttributes"] = attributes
+    return event
+
+
+def s3_notification(bucket: str, key: str, etag: str, size: int) -> str:
+    created = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(NOW_MS / 1000))
+    record = {
+        "eventVersion": "2.1",
+        "eventSource": "aws:s3",
+        "eventTime": created,
+        "eventName": "ObjectCreated:Put",
+        "s3": {
+            "bucket": {"name": bucket},
+            "object": {"key": key.replace(" ", "+"), "size": size, "eTag": etag},
+        },
+    }
+    return json.dumps({"Records": [record]})
+
+
+async def test_kinesis_protobuf_and_compressed(make_client: MakeClient) -> None:
+    pytest.importorskip("opentelemetry.proto")
+    ingest = recipe.LambdaIngestor(client(make_client), contract=LOGS)
+    event = kinesis(
+        protobuf("acme-001", 3),
+        zstd(protobuf("tenant-a", 2)),
+        gzip.compress(otlp("acme-001", 1)),
+        gzip.compress(b"\x0b\x0c"),
+    )
+    result = await ingest.ingest(event)
+    assert {t: r.records_ok for t, r in result.reports.items()} == {"acme-001": 4, "tenant-a": 2}
+    assert result.failed == ["49590003"]
+
+
+async def test_sqs_protobuf_in_base64(make_client: MakeClient) -> None:
+    pytest.importorskip("opentelemetry.proto")
+    ingest = recipe.LambdaIngestor(client(make_client), contract=LOGS)
+    protobuf_type = {
+        "content-type": {"stringValue": "application/x-protobuf", "dataType": "String"}
+    }
+    event = sqs_messages(
+        (base64.b64encode(protobuf("acme-001", 2)).decode(), protobuf_type),
+        (base64.b64encode(gzip.compress(protobuf("tenant-a", 3))).decode(), None),
+        (otlp("acme-001", 1).decode(), None),
+        ("not base64 and not json", None),
+    )
+    result = await ingest.ingest(event)
+    assert {t: r.records_ok for t, r in result.reports.items()} == {"acme-001": 3, "tenant-a": 3}
+    assert result.failed == ["msg-3"]
+
+
+async def test_s3_objects_through_sqs(make_client: MakeClient, s3: Any, store: Bucket) -> None:
+    pytest.importorskip("opentelemetry.proto")
+    landing = f"landing-{store.name}"
+    s3.create_bucket(Bucket=landing)
+    objects = {
+        "logs/part 1.binpb.gz": gzip.compress(protobuf("acme-001", 3)),
+        "logs/part-2.json": otlp("tenant-a", 2),
+        "logs/part-3.binpb.zst": zstd(protobuf("acme-001", 1)),
+        "logs/huge.binpb": protobuf("acme-001", 1),
+    }
+    etags = {}
+    for key, body in objects.items():
+        etags[key] = s3.put_object(Bucket=landing, Key=key, Body=body)["ETag"].strip('"')
+
+    def notice(key: str, size: int | None = None) -> str:
+        actual = len(objects.get(key, b""))
+        return s3_notification(landing, key, etags.get(key, "0"), actual if size is None else size)
+
+    ingest = recipe.LambdaIngestor(client(make_client), contract=LOGS, s3=s3, max_object_mb=1)
+    event = sqs(
+        notice("logs/part 1.binpb.gz"),
+        notice("logs/part-2.json"),
+        notice("logs/part-3.binpb.zst"),
+        notice("logs/missing.binpb"),
+        notice("logs/huge.binpb", size=2 * 1024 * 1024),
+        json.dumps({"Service": "Amazon S3", "Event": "s3:TestEvent", "Bucket": landing}),
+    )
+    result = await ingest.ingest(event)
+    assert {t: r.records_ok for t, r in result.reports.items()} == {"acme-001": 4, "tenant-a": 2}
+    assert result.failed == ["msg-3", "msg-4"], "missing and oversized objects are retried"
+    announced = [*list(objects)[:3], "logs/missing.binpb", "logs/huge.binpb"]
+    keys = [f"s3://{landing}/{k}@{etags.get(k, '0')}" for k in announced]
+    assert result.batch_id == batch_id_for(keys, time_ms=NOW_MS // 1000 * 1000), (
+        "from the object keys and ETags, at the event time"
+    )
+    written = store.keys()
+    # The same objects announced again (new SQS message ids): same batch, same Bronze keys.
+    again = sqs(*(r["body"] for r in event["Records"]))
+    for i, record in enumerate(again["Records"]):
+        record["messageId"] = f"redelivered-{i}"
+    second = await ingest.ingest(again)
+    assert second.batch_id == result.batch_id
+    assert store.keys() == written

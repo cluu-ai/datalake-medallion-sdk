@@ -1,12 +1,13 @@
-//! OTLP/JSON logs: flattening and ingestion throughput, without network I/O.
+//! OTLP logs: flattening and ingestion throughput, without network I/O.
 //!
 //! ```text
-//! cargo run --release --example otel_throughput -- [records] [tenants] [requests]
+//! cargo run --release --example otel_throughput -- [records] [tenants] [requests] [json|protobuf] [none|gzip|zstd]
 //! ```
 //!
-//! Builds OTLP/JSON export requests (several, as in one queue batch, when
-//! `requests` > 1) with log records spread over a few tenants, then times
-//! `otel::flatten_logs_json_many` and the ingestion of every tenant's rows
+//! Builds OTLP export requests (several, as in one queue batch, when
+//! `requests` > 1) with log records spread over a few tenants, in the given
+//! encoding and compression (the same logical requests in every case), then
+//! times `otel::flatten_logs_many` and the ingestion of every tenant's rows
 //! into a store that discards the bytes.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,13 +16,16 @@ use std::time::Instant;
 
 use _core::contracts::ContractRegistry;
 use _core::error::DatalakeError;
-use _core::otel;
+use _core::otel::{self, OtlpOptions};
 use _core::pipeline::{BronzePipeline, IngestRequest, PipelineConfig, RecordSource};
 use _core::storage::ObjectStorage;
 use _core::tenant::{ObjectPath, TenantId, TenantProfile};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde_json::{json, Value};
+
+#[path = "../src/otel/transcode.rs"]
+mod transcode;
 
 struct Discard {
     bytes: AtomicU64,
@@ -56,7 +60,7 @@ impl ObjectStorage for Discard {
     }
 }
 
-fn request(records: usize, tenants: usize) -> Vec<u8> {
+fn request(records: usize, tenants: usize) -> Value {
     let base: u64 = 1_772_359_200_000_000_000;
     let resources: Vec<Value> = (0..tenants)
         .map(|t| {
@@ -89,7 +93,25 @@ fn request(records: usize, tenants: usize) -> Vec<u8> {
             })
         })
         .collect();
-    serde_json::to_vec(&json!({ "resourceLogs": resources })).unwrap()
+    json!({ "resourceLogs": resources })
+}
+
+fn encode(request: &Value, encoding: &str, compression: &str) -> Vec<u8> {
+    use std::io::Write as _;
+
+    let raw = match encoding {
+        "protobuf" => transcode::request(request),
+        _ => serde_json::to_vec(request).unwrap(),
+    };
+    match compression {
+        "gzip" => {
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            gz.write_all(&raw).unwrap();
+            gz.finish().unwrap()
+        }
+        "zstd" => zstd::encode_all(raw.as_slice(), 3).unwrap(),
+        _ => raw,
+    }
 }
 
 #[tokio::main]
@@ -98,9 +120,23 @@ async fn main() {
     let records: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(200_000);
     let tenants: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(4);
     let requests: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1);
+    let encoding = args.next().unwrap_or_else(|| "json".into());
+    let compression = args.next().unwrap_or_else(|| "none".into());
     let bodies: Vec<Vec<u8>> = (0..requests)
-        .map(|_| request(records / requests, tenants))
+        .map(|_| {
+            encode(
+                &request(records / requests, tenants),
+                &encoding,
+                &compression,
+            )
+        })
         .collect();
+    let format = match (encoding.as_str(), compression.as_str()) {
+        ("protobuf", "none") => "OTLP/protobuf".to_owned(),
+        ("protobuf", c) => format!("OTLP/protobuf+{c}"),
+        (_, "none") => "OTLP/JSON".to_owned(),
+        (_, c) => format!("OTLP/JSON+{c}"),
+    };
     let slices: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
     let mib = bodies.iter().map(Vec::len).sum::<usize>() as f64 / 1_048_576.0;
 
@@ -125,7 +161,7 @@ async fn main() {
     );
     for round in 0..3 {
         let t0 = Instant::now();
-        let groups = otel::flatten_logs_json_many(&slices, "tenant.id")
+        let groups = otel::flatten_logs_many(&slices, &OtlpOptions::default())
             .unwrap()
             .tenants;
         let flatten = t0.elapsed();
@@ -152,8 +188,9 @@ async fn main() {
         }
         let total = t0.elapsed();
         println!(
-            "round {round}: {records} records in {requests} requests, {mib:.0} MiB OTLP/JSON, {tenants} tenants: flatten {:.0} ms, total {:.0} ms ({:.0} MiB/s, {:.2} M records/s), ok {ok}",
+            "round {round}: {records} records in {requests} requests, {mib:.1} MiB {format}, {tenants} tenants: flatten {:.0} ms ({:.2} M records/s), total {:.0} ms ({:.0} MiB/s, {:.2} M records/s), ok {ok}",
             flatten.as_secs_f64() * 1e3,
+            records as f64 / flatten.as_secs_f64() / 1e6,
             total.as_secs_f64() * 1e3,
             mib / total.as_secs_f64(),
             records as f64 / total.as_secs_f64() / 1e6,

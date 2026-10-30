@@ -26,17 +26,59 @@ pub(crate) fn otel_logs_contract(
     .to_string()
 }
 
-/// Flattens an OTLP/JSON logs request into `(tenant, pyarrow.RecordBatch)`
-/// pairs, one per tenant, without holding the GIL while parsing.
+/// Reading options from the Python keyword arguments.
+pub(crate) fn otlp_options(
+    tenant_attribute: &str,
+    encoding: &str,
+    compression: &str,
+    max_decompressed_bytes: usize,
+) -> PyResult<otel::OtlpOptions> {
+    Ok(otel::OtlpOptions::new(tenant_attribute)
+        .with_encoding(encoding.parse()?)
+        .with_compression(compression.parse()?)
+        .with_max_decompressed_bytes(max_decompressed_bytes))
+}
+
+/// `"json"`, `"protobuf"` or `"mixed"` for the requests that were read.
+pub(crate) fn encoding_summary(encodings: &[Option<otel::OtlpEncoding>]) -> Option<&'static str> {
+    let mut read = encodings.iter().flatten();
+    let first = *read.next()?;
+    Some(if read.all(|&e| e == first) {
+        first.as_str()
+    } else {
+        "mixed"
+    })
+}
+
+/// Flattens an OTLP logs request (protobuf or JSON, optionally compressed)
+/// into `(tenant, pyarrow.RecordBatch)` pairs, one per tenant, without
+/// holding the GIL while decoding.
 #[pyfunction]
-#[pyo3(signature = (body, *, tenant_attribute))]
+#[pyo3(signature = (
+    body,
+    *,
+    tenant_attribute,
+    encoding = "auto",
+    compression = "auto",
+    // otel::DEFAULT_MAX_DECOMPRESSED_BYTES, as a literal for the Python signature.
+    max_decompressed_bytes = 67_108_864,
+))]
 pub(crate) fn flatten_otlp_logs<'py>(
     py: Python<'py>,
     body: &Bound<'py, PyBytes>,
     tenant_attribute: &str,
+    encoding: &str,
+    compression: &str,
+    max_decompressed_bytes: usize,
 ) -> PyResult<Vec<(Option<String>, Py<PyAny>)>> {
+    let options = otlp_options(
+        tenant_attribute,
+        encoding,
+        compression,
+        max_decompressed_bytes,
+    )?;
     let bytes = body.as_bytes();
-    let groups = py.detach(|| otel::flatten_logs_json(bytes, tenant_attribute))?;
+    let groups = py.detach(|| otel::flatten_logs(bytes, &options))?;
     groups
         .into_iter()
         .map(|g| Ok((g.tenant, g.batch.to_pyarrow(py)?.unbind())))

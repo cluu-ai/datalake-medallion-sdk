@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "datalake-medallion-sdk"
-version = "0.3.0"
+version = "0.4.0rc1"
 description = "Build and serve multi-tenant medallion data lakes on S3: contract-checked Bronze ingestion, Silver and Gold Iceberg writes and maintenance, and tenant-scoped Parquet/Iceberg reads without Athena. Per-call tenancy, any input (Arrow, Polars, DuckDB, JSON, files), optional PII protection. Rust core, Python API"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -59,6 +59,8 @@ dev = [
     "pytest-asyncio>=0.24",
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
+    # Reference OTLP encoder for the JSON/protobuf differential tests.
+    "opentelemetry-proto>=1.20",
     "pytest-cov>=5.0",
     "mypy>=1.11",
     "ruff>=0.7",

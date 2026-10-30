@@ -15,13 +15,12 @@ from ._core import (
     ConfigurationError,
     ContractRegistry,
     IngestReport,
-    MalformedPayloadError,
     StreamReport,
     TenantProfile,
     TenantRegistry,
     TenantViolationError,
 )
-from ._telemetry import traced
+from ._telemetry import set_span_attribute, traced
 from .tenancy import TenantResolver
 
 if TYPE_CHECKING:
@@ -48,7 +47,12 @@ _MIB = 1024 * 1024
 __all__ = ["BronzeIngestionClient", "ClientOptions", "TenantOutcome", "batch_id_for"]
 
 OtlpPayload = bytes | bytearray | memoryview | str | Mapping[str, Any]
-"""One OTLP/JSON logs request: encoded JSON, or the decoded mapping."""
+"""One OTLP logs request: encoded bytes (protobuf or JSON, optionally
+compressed), or OTLP/JSON as text or as the decoded mapping."""
+OtlpEncoding = Literal["auto", "json", "protobuf"]
+"""Encoding of OTLP requests; ``"auto"`` detects it per request."""
+OtlpCompression = Literal["auto", "none", "gzip", "zstd"]
+"""Compression of OTLP requests; ``"auto"`` detects it per request."""
 
 
 def batch_id_for(message_ids: Sequence[str], *, time_ms: int) -> str:
@@ -196,7 +200,7 @@ class BronzeIngestionClient:
             batch, tenant=self._resolve(tenant), contract=contract, batch_id=batch_id
         )
 
-    @traced("ingest_otel_logs", layer="bronze", count=False)
+    @traced("ingest_otel_logs", layer="bronze")
     async def ingest_otel_logs(
         self,
         payload: OtlpPayload | list[OtlpPayload],
@@ -205,15 +209,25 @@ class BronzeIngestionClient:
         tenant_attribute: str = "tenant.id",
         default_tenant: TenantProfile | str | None = None,
         batch_id: str | None = None,
+        encoding: OtlpEncoding = "auto",
+        compression: OtlpCompression = "auto",
+        max_decompressed_mb: int = 64,
     ) -> dict[str, IngestReport]:
-        """Ingest an OTLP/JSON logs request for every tenant it contains.
+        """Ingest an OTLP logs request for every tenant it contains.
+
+        The request is OTLP/protobuf (a serialized ``ExportLogsServiceRequest``)
+        or OTLP/JSON, optionally gzip or zstd compressed; both give the same
+        rows. ``encoding="auto"`` reads JSON when the request starts with
+        ``{`` and protobuf otherwise, ``compression="auto"`` recognizes gzip
+        and zstd by their magic bytes; set them to read only one kind. A
+        compressed request may expand to ``max_decompressed_mb`` at most.
 
         Records are flattened to the columns of
         :func:`datalake_medallion_sdk.otel.logs_contract` and grouped by the
         resource attribute ``tenant_attribute`` (or a record attribute of that
         name); each tenant id is resolved like ``ingest(tenant="<id>")``.
         Records without it go to ``default_tenant``; without one, those
-        records fail with :class:`TenantViolationError`. Parsing,
+        records fail with :class:`TenantViolationError`. Decoding,
         validation and encoding run in Rust without the GIL and without
         pyarrow; tenants are uploaded concurrently.
 
@@ -227,18 +241,23 @@ class BronzeIngestionClient:
         each tenant is written once. Returns the reports by tenant id.
 
         Raises:
-            MalformedPayloadError: the request is not OTLP/JSON.
+            MalformedPayloadError: the request cannot be decompressed or is
+                not a valid OTLP logs request (``PayloadTooLargeError`` when it
+                expands beyond ``max_decompressed_mb``).
             TenantViolationError: a tenant is unknown, or records have no
                 tenant and there is no ``default_tenant``. The other tenants
                 are written first.
             As :meth:`ingest` otherwise.
         """
-        outcomes = await self.ingest_otel_log_batch(
+        outcomes = await self._ingest_otel(
             payload if isinstance(payload, list) else [payload],
             contract=contract,
             tenant_attribute=tenant_attribute,
             default_tenant=default_tenant,
             batch_id=batch_id,
+            encoding=encoding,
+            compression=compression,
+            max_decompressed_mb=max_decompressed_mb,
         )
         # Every tenant was attempted; report the first failure after all.
         for outcome in outcomes:
@@ -255,8 +274,11 @@ class BronzeIngestionClient:
         tenant_attribute: str = "tenant.id",
         default_tenant: TenantProfile | str | None = None,
         batch_id: str | None = None,
+        encoding: OtlpEncoding = "auto",
+        compression: OtlpCompression = "auto",
+        max_decompressed_mb: int = 64,
     ) -> list[TenantOutcome]:
-        """Ingest several OTLP/JSON logs requests (one queue or stream batch).
+        """Ingest several OTLP logs requests (one queue or stream batch).
 
         Like :meth:`ingest_otel_logs`, but never raises for one tenant: it
         returns one :class:`TenantOutcome` per tenant, with the indices of
@@ -264,8 +286,33 @@ class BronzeIngestionClient:
         request. A consumer retries (or reports as failed) only the requests
         of the outcomes with an ``error``; with the same ``batch_id`` (see
         :func:`batch_id_for`) a retry rewrites what was already written.
-        Requests are flattened in parallel and each tenant is written once.
+        Requests are flattened in parallel and each tenant is written once;
+        with ``"auto"`` settings each request may have its own encoding and
+        compression.
         """
+        return await self._ingest_otel(
+            payloads,
+            contract=contract,
+            tenant_attribute=tenant_attribute,
+            default_tenant=default_tenant,
+            batch_id=batch_id,
+            encoding=encoding,
+            compression=compression,
+            max_decompressed_mb=max_decompressed_mb,
+        )
+
+    async def _ingest_otel(
+        self,
+        payloads: Sequence[OtlpPayload],
+        *,
+        contract: str,
+        tenant_attribute: str,
+        default_tenant: TenantProfile | str | None,
+        batch_id: str | None,
+        encoding: OtlpEncoding,
+        compression: OtlpCompression,
+        max_decompressed_mb: int,
+    ) -> list[TenantOutcome]:
         from .otel import otlp_bytes
 
         def resolve(tenant_id: str | None) -> TenantProfile | str:
@@ -278,22 +325,18 @@ class BronzeIngestionClient:
                 )
             return self._resolve(default_tenant)
 
-        bodies: list[bytes] = []
-        unreadable: list[TenantOutcome] = []
-        for index, p in enumerate(payloads):
-            try:
-                bodies.append(otlp_bytes(p))
-            except MalformedPayloadError as e:
-                bodies.append(b"{}")
-                unreadable.append(TenantOutcome(None, [index], None, e))
-        raw = await self._native.ingest_otel_logs(
-            bodies,
+        raw, detected = await self._native.ingest_otel_logs(
+            [otlp_bytes(p, encoding=encoding) for p in payloads],
             contract=contract,
             tenant_attribute=tenant_attribute,
             resolve=resolve,
             batch_id=batch_id,
+            encoding=encoding,
+            compression=compression,
+            max_decompressed_bytes=max_decompressed_mb * _MIB,
         )
-        return [TenantOutcome(t, list(s), r, e) for t, s, r, e in raw] + unreadable
+        set_span_attribute("datalake.otlp.encoding", detected)
+        return [TenantOutcome(t, list(s), r, e) for t, s, r, e in raw]
 
     @traced("ingest_stream", layer="bronze")
     async def ingest_stream(

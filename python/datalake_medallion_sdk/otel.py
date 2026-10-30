@@ -3,12 +3,15 @@
 Applications that already emit logs with OpenTelemetry send them to the lake
 as OTLP. :func:`logs_contract` is the contract of the flattened records (one
 row per log record, the columns of the OpenTelemetry Logs Data Model), and
-:meth:`BronzeIngestionClient.ingest_otel_logs` ingests an OTLP/JSON request
-for every tenant it contains. :func:`flatten_logs` returns the same rows as
+:meth:`BronzeIngestionClient.ingest_otel_logs` ingests an OTLP request for
+every tenant it contains. :func:`flatten_logs` returns the same rows as
 pyarrow batches, for inspection or custom pipelines.
 
-Only the OTLP/JSON encoding is read (OTLP/HTTP with ``application/json``, the
-Firehose and Collector JSON exports). Configure exporters with JSON encoding.
+Both OTLP encodings are read and give the same rows: protobuf (OTLP/HTTP
+``application/x-protobuf``, the Collector's ``awss3exporter`` with
+``marshaler: otlp_proto``) and JSON (``application/json``, ``otlp_json``),
+each optionally gzip or zstd compressed. With ``encoding="auto"`` and
+``compression="auto"`` (the defaults) both are detected per request.
 """
 
 from __future__ import annotations
@@ -18,10 +21,11 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from . import _core
-from ._core import MalformedPayloadError
 
 if TYPE_CHECKING:
     import pyarrow as pa
+
+    from .client import OtlpCompression, OtlpEncoding, OtlpPayload
 
 __all__ = ["flatten_logs", "logs_contract", "otlp_bytes"]
 
@@ -64,29 +68,50 @@ def logs_contract(
     )
 
 
-def otlp_bytes(payload: bytes | bytearray | memoryview | str | Mapping[str, Any]) -> bytes:
-    """An OTLP/JSON request as bytes; rejects the protobuf encoding with a clear error."""
-    if isinstance(payload, Mapping):
-        return json.dumps(payload, separators=(",", ":")).encode()
-    data = payload.encode() if isinstance(payload, str) else bytes(payload)
-    if data.lstrip()[:1] not in (b"{", b""):
-        raise MalformedPayloadError(
-            "malformed payload: OTLP request is not JSON; only the OTLP/JSON encoding is "
-            "supported (configure the exporter with JSON encoding)"
+def otlp_bytes(payload: OtlpPayload, *, encoding: OtlpEncoding = "auto") -> bytes:
+    """One OTLP request as ``bytes``, without decoding it.
+
+    ``bytes`` pass through unchanged (``bytearray`` and ``memoryview`` are
+    copied); ``str`` and mappings are OTLP/JSON, so they cannot be read with
+    ``encoding="protobuf"``.
+    """
+    if isinstance(payload, bytes):
+        return payload
+    if isinstance(payload, bytearray | memoryview):
+        return bytes(payload)
+    if not isinstance(payload, str | Mapping):
+        raise TypeError(
+            "an OTLP request must be bytes, bytearray, memoryview, str or a mapping, "
+            f"not {type(payload).__name__}"
         )
-    return data
+    if encoding == "protobuf":
+        raise TypeError("str and mapping OTLP requests are JSON; pass protobuf as bytes")
+    if isinstance(payload, str):
+        return payload.encode()
+    return json.dumps(payload, separators=(",", ":")).encode()
 
 
 def flatten_logs(
-    payload: bytes | bytearray | memoryview | str | Mapping[str, Any],
+    payload: OtlpPayload,
     *,
     tenant_attribute: str = TENANT_ATTRIBUTE,
+    encoding: OtlpEncoding = "auto",
+    compression: OtlpCompression = "auto",
+    max_decompressed_mb: int = 64,
 ) -> dict[str | None, pa.RecordBatch]:
-    """Flatten an OTLP/JSON logs request into one pyarrow batch per tenant.
+    """Flatten an OTLP logs request into one pyarrow batch per tenant.
 
-    The tenant is the string value of the resource attribute
-    ``tenant_attribute`` (or of a record attribute with that name); records
-    without it are under ``None``. Needs pyarrow.
+    The request is read as in
+    :meth:`BronzeIngestionClient.ingest_otel_logs` (protobuf or JSON,
+    optionally compressed). The tenant is the string value of the resource
+    attribute ``tenant_attribute`` (or of a record attribute with that name);
+    records without it are under ``None``. Needs pyarrow.
     """
-    pairs = _core.flatten_otlp_logs(otlp_bytes(payload), tenant_attribute=tenant_attribute)
+    pairs = _core.flatten_otlp_logs(
+        otlp_bytes(payload, encoding=encoding),
+        tenant_attribute=tenant_attribute,
+        encoding=encoding,
+        compression=compression,
+        max_decompressed_bytes=max_decompressed_mb * 1024 * 1024,
+    )
     return dict(pairs)

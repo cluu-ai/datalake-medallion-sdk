@@ -355,35 +355,58 @@ impl PyBronzeIngestionClient {
         })
     }
 
-    /// Flattens an OTLP/JSON logs request and ingests each tenant's records
-    /// in one call, without pyarrow and without holding the GIL while parsing.
+    /// Flattens OTLP logs requests (protobuf or JSON, optionally gzip or zstd
+    /// compressed) and ingests each tenant's records in one call, without
+    /// pyarrow and without holding the GIL while decoding.
     ///
     /// `resolve(tenant_or_none)` maps each tenant found in `tenant_attribute`
     /// (or `None` for records without it) to a `TenantProfile` or a tenant id.
     /// Tenants are validated one by one and committed concurrently; every
-    /// tenant is attempted even when another fails. Returns one
-    /// `(tenant_or_none, request_indices, IngestReport | None, error | None)`
-    /// per tenant, in tenant order (tenants that could not be resolved after
-    /// the others), then `(None, [index], None, error)` per unreadable
-    /// request.
+    /// tenant is attempted even when another fails. Returns `(outcomes,
+    /// encoding)`: one `(tenant_or_none, request_indices, IngestReport | None,
+    /// error | None)` per tenant, in tenant order (tenants that could not be
+    /// resolved after the others), then `(None, [index], None, error)` per
+    /// unreadable request; and the encoding of the readable requests
+    /// (`"json"`, `"protobuf"`, `"mixed"`, or `None` if there are none).
     ///
     /// `bodies` is a list of requests (for example the records of one queue
     /// batch): their rows are merged by tenant, so each tenant is written once.
-    #[pyo3(signature = (bodies, *, contract, tenant_attribute, resolve, batch_id = None))]
+    #[pyo3(signature = (
+        bodies,
+        *,
+        contract,
+        tenant_attribute,
+        resolve,
+        batch_id = None,
+        encoding = "auto",
+        compression = "auto",
+        // otel::DEFAULT_MAX_DECOMPRESSED_BYTES, as a literal for the Python signature.
+        max_decompressed_bytes = 67_108_864,
+    ))]
+    #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn ingest_otel_logs<'py>(
         &self,
         py: Python<'py>,
-        bodies: Vec<Vec<u8>>,
+        bodies: Vec<Bound<'py, PyBytes>>,
         contract: &str,
         tenant_attribute: &str,
         resolve: &Bound<'py, PyAny>,
         batch_id: Option<String>,
+        encoding: &str,
+        compression: &str,
+        max_decompressed_bytes: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.parts.registry.get(contract)?;
-        let flattened = py.detach(|| {
-            let slices: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
-            crate::otel::flatten_logs_json_many(&slices, tenant_attribute)
-        })?;
+        let options = super::otel::otlp_options(
+            tenant_attribute,
+            encoding,
+            compression,
+            max_decompressed_bytes,
+        )?;
+        // Borrowed from the immutable `bytes` objects: no copy.
+        let slices: Vec<&[u8]> = bodies.iter().map(PyBytesMethods::as_bytes).collect();
+        let flattened = py.detach(|| crate::otel::flatten_logs_many(&slices, &options))?;
+        let encoding = super::otel::encoding_summary(&flattened.encodings);
         let mut requests = Vec::with_capacity(flattened.tenants.len());
         // A tenant that cannot be resolved fails alone; the others go on.
         let mut unresolved = Vec::new();
@@ -471,7 +494,7 @@ impl PyBronzeIngestionClient {
                 sources: vec![index],
                 report: Err(OtelError::Datalake(e)),
             }));
-            Ok(outcomes)
+            Ok((outcomes, encoding))
         })
     }
 

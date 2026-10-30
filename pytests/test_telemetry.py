@@ -146,6 +146,32 @@ async def test_reads_are_spans(make_client: MakeClient, s3_endpoint: str, bucket
     )
 
 
+async def test_otel_log_spans_name_the_encoding(make_client: MakeClient) -> None:
+    from datalake_medallion_sdk import ContractRegistry
+    from datalake_medallion_sdk.otel import logs_contract
+    from google.protobuf.json_format import ParseDict
+    from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+
+    client = make_client(registry=ContractRegistry.from_schemas([logs_contract()]))
+    tenant = {"key": "tenant.id", "value": {"stringValue": "acme-001"}}
+    body = {
+        "resourceLogs": [
+            {
+                "resource": {"attributes": [tenant]},
+                "scopeLogs": [{"logRecords": [{"timeUnixNano": "1772359200000000000"}]}],
+            }
+        ]
+    }
+    pb = ParseDict(body, ExportLogsServiceRequest()).SerializeToString()
+    await client.ingest_otel_logs(pb, contract="otel/logs/1.0.0")
+    (span,) = [s for s in SPANS.get_finished_spans() if s.name == "datalake.ingest_otel_logs"]
+    assert (span.attributes or {})["datalake.otlp.encoding"] == "protobuf"
+    assert records(snapshot(), "ok") == 1
+    await client.ingest_otel_log_batch([body, pb], contract="otel/logs/1.0.0")
+    (span,) = [s for s in SPANS.get_finished_spans() if s.name == "datalake.ingest_otel_log_batch"]
+    assert (span.attributes or {})["datalake.otlp.encoding"] == "mixed"
+
+
 def test_without_opentelemetry_everything_is_unchanged() -> None:
     code = """
 import sys
