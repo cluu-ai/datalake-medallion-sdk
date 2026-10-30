@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- OTLP/protobuf logs: `ingest_otel_logs`, `ingest_otel_log_batch` and `otel.flatten_logs` read serialized `ExportLogsServiceRequest`s (what OTLP exporters and the Collector's `awss3exporter` write by default) as well as OTLP/JSON, with the same rows. A wire-format reader writes borrowed strings straight into the Arrow builders: no generated code, no copies.
+- gzip and zstd compressed OTLP requests, detected by their magic bytes. `encoding=` (`auto`, `json`, `protobuf`) and `compression=` (`auto`, `none`, `gzip`, `zstd`) restrict what is accepted; one batch may mix them.
+- `max_decompressed_mb=64`: a compressed request that expands beyond it fails with the new `PayloadTooLargeError`, a `MalformedPayloadError` (Rust: `DatalakeError::PayloadTooLarge`).
+- Rust: `otel::flatten_logs` and `otel::flatten_logs_many` with `OtlpOptions`; `FlattenedRequests::encodings`. `flatten_logs_json` and `flatten_logs_json_many` remain.
+- Span attribute `datalake.otlp.encoding` (`json`, `protobuf` or `mixed`) on the OTLP log ingestion spans.
+- Lambda recipe: raw protobuf in Kinesis, protobuf in base64 in SQS (`content-type` message attribute or detection), and S3 objects announced through SQS, with the batch id derived from the object keys and ETags. gzip messages are decompressed with a size limit.
+- `fuzz.yml`: weekly and on-demand fuzzing of the contract compiler and the OTLP reader.
+
+### Changed
+
+- OTLP/JSON reads like protobuf where protobuf cannot tell "unset" from a default: a zero `severityNumber` or `flags` and an all-zero trace or span id are now null. `doubleValue` also accepts the strings `"NaN"`, `"Infinity"` and `"-Infinity"` (null in the rows) instead of failing the request.
+- Values (arrays and key-value lists) nested deeper than 24 levels make a request malformed, in both encodings.
+- `otel.otlp_bytes` no longer rejects protobuf; it only checks the payload type (`TypeError` otherwise). `str` and mapping payloads are OTLP/JSON.
+
 ### Fixed
 
 - Windows: the `pyarrow`, `read` and `write` extras install `tzdata`, which PyArrow needs to convert timezone-aware timestamps to Python objects.

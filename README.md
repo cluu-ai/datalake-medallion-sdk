@@ -134,7 +134,7 @@ The rest of this page covers each piece in depth.
 | A file, local or on S3: CSV, TSV, JSON Lines, Parquet, gz/zst | `client.ingest_file("s3://…")` | 3.16 M records: Parquet **4.0 s**, CSV 5.6 s, JSONL 10.2 s; **0.5–0.9 GB** of memory |
 | An Arrow stream: pyarrow dataset, DuckDB result, Polars, Kafka batches… | `client.ingest_stream(reader)` | 0.7–0.8 M records/s with bounded memory |
 | A DataFrame already in memory | `client.ingest(df)` | 0.5 M records/s (one object) |
-| Application logs in OTLP/JSON, from an API or a queue batch | `client.ingest_otel_logs(body)` / `ingest_otel_log_batch(bodies)` | 1 M records (396 MiB) in **2.5 s**, one object per tenant |
+| Application logs in OTLP (protobuf or JSON), from an API, a queue batch or S3 | `client.ingest_otel_logs(body)` / `ingest_otel_log_batch(bodies)` | 1 M records (396 MiB) in **2.5 s**, one object per tenant |
 | Cleaned or aggregated data for Silver and Gold | `LakeWriter.append / upsert / replace` | 3.16 M rows appended in **8.1 s**; 29 k-row upsert in **2.5 s** |
 | Small files and old snapshots to clean up | `LakeMaintenance` on a schedule | 210 small files compacted into 7 in 67 s |
 | Repeated per-tenant reads: APIs, dashboards | `LakeReader(cache_mb=1024)` (Polars) | **6–67 ms** per query (Gold and Bronze, 2–3 M rows) |
@@ -306,7 +306,7 @@ From Rust:
 
 ## Application logs (OpenTelemetry)
 
-Applications that emit logs with [OpenTelemetry](https://opentelemetry.io/) can send them to the lake as OTLP/JSON. The SDK flattens each request into one row per log record, with the columns of the [OpenTelemetry Logs Data Model](https://opentelemetry.io/docs/specs/otel/logs/data-model/), groups the records by tenant and writes each tenant once. Parsing, validation and encoding run in Rust, without the GIL and without pyarrow.
+Applications that emit logs with [OpenTelemetry](https://opentelemetry.io/) can send them to the lake as OTLP, in either encoding: protobuf (what OTLP exporters and the Collector's S3 exporter write by default) or JSON, optionally gzip or zstd compressed. The SDK flattens each request into one row per log record, with the columns of the [OpenTelemetry Logs Data Model](https://opentelemetry.io/docs/specs/otel/logs/data-model/), groups the records by tenant and writes each tenant once. Both encodings give the same rows. Decoding, validation and encoding run in Rust, without the GIL and without pyarrow.
 
 ```python
 from datalake_medallion_sdk import BronzeIngestionClient, ContractRegistry, TenantRegistry
@@ -318,8 +318,9 @@ client = BronzeIngestionClient(
     tenants=tenants,
 )
 
-# One OTLP/JSON export request (bytes, str or the decoded dict). The tenant is the
-# resource attribute "tenant.id"; records without it go to default_tenant.
+# One OTLP logs export request: protobuf or JSON bytes (gzip or zstd allowed),
+# or OTLP/JSON as str or the decoded dict. The tenant is the resource attribute
+# "tenant.id"; records without it go to default_tenant.
 reports = await client.ingest_otel_logs(body, contract="otel/logs/1.0.0", default_tenant="shared")
 for tenant_id, report in reports.items():
     print(tenant_id, report.records_ok, report.records_quarantined, report.data_uri)
@@ -334,11 +335,13 @@ for tenant_id, report in reports.items():
 | `severity_number`, `severity_text` | int64, text | severity |
 | `body` | text | a string body as is, a structured body as JSON text |
 | `attributes`, `resource_attributes` | JSON text | record and resource attributes |
-| `trace_id`, `span_id` | hex text | trace context (checked: 32 and 16 hex digits) |
+| `trace_id`, `span_id` | hex text | trace context (checked: 32 and 16 hex digits; empty or all-zero ids are null) |
 | `flags`, `event_name` | int64, text | |
 | `service_name`, `scope_name`, `scope_version` | text | `service.name` resource attribute, instrumentation scope |
 
-It uses zstd (logs are text-heavy) and ingest-day partitions. Change the defaults with `logs_contract(datatype=, schema_version=, compression=, partition_by_event_time=)`; turn event-day partitions on only for high daily volumes per tenant (see [Data contracts](#data-contracts)). Configure exporters with the OTLP/JSON encoding: protobuf requests are rejected with a clear error.
+It uses zstd (logs are text-heavy) and ingest-day partitions. Change the defaults with `logs_contract(datatype=, schema_version=, compression=, partition_by_event_time=)`; turn event-day partitions on only for high daily volumes per tenant (see [Data contracts](#data-contracts)). Values that protobuf cannot tell apart from "unset" are null in both encodings: a zero time, severity number or flags, and an empty severity text, event name or scope.
+
+**Encodings and compression.** `encoding="auto"` (the default) reads JSON when a request starts with `{` and protobuf otherwise; `compression="auto"` recognizes gzip and zstd by their magic bytes, so one batch may mix them. Pass `encoding="json"` / `"protobuf"` or `compression="none"` / `"gzip"` / `"zstd"` to accept only one kind. A compressed request may expand to `max_decompressed_mb=64` at most; beyond it the request fails with `PayloadTooLargeError` (a `MalformedPayloadError`). Values nested deeper than 24 levels are rejected too. Protobuf is the cheaper encoding to read: fewer bytes, no text escaping and binary ids (see **Performance** below).
 
 **Queues and streams.** A consumer of Kinesis, SQS, Kafka or Pub/Sub ingests a whole batch of messages with one call, with one write per tenant instead of one object per message:
 
@@ -356,7 +359,12 @@ failed = {messages[i].id for o in outcomes if o.error for i in o.requests}
 - Each `TenantOutcome` lists the requests that carried that tenant's records. A tenant that fails (unknown tenant, upload error) or a message that cannot be read fails alone; retry or report only those messages.
 - Messages are flattened in parallel.
 
-[`examples/aws_lambda_handler.py`](examples/aws_lambda_handler.py) is a tested recipe for AWS Lambda: Kinesis, SQS and CloudWatch Logs subscriptions (CloudWatch events are mapped to the same OpenTelemetry columns, so every log ends up in one table), with `batchItemFailures` for partial failures. It is an example to copy and adapt, not part of the SDK API.
+[`examples/aws_lambda_handler.py`](examples/aws_lambda_handler.py) is a tested recipe for AWS Lambda, with `batchItemFailures` for partial failures. It is an example to copy and adapt, not part of the SDK API. It reads:
+
+- Kinesis records as written (raw protobuf, JSON or compressed);
+- SQS messages: JSON text, or protobuf in base64 (a `content-type` message attribute says which; without it, a body that does not start with `{` is decoded from base64);
+- S3 objects announced through SQS (`ObjectCreated` notifications): for example a landing bucket where the Collector's `awss3exporter` writes one request per object (`marshaler: otlp_proto`, optional `compression: gzip` or `zstd`). The batch id comes from the object keys and ETags, so a notification delivered twice rewrites the same Bronze objects;
+- CloudWatch Logs subscriptions, mapped to the same OpenTelemetry columns, so every log ends up in one table.
 
 **Reading logs back.** Filter the typed `timestamp` with text, dates or datetimes; values without a zone are UTC:
 
@@ -616,7 +624,7 @@ client = BronzeIngestionClient(contracts, tenants=tenants, hooks=hooks.as_mappin
 - **Client options**: `max_record_bytes` (default 10 MiB), `max_future_skew_seconds` (default 3600, `None` disables), `on_invalid` (`"quarantine"` or `"raise"`), `envelope_prefix` (default `"_dl_"`), `manifests` (default off, see [Incremental reads](#incremental-reads-changes-since-a-watermark)).
 - **Retries and idempotency**: uploads are retried inside the call (4 attempts, exponential backoff with jitter) over the same object keys, so a transient S3 error never duplicates rows. To retry a whole call, for example after a crash, pass the earlier `batch_id=` (or `stream_id=` for streams): the same keys are rewritten instead of adding rows. `@datalake_retry()` retries `StorageError` only.
 - **Metrics**: `@emit_metrics(sink)` records duration, failures and record counts to logging, CloudWatch Embedded Metric Format or any `MetricsSink`.
-- **OpenTelemetry** (optional, `pip install "datalake-medallion-sdk[otel]"`): ingests and reads become spans (`datalake.ingest`, `datalake.ingest_stream`, `datalake.read`, …) with `tenant.id`, `datalake.contract`, `datalake.data_type` and record counts, and the metrics `datalake.records` (by outcome), `datalake.bytes` and `datalake.operation.duration`. The SDK uses the OpenTelemetry API only and ships no exporter: configure the OpenTelemetry SDK and exporter in your application. Without the package nothing is wrapped; installed but not configured, a call costs about 2 µs.
+- **OpenTelemetry** (optional, `pip install "datalake-medallion-sdk[otel]"`): ingests and reads become spans (`datalake.ingest`, `datalake.ingest_stream`, `datalake.read`, …) with `tenant.id`, `datalake.contract`, `datalake.data_type`, record counts and, for OTLP logs, `datalake.otlp.encoding`, and the metrics `datalake.records` (by outcome), `datalake.bytes` and `datalake.operation.duration`. The SDK uses the OpenTelemetry API only and ships no exporter: configure the OpenTelemetry SDK and exporter in your application. Without the package nothing is wrapped; installed but not configured, a call costs about 2 µs.
 - **Concurrency**: one client and one reader per process serve every tenant and bucket; connections are created once and reused. Buckets must be reachable in the client's region.
 
 ## Errors
@@ -630,7 +638,8 @@ All errors derive from `DatalakeError`.
 | `TenantViolationError` | invalid or unknown tenant id, a resolver returned another tenant, a reader filter on `tenant_id` | check the tenant id and the registry |
 | `ProtectionError` | the tenant's PII protection or key service failed; nothing was written | check KMS permissions and availability, then retry |
 | `StorageError` | S3 failed | retry (`@datalake_retry`); quarantine objects are not duplicated |
-| `MalformedPayloadError` | the batch is not JSON or Arrow | fix the input |
+| `MalformedPayloadError` | the batch is not JSON or Arrow, or an OTLP request cannot be decompressed or decoded | fix the input |
+| `PayloadTooLargeError` (a `MalformedPayloadError`) | a compressed OTLP request expands beyond `max_decompressed_mb` | raise the limit if the request is legitimate |
 | `SchemaViolationError`, `HookError`, `SemanticViolationError`, `TypeCoercionError` | a record is invalid and `on_invalid="raise"` | fix the record, or quarantine instead |
 
 ## Upgrading from 0.1
