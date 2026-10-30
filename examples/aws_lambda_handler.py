@@ -4,10 +4,12 @@ Not part of the SDK API: copy this file next to your handler and adapt it.
 It only uses public SDK calls (``ingest_otel_log_batch``, ``ingest`` and
 ``batch_id_for``), which give the guarantees that matter:
 
-* **One write per tenant per batch**, not one object per message.
-* **Idempotent redelivery**: the batch id comes from the message ids (or, for
-  S3 objects, from their keys and ETags), so a batch delivered again (a
-  timeout, a crash) rewrites the same objects.
+* **One write per tenant per batch**, not one object per message (per S3
+  object for S3 notifications).
+* **Idempotent redelivery**: the batch id comes from the message ids, so a
+  batch delivered again (a timeout, a crash) rewrites the same objects. Each S3
+  object is a batch of its own named by its key and ETag, so it is rewritten in
+  place however SQS groups its notifications.
 * **Partial failures**: only the messages that carried a failed tenant's
   records are reported in ``batchItemFailures`` (enable
   ``ReportBatchItemFailures`` on the event source mapping).
@@ -40,9 +42,8 @@ JSON, gzip or zstd compressed; the SDK detects them:
   from base64.
 * **S3 through SQS**: ``ObjectCreated`` notifications of a landing bucket
   (for example where the Collector's ``awss3exporter`` writes one request per
-  object, ``marshaler: otlp_proto``). Each object is downloaded and ingested;
-  the batch id comes from the object keys and ETags, so a notification
-  delivered twice rewrites the same Bronze objects.
+  object, ``marshaler: otlp_proto``). Each object is downloaded and ingested
+  as a batch of its own, with the batch id from its key and ETag.
 
 CloudWatch Logs subscription data (direct, or gzip-compressed through
 Kinesis) is detected and mapped to the OpenTelemetry logs contract.
@@ -96,19 +97,13 @@ class Message:
     notification: bool = False
     """An S3 notification: its content is in ``objects`` (none for test events)."""
 
-    @property
-    def batch_key(self) -> str:
-        """What identifies the message's content for the batch id: the
-        objects of an S3 notification (none for a test event), else its id."""
-        if self.notification:
-            return ",".join(f"s3://{b}/{k}@{e}" for b, k, e, _ in self.objects)
-        return self.id
-
 
 @dataclass(frozen=True, slots=True)
 class LambdaResult:
     batch_id: str
-    reports: dict[str, IngestReport]
+    """Batch id of the Kinesis or SQS messages (S3 objects have their own)."""
+    reports: list[IngestReport]
+    """One per tenant and batch (a tenant may appear in several S3 objects)."""
     failed: list[str]
 
     def response(self) -> dict[str, Any]:
@@ -325,34 +320,56 @@ class LambdaIngestor:
         body: bytes = self.s3.get_object(Bucket=bucket, Key=key)["Body"].read()
         return body
 
-    async def _objects(self, batch: list[Message], failed: set[int]) -> list[tuple[int, bytes]]:
-        """The contents of the S3 objects announced in the batch, by message."""
+    async def _objects(
+        self, batch: list[Message], failed: set[int]
+    ) -> list[tuple[int, str, bytes]]:
+        """The S3 objects announced in the batch: (message index, object id, content)."""
         wanted = [(i, o) for i, m in enumerate(batch) for o in m.objects]
         results = await asyncio.gather(
             *(asyncio.to_thread(self._download, *o) for _, o in wanted), return_exceptions=True
         )
-        out: list[tuple[int, bytes]] = []
-        for (index, (bucket, key, _, _)), result in zip(wanted, results, strict=True):
+        out: list[tuple[int, str, bytes]] = []
+        for (index, (bucket, key, etag, _)), result in zip(wanted, results, strict=True):
             if isinstance(result, BaseException):
                 _log.warning("s3://%s/%s cannot be read: %s", bucket, key, type(result).__name__)
                 failed.add(index)
             else:
-                out.append((index, result))
+                out.append((index, f"s3://{bucket}/{key}@{etag}", result))
         return out
 
     async def ingest(self, event: Mapping[str, Any]) -> LambdaResult:
         source, batch = messages(event)
-        if not batch:
-            return LambdaResult("", {}, [])
-        # Messages without content (S3 test events) do not change the batch id.
-        named = [m for m in batch if m.batch_key] or batch
-        batch_id = batch_id_for(
-            [m.batch_key or m.id for m in named], time_ms=max(m.arrival_ms for m in named)
-        )
         failed: set[int] = set()
-        contents = [(i, m.data) for i, m in enumerate(batch) if not m.notification]
-        contents += await self._objects(batch, failed)
-        contents.sort(key=lambda c: c[0])
+        direct = [(i, m.data) for i, m in enumerate(batch) if not m.notification]
+        batch_id = ""
+        jobs: list[tuple[str, list[tuple[int, bytes]]]] = []  # (batch id, [(message, content)])
+        if direct:
+            batch_id = batch_id_for(
+                [batch[i].id for i, _ in direct],
+                time_ms=max(batch[i].arrival_ms for i, _ in direct),
+            )
+            jobs.append((batch_id, direct))
+        # Each S3 object is a batch of its own, named by its key and ETag: the
+        # same object announced again rewrites the same Bronze objects, however
+        # SQS groups the notifications.
+        for index, object_id, data in await self._objects(batch, failed):
+            object_batch = batch_id_for([object_id], time_ms=batch[index].arrival_ms)
+            jobs.append((object_batch, [(index, data)]))
+        results = await asyncio.gather(
+            *(self._ingest(source, batch, job_id, contents, failed) for job_id, contents in jobs)
+        )
+        reports = [r for job in results for r in job]
+        return LambdaResult(batch_id, reports, [batch[i].id for i in sorted(failed)])
+
+    async def _ingest(
+        self,
+        source: str,
+        batch: list[Message],
+        batch_id: str,
+        contents: list[tuple[int, bytes]],
+        failed: set[int],
+    ) -> list[IngestReport]:
+        """Ingests the contents of some messages as one batch; adds failures to ``failed``."""
         limit = self.max_object_mb * _MIB
         otlp: list[bytes] = []
         owners: list[int] = []  # message of each OTLP request
@@ -383,7 +400,7 @@ class LambdaIngestor:
             except (ValueError, KeyError, TypeError, zlib.error, TenantViolationError) as e:
                 _log.warning("message %s cannot be ingested: %s", batch[index].id, type(e).__name__)
                 failed.add(index)
-        reports: dict[str, IngestReport] = {}
+        reports: list[IngestReport] = []
         if otlp:
             outcomes = await self.client.ingest_otel_log_batch(
                 otlp,
@@ -395,7 +412,7 @@ class LambdaIngestor:
             )
             for o in outcomes:
                 if o.report is not None:
-                    reports[o.report.tenant_id] = o.report
+                    reports.append(o.report)
                 else:
                     _log.error("tenant %s of batch %s failed: %r", o.tenant_id, batch_id, o.error)
                     failed.update(owners[i] for i in o.requests)
@@ -418,8 +435,8 @@ class LambdaIngestor:
                     _log.error("tenant %s of batch %s failed: %r", tenant, batch_id, result)
                     failed.update(groups[tenant][1])
                 else:
-                    reports[result.tenant_id] = result
-        return LambdaResult(batch_id, reports, [batch[i].id for i in sorted(failed)])
+                    reports.append(result)
+        return reports
 
     def _tenant_of(self, record: Any) -> str:
         if self.tenant_field is not None and isinstance(record, dict):

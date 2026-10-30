@@ -363,7 +363,7 @@ failed = {messages[i].id for o in outcomes if o.error for i in o.requests}
 
 - Kinesis records as written (raw protobuf, JSON or compressed);
 - SQS messages: JSON text, or protobuf in base64 (a `content-type` message attribute says which; without it, a body that does not start with `{` is decoded from base64);
-- S3 objects announced through SQS (`ObjectCreated` notifications): for example a landing bucket where the Collector's `awss3exporter` writes one request per object (`marshaler: otlp_proto`, optional `compression: gzip` or `zstd`). The batch id comes from the object keys and ETags, so a notification delivered twice rewrites the same Bronze objects;
+- S3 objects announced through SQS (`ObjectCreated` notifications): for example a landing bucket where the Collector's `awss3exporter` writes one request per object (`marshaler: otlp_proto`, optional `compression: gzip` or `zstd`). Each object is a batch of its own, named by its key and ETag, so a notification delivered twice rewrites the same Bronze objects however SQS groups it (an object uploaded again is a new event and is ingested again);
 - CloudWatch Logs subscriptions, mapped to the same OpenTelemetry columns, so every log ends up in one table.
 
 **Reading logs back.** Filter the typed `timestamp` with text, dates or datetimes; values without a zone are UTC:
