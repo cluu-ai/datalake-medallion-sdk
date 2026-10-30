@@ -59,7 +59,9 @@ jobs:
         with:
           python-version: "3.13"
       - run: cargo test --all-targets
-      - run: pip install -e ".[dev]"
+      # Dependencies pinned by hash; maturin comes from the same file (no build isolation).
+      - run: pip install --require-hashes -r requirements/ci.txt
+      - run: pip install --no-deps --no-build-isolation -e .
       - run: pytest pytests -q
 
   wheels:
@@ -150,7 +152,11 @@ jobs:
           persist-credentials: false
           sparse-checkout: scripts
           path: src
-      - run: pip install --no-index --find-links dist datalake-medallion-sdk
+      # Offline: select this platform's wheel from dist, then install that file only.
+      - shell: bash
+        run: |
+          pip download --no-index --no-deps --only-binary :all: --find-links dist --dest wheel datalake-medallion-sdk
+          pip install --no-index --no-deps wheel/*.whl
       - run: python src/scripts/release_smoke.py
 
   check:

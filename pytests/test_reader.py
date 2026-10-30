@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import tempfile
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -139,7 +139,8 @@ async def test_scan_runs_aggregations_in_the_engine(
 
         total = scan.select(pl.len(), pl.col("attempts").sum()).collect().row(0)
     else:
-        total = scan.aggregate("count(*), sum(attempts)").fetchone()
+        # DuckDB 2 relations have no fetchone(); fetchall() works on 1.x and 2.x.
+        total = scan.aggregate("count(*), sum(attempts)").fetchall()[0]
     assert tuple(total) == (10, 45)
 
 
@@ -203,7 +204,7 @@ def iceberg_catalog(s3_endpoint: str, bucket: str) -> Iterator[Any]:
     workdir = tempfile.mkdtemp()
     catalog = SqlCatalog(
         "lake",
-        uri=f"sqlite:///{os.path.join(workdir, 'catalog.db')}",
+        uri=f"sqlite:///{Path(workdir, 'catalog.db').as_posix()}",
         warehouse=f"s3://{bucket}/warehouse",
         **{
             "s3.endpoint": s3_endpoint,

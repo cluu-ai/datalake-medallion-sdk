@@ -40,7 +40,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - run: pip install -e ".[dev]"
+      # Dependencies pinned by hash; maturin comes from the same file (no build isolation).
+      - run: pip install --require-hashes -r requirements/ci.txt
+      - run: pip install --no-deps --no-build-isolation -e .
       - run: ruff format --check python pytests
       - run: ruff check python pytests
       - run: mypy
@@ -179,9 +181,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pull requests: Linux only. Windows and macOS run on main and in the
-        # release workflow, which tests every wheel before publishing.
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "windows-latest", "macos-latest"]') }}
+        # Pull requests run Linux and Windows to catch OS regressions before
+        # merge. macOS runs on main and in the release workflow.
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest", "windows-latest"]' || '["ubuntu-latest", "windows-latest", "macos-latest"]') }}
         python: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -194,7 +196,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install -e ".[dev]"
+      # Dependencies pinned by hash; maturin comes from the same file (no build isolation).
+      - run: pip install --require-hashes -r requirements/ci.txt
+      - run: pip install --no-deps --no-build-isolation -e .
       - run: pytest pytests -q
       - run: python scripts/release_smoke.py
 
@@ -257,6 +261,8 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo bench -- --noplot
+        env:
+          CARGO_BUILD_JOBS: "2"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: criterion

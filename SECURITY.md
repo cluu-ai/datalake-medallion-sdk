@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.x (including pre-releases) | yes |
-| 0.1.x   | security fixes until 0.2.0 is released |
+| 0.3.x (including pre-releases) | yes |
+| 0.2.x | security fixes until 0.3.0 stabilizes |
 
 ## Reporting a vulnerability
 

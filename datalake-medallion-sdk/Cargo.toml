@@ -31,7 +31,10 @@ async-trait = "0.1"
 # Object storage
 aws-config = "1"
 # Without the legacy `rustls` feature (hyper 0.14 + rustls 0.21 stack).
-aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+# `sigv4a` is deliberately off: it only serves S3 Multi-Region Access Points, which
+# this SDK does not address, and it pulls an elliptic-curve stack (p256, ecdsa,
+# crypto-bigint) with no use here. Buckets are always plain names (SigV4).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["http-1x", "default-https-client", "rt-tokio"] }
 # Optional (feature `aws-kms`): data keys for PII envelope encryption.
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio"], optional = true }
 bytes = "1"
