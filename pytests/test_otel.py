@@ -1,4 +1,4 @@
-"""OpenTelemetry logs: OTLP/JSON requests flattened and ingested per tenant (moto S3)."""
+"""OpenTelemetry logs: OTLP requests flattened and ingested per tenant (moto S3)."""
 
 from __future__ import annotations
 
@@ -146,9 +146,19 @@ async def test_invalid_records_are_quarantined(make_client: MakeClient, store: B
     assert (r.records_ok, r.records_quarantined) == (1, 2)
 
 
-async def test_protobuf_is_rejected(make_client: MakeClient) -> None:
-    with pytest.raises(MalformedPayloadError, match="OTLP/JSON"):
+async def test_unreadable_requests_are_rejected(make_client: MakeClient) -> None:
+    with pytest.raises(MalformedPayloadError, match="OTLP/protobuf"):
         await client(make_client).ingest_otel_logs(b"\x0a\x12\x08", contract=CONTRACT)
+    with pytest.raises(MalformedPayloadError, match="JSON object"):
+        await client(make_client).ingest_otel_logs(b"[1]", contract=CONTRACT, encoding="json")
+    with pytest.raises(TypeError, match="JSON"):
+        await client(make_client).ingest_otel_logs(
+            request(), contract=CONTRACT, encoding="protobuf"
+        )
+    with pytest.raises(TypeError, match="bytes"):
+        await client(make_client).ingest_otel_logs(42, contract=CONTRACT)  # type: ignore[arg-type]
+    with pytest.raises(Exception, match="encoding"):
+        await client(make_client).ingest_otel_logs(b"{}", contract=CONTRACT, encoding="xml")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("engine", ["polars", "duckdb"])

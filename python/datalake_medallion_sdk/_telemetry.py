@@ -10,7 +10,8 @@ Spans (kind ``INTERNAL``): ``datalake.ingest``, ``datalake.ingest_stream``,
 ``datalake.ingest_file``, ``datalake.ingest_otel_logs``, ``datalake.read``,
 ``datalake.changes``; attributes ``tenant.id``, ``datalake.contract``,
 ``datalake.data_type``, ``datalake.layer``, ``datalake.batch_id`` and the
-record counts.
+record counts, plus ``datalake.otlp.encoding`` (``json``, ``protobuf`` or
+``mixed``) on the OTLP log ingestion spans.
 
 Metrics: ``datalake.records`` (counter, ``{record}``, attribute
 ``datalake.outcome`` = ``ok`` or ``quarantined``), ``datalake.bytes``
@@ -38,7 +39,7 @@ except ImportError:  # the [otel] extra is not installed
     _trace = None  # type: ignore[assignment]
     _metrics = None  # type: ignore[assignment]
 
-__all__ = ["enabled", "operation", "traced"]
+__all__ = ["enabled", "operation", "set_span_attribute", "traced"]
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -85,6 +86,13 @@ def _configured() -> bool:
 def enabled() -> bool:
     """Whether ``opentelemetry-api`` is installed (spans may still be no-ops)."""
     return _instruments is not None
+
+
+def set_span_attribute(key: str, value: Any) -> None:
+    """Sets ``key`` on the SDK span in progress; never on an application span,
+    since without a configured provider the SDK records none."""
+    if value is not None and _trace is not None and _configured():
+        _trace.get_current_span().set_attribute(key, value)
 
 
 Done = Callable[[Any], None]
