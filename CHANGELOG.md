@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: the `pyarrow`, `read` and `write` extras install `tzdata`, which PyArrow needs to convert timezone-aware timestamps to Python objects.
+
+### Security
+
+- `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382) and `ctutils` 0.4.6 (RUSTSEC-2026-0385). `aws-sdk-s3` is built without `sigv4a` (S3 Multi-Region Access Points, not used by the SDK), which removes `crypto-bigint` (RUSTSEC-2026-0387).
+- CI installs Python dependencies from a hash-pinned lock (`requirements/ci.txt`) and the release smoke test installs only the locally built wheel.
+
 ## [0.3.0] - 2026-10-20
 
 The SDK now covers the whole medallion lake: contract-checked Bronze ingestion, Silver and Gold Iceberg writes with their maintenance, and tenant-scoped reads of every layer. This release includes everything in 0.2.0rc6 to 0.3.0rc1 below.

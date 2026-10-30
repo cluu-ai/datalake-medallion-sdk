@@ -40,7 +40,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - run: pip install -e ".[dev]"
+      # Dependencies pinned by hash; maturin comes from the same file (no build isolation).
+      - run: pip install --require-hashes -r requirements/ci.txt
+      - run: pip install --no-deps --no-build-isolation -e .
       - run: ruff format --check python pytests
       - run: ruff check python pytests
       - run: mypy
@@ -194,7 +196,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install -e ".[dev]"
+      # Dependencies pinned by hash; maturin comes from the same file (no build isolation).
+      - run: pip install --require-hashes -r requirements/ci.txt
+      - run: pip install --no-deps --no-build-isolation -e .
       - run: pytest pytests -q
       - run: python scripts/release_smoke.py
 

@@ -13,6 +13,8 @@ python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"                        # builds the native extension with maturin
 ```
 
+CI installs the same `dev` extra from `requirements/ci.txt`, pinned by hash. Regenerate it whenever the extra changes; the command is at the top of the file.
+
 ## Checks
 
 Run before opening a pull request; CI runs the same commands.
