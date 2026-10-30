@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "datalake-medallion-sdk"
-version = "0.4.0rc1"
+version = "0.4.0"
 description = "Build and serve multi-tenant medallion data lakes on S3: contract-checked Bronze ingestion, Silver and Gold Iceberg writes and maintenance, and tenant-scoped Parquet/Iceberg reads without Athena. Per-call tenancy, any input (Arrow, Polars, DuckDB, JSON, files), optional PII protection. Rust core, Python API"
 readme = "README.md"
 requires-python = ">=3.12"
