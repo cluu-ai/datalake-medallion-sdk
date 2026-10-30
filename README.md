@@ -382,7 +382,7 @@ errors = reader.read(
 )
 ```
 
-**Performance.** On AWS Lambda (10 GB / 6 vCPU), a batch of 500 requests with 1 M log records (396 MiB of OTLP/JSON) for 8 tenants is written to S3 in **2.5 s**, one object per tenant; the Lambda recipe handles a Kinesis batch of 100 requests in 0.5 s. Without the network (`examples/otel_throughput.rs`), 200 k records in 100 requests take 0.27 s as OTLP/JSON and 0.18 s as OTLP/protobuf; decoding alone is 2 to 2.8 times faster in protobuf, with 2.6 times fewer bytes. Details in [docs/performance.md](docs/performance.md).
+**Performance.** On AWS Lambda (10 GB / 6 vCPU), a batch of 500 requests with 1 M log records for 8 tenants is written to S3 in **1.43 s** as OTLP/protobuf (161 MiB) and 1.86 s as OTLP/JSON (421 MiB), one object per tenant; the Lambda recipe handles a Kinesis batch of 100 requests in 0.27 s (protobuf) or 0.37 s (JSON). Without the network (`examples/otel_throughput.rs`), 200 k records in 100 requests take 0.27 s as OTLP/JSON and 0.18 s as OTLP/protobuf; decoding alone is 2 to 2.8 times faster in protobuf, with 2.6 times fewer bytes. Details in [docs/performance.md](docs/performance.md).
 
 ## PII protection
 
