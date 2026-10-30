@@ -19,3 +19,9 @@ name = "contract_compile"
 path = "fuzz_targets/contract_compile.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "otlp_logs"
+path = "fuzz_targets/otlp_logs.rs"
+test = false
+doc = false

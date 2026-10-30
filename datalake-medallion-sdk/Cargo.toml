@@ -44,6 +44,11 @@ bytes = "1"
 arrow = { version = "60", features = ["json", "ffi", "chrono-tz"] }
 parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
 
+# Compressed OTLP requests: gzip in pure Rust (miniz_oxide); zstd is the
+# library parquet already links.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zstd = { version = "0.14", default-features = false }
+
 # Contracts and validation
 # No remote or file $ref resolution: contracts must be self-contained, and
 # compiling a schema must never perform network I/O. `idna` keeps the

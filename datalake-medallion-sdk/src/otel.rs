@@ -1,20 +1,33 @@
-//! OpenTelemetry logs: OTLP/JSON export requests flattened into Arrow rows.
+//! OpenTelemetry logs: OTLP export requests flattened into Arrow rows.
 //!
 //! An OTLP logs request nests records under resources and scopes
-//! (`resourceLogs → scopeLogs → logRecords`). [`flatten_logs_json`] turns it
+//! (`resourceLogs → scopeLogs → logRecords`). [`flatten_logs`] turns it
 //! into one row per log record, with the columns of the
 //! [OpenTelemetry Logs Data Model](https://opentelemetry.io/docs/specs/otel/logs/data-model/),
 //! grouped by the tenant named in a resource attribute. The rows go straight
 //! into the SDK's columnar path; [`logs_contract`] is the matching contract.
 //!
-//! Field names are read in the lowerCamelCase of the OTLP/JSON encoding,
-//! and in the original `snake_case` as the specification allows. Trace and
-//! span ids are hex text; 64-bit integers may be numbers or strings.
+//! Both OTLP encodings give the same rows: OTLP/protobuf (a serialized
+//! `ExportLogsServiceRequest`, what OTLP exporters and the Collector's S3
+//! exporter write by default) and OTLP/JSON, each optionally gzip or zstd
+//! compressed ([`OtlpOptions`]). In JSON, field names are read in the
+//! lowerCamelCase of the encoding and in the original `snake_case` as the
+//! specification allows, trace and span ids are hex text and 64-bit integers
+//! may be numbers or strings.
+//!
+//! Values that protobuf cannot tell apart from "unset" are null in both
+//! encodings: a zero time, severity number or flags; an empty severity text,
+//! event name, scope name or version; an empty or all-zero trace or span id.
+
+mod protobuf;
+#[cfg(test)]
+mod transcode;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::Write as _;
+use std::io::{Read, Write as _};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Builder, StringBuilder};
@@ -26,6 +39,160 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::error::DatalakeError;
+
+/// Deepest nesting of values (arrays and key-value lists inside attributes
+/// or bodies) that a request may have, in either encoding. Deeper requests
+/// are malformed.
+pub const MAX_VALUE_DEPTH: usize = 24;
+
+/// Default of [`OtlpOptions::max_decompressed_bytes`]: 64 MiB.
+pub const DEFAULT_MAX_DECOMPRESSED_BYTES: usize = 64 << 20;
+
+/// Encoding of an OTLP logs request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum OtlpEncoding {
+    /// JSON when the first non-blank byte (after decompression) is `{`,
+    /// protobuf otherwise.
+    #[default]
+    Auto,
+    /// OTLP/JSON (`application/json`).
+    Json,
+    /// OTLP/protobuf (`application/x-protobuf`): a serialized
+    /// `ExportLogsServiceRequest`.
+    Protobuf,
+}
+
+impl OtlpEncoding {
+    /// `"auto"`, `"json"` or `"protobuf"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Json => "json",
+            Self::Protobuf => "protobuf",
+        }
+    }
+}
+
+impl FromStr for OtlpEncoding {
+    type Err = DatalakeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "json" => Ok(Self::Json),
+            "protobuf" => Ok(Self::Protobuf),
+            _ => Err(DatalakeError::config(format!(
+                "OTLP encoding {s:?} is not one of 'auto', 'json', 'protobuf'"
+            ))),
+        }
+    }
+}
+
+/// Compression of an OTLP logs request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum OtlpCompression {
+    /// gzip or zstd when the request starts with their magic bytes,
+    /// uncompressed otherwise.
+    #[default]
+    Auto,
+    /// Uncompressed.
+    None,
+    /// gzip (one or more members), as `Content-Encoding: gzip`.
+    Gzip,
+    /// zstd (one or more frames).
+    Zstd,
+}
+
+impl OtlpCompression {
+    /// `"auto"`, `"none"`, `"gzip"` or `"zstd"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+            Self::Gzip => "gzip",
+            Self::Zstd => "zstd",
+        }
+    }
+}
+
+impl FromStr for OtlpCompression {
+    type Err = DatalakeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "none" => Ok(Self::None),
+            "gzip" => Ok(Self::Gzip),
+            "zstd" => Ok(Self::Zstd),
+            _ => Err(DatalakeError::config(format!(
+                "OTLP compression {s:?} is not one of 'auto', 'none', 'gzip', 'zstd'"
+            ))),
+        }
+    }
+}
+
+/// How [`flatten_logs`] reads a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OtlpOptions {
+    /// Attribute that names the tenant: on the resource, or on the record
+    /// when the resource has none. Default `tenant.id`.
+    pub tenant_attribute: String,
+    /// Default [`OtlpEncoding::Auto`].
+    pub encoding: OtlpEncoding,
+    /// Default [`OtlpCompression::Auto`].
+    pub compression: OtlpCompression,
+    /// Largest size a compressed request may expand to; above it the request
+    /// fails with [`DatalakeError::PayloadTooLarge`] (a guard against
+    /// compression bombs). Default [`DEFAULT_MAX_DECOMPRESSED_BYTES`].
+    pub max_decompressed_bytes: usize,
+}
+
+impl OtlpOptions {
+    /// Defaults, with the tenant in `tenant_attribute`.
+    pub fn new(tenant_attribute: impl Into<String>) -> Self {
+        Self {
+            tenant_attribute: tenant_attribute.into(),
+            encoding: OtlpEncoding::Auto,
+            compression: OtlpCompression::Auto,
+            max_decompressed_bytes: DEFAULT_MAX_DECOMPRESSED_BYTES,
+        }
+    }
+
+    /// Reads requests in `encoding`.
+    #[must_use]
+    pub fn with_encoding(mut self, encoding: OtlpEncoding) -> Self {
+        self.encoding = encoding;
+        self
+    }
+
+    /// Reads requests compressed with `compression`.
+    #[must_use]
+    pub fn with_compression(mut self, compression: OtlpCompression) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Limits the size of a decompressed request.
+    #[must_use]
+    pub fn with_max_decompressed_bytes(mut self, bytes: usize) -> Self {
+        self.max_decompressed_bytes = bytes;
+        self
+    }
+
+    /// Strict OTLP/JSON, uncompressed: what [`flatten_logs_json`] reads.
+    fn json(tenant_attribute: &str) -> Self {
+        Self::new(tenant_attribute)
+            .with_encoding(OtlpEncoding::Json)
+            .with_compression(OtlpCompression::None)
+    }
+}
+
+impl Default for OtlpOptions {
+    fn default() -> Self {
+        Self::new("tenant.id")
+    }
+}
 
 /// Column type of a flattened log record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,11 +232,11 @@ pub struct TenantLogs {
     /// One row per log record, columns as in [`logs_contract`].
     pub batch: RecordBatch,
     /// Indices of the requests that contributed rows (always `[0]` for
-    /// [`flatten_logs_json`]).
+    /// [`flatten_logs`]).
     pub sources: Vec<usize>,
 }
 
-/// Outcome of [`flatten_logs_json_many`].
+/// Outcome of [`flatten_logs_many`].
 #[derive(Debug)]
 pub struct FlattenedRequests {
     /// Rows by tenant, merged across requests.
@@ -77,6 +244,8 @@ pub struct FlattenedRequests {
     /// Requests that could not be read, with their index and error; the
     /// other requests are flattened anyway.
     pub malformed: Vec<(usize, DatalakeError)>,
+    /// Encoding each request was read in (`None` for unreadable ones).
+    pub encodings: Vec<Option<OtlpEncoding>>,
 }
 
 /// JSON Schema contract for flattened `OpenTelemetry` logs: event time typed as a
@@ -175,6 +344,109 @@ const T_RESOURCE: usize = 11;
 const I_SEVERITY: usize = 0;
 const I_FLAGS: usize = 1;
 
+/// Resource and scope of the records being read.
+struct Origin<'a> {
+    service: Option<&'a str>,
+    /// Resource attributes as JSON text.
+    resource: Option<&'a str>,
+    scope_name: Option<&'a str>,
+    scope_version: Option<&'a str>,
+}
+
+/// One log record as read from either encoding; zero and empty mean unset.
+#[derive(Default)]
+struct Record<'a> {
+    time: u64,
+    observed: u64,
+    severity_number: i64,
+    severity_text: &'a str,
+    /// Text, or JSON text for structured bodies.
+    body: Option<&'a str>,
+    /// Attributes as JSON text.
+    attributes: Option<&'a str>,
+    /// Lowercase hex.
+    trace_id: Option<&'a str>,
+    span_id: Option<&'a str>,
+    flags: i64,
+    event_name: &'a str,
+}
+
+/// Rows of a request by tenant, in order of first appearance.
+#[derive(Default)]
+struct Groups {
+    tenants: Vec<(Option<String>, Rows)>,
+    last: Option<usize>,
+    time: String,
+    observed: String,
+}
+
+impl Groups {
+    fn index(&mut self, tenant: Option<&str>) -> usize {
+        // Few tenants per request: a linear search beats hashing owned keys.
+        if let Some(i) = self
+            .last
+            .filter(|&i| self.tenants[i].0.as_deref() == tenant)
+        {
+            return i;
+        }
+        let i = if let Some(i) = self
+            .tenants
+            .iter()
+            .position(|(t, _)| t.as_deref() == tenant)
+        {
+            i
+        } else {
+            self.tenants.push((tenant.map(str::to_owned), Rows::new()));
+            self.tenants.len() - 1
+        };
+        self.last = Some(i);
+        i
+    }
+
+    fn push(&mut self, tenant: Option<&str>, origin: &Origin<'_>, record: &Record<'_>) {
+        let index = self.index(tenant);
+        let rows = &mut self.tenants[index].1;
+        let has_observed = time_text(&mut self.observed, record.observed);
+        // The record's time, or when it was observed if unset.
+        if time_text(&mut self.time, record.time) {
+            rows.text[T_TIME].append_value(&self.time);
+        } else if has_observed {
+            rows.text[T_TIME].append_value(&self.observed);
+        } else {
+            rows.text[T_TIME].append_null();
+        }
+        rows.text[T_OBSERVED].append_option(has_observed.then_some(self.observed.as_str()));
+        rows.text[T_SEVERITY].append_option(non_empty(record.severity_text));
+        rows.text[T_BODY].append_option(record.body);
+        rows.text[T_ATTRIBUTES].append_option(record.attributes);
+        rows.text[T_TRACE].append_option(record.trace_id);
+        rows.text[T_SPAN].append_option(record.span_id);
+        rows.text[T_EVENT].append_option(non_empty(record.event_name));
+        rows.text[T_SERVICE].append_option(origin.service);
+        rows.text[T_SCOPE_NAME].append_option(origin.scope_name);
+        rows.text[T_SCOPE_VERSION].append_option(origin.scope_version);
+        rows.text[T_RESOURCE].append_option(origin.resource);
+        rows.ints[I_SEVERITY]
+            .append_option((record.severity_number != 0).then_some(record.severity_number));
+        rows.ints[I_FLAGS].append_option((record.flags != 0).then_some(record.flags));
+    }
+
+    /// Groups in tenant order.
+    fn finish(mut self) -> Result<Vec<TenantLogs>, DatalakeError> {
+        self.tenants.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        self.tenants
+            .into_iter()
+            .map(|(tenant, rows)| {
+                Ok(TenantLogs {
+                    tenant,
+                    batch: rows.finish()?,
+                    sources: vec![0],
+                })
+            })
+            .collect()
+    }
+}
+
 /// A 64-bit integer written as a JSON number or a string, as OTLP/JSON
 /// allows; anything else reads as absent.
 #[derive(Debug, Clone, Copy)]
@@ -208,6 +480,10 @@ impl<'de> Deserialize<'de> for Int {
     }
 }
 
+fn int(v: Option<Int>) -> i64 {
+    v.and_then(|Int(v)| v).unwrap_or(0)
+}
+
 /// Unsigned nanoseconds since the epoch, as a number or a string.
 #[derive(Debug, Clone, Copy)]
 struct Nanos(Option<u64>);
@@ -215,6 +491,46 @@ struct Nanos(Option<u64>);
 impl<'de> Deserialize<'de> for Nanos {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Int::deserialize(d).map(|Int(v)| Nanos(v.and_then(|n| u64::try_from(n).ok())))
+    }
+}
+
+fn nanos(v: Option<Nanos>) -> u64 {
+    v.and_then(|Nanos(v)| v).unwrap_or(0)
+}
+
+/// A double written as a JSON number, or as a string (`"NaN"`, `"Infinity"`,
+/// `"-Infinity"` or digits) as the protobuf JSON mapping allows.
+#[derive(Debug, Clone, Copy)]
+struct Double(f64);
+
+impl<'de> Deserialize<'de> for Double {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct DoubleVisitor;
+        impl Visitor<'_> for DoubleVisitor {
+            type Value = Double;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a number, or a string")
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Double, E> {
+                Ok(Double(v))
+            }
+            #[allow(clippy::cast_precision_loss)] // As JSON number parsing does.
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Double, E> {
+                Ok(Double(v as f64))
+            }
+            #[allow(clippy::cast_precision_loss)]
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Double, E> {
+                Ok(Double(v as f64))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Double, E> {
+                Ok(Double(match v {
+                    "Infinity" => f64::INFINITY,
+                    "-Infinity" => f64::NEG_INFINITY,
+                    _ => v.parse().unwrap_or(f64::NAN),
+                }))
+            }
+        }
+        d.deserialize_any(DoubleVisitor)
     }
 }
 
@@ -299,7 +615,7 @@ struct AnyValue<'a> {
     #[serde(default, rename = "intValue", alias = "int_value")]
     int: Option<Int>,
     #[serde(default, rename = "doubleValue", alias = "double_value")]
-    double: Option<f64>,
+    double: Option<Double>,
     #[serde(borrow, default, rename = "arrayValue", alias = "array_value")]
     array: Option<Values<'a, AnyValue<'a>>>,
     #[serde(borrow, default, rename = "kvlistValue", alias = "kvlist_value")]
@@ -317,13 +633,33 @@ struct Values<'a, T> {
     _borrow: std::marker::PhantomData<&'a ()>,
 }
 
+fn malformed(reason: impl Into<String>) -> DatalakeError {
+    DatalakeError::MalformedPayload {
+        reason: reason.into(),
+    }
+}
+
+fn too_deep() -> DatalakeError {
+    malformed(format!(
+        "OTLP logs request nests values deeper than {MAX_VALUE_DEPTH} levels"
+    ))
+}
+
 /// JSON text of a string, escaped. Writing to a `Vec` cannot fail.
 fn push_json_str(out: &mut Vec<u8>, s: &str) {
     let _ = serde_json::to_writer(&mut *out, s);
 }
 
-/// An OTLP `AnyValue` as plain JSON (bytes stay base64 text).
-fn push_any(out: &mut Vec<u8>, v: &AnyValue<'_>) {
+/// JSON text of a double; non-finite values are `null`.
+fn push_double(out: &mut Vec<u8>, d: f64) {
+    let _ = serde_json::to_writer(&mut *out, &d);
+}
+
+/// An OTLP `AnyValue` at nesting `depth` as plain JSON (bytes stay base64 text).
+fn push_any(out: &mut Vec<u8>, v: &AnyValue<'_>, depth: usize) -> Result<(), DatalakeError> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(too_deep());
+    }
     if let Some(s) = &v.string {
         push_json_str(out, s);
     } else if let Some(b) = v.boolean {
@@ -335,27 +671,32 @@ fn push_any(out: &mut Vec<u8>, v: &AnyValue<'_>) {
             }
             None => out.extend_from_slice(b"null"),
         }
-    } else if let Some(d) = v.double {
-        let _ = serde_json::to_writer(&mut *out, &d);
+    } else if let Some(Double(d)) = v.double {
+        push_double(out, d);
     } else if let Some(a) = &v.array {
         out.push(b'[');
         for (n, item) in a.values.iter().enumerate() {
             if n > 0 {
                 out.push(b',');
             }
-            push_any(out, item);
+            push_any(out, item, depth + 1)?;
         }
         out.push(b']');
     } else if let Some(kv) = &v.kvlist {
-        push_key_values(out, &kv.values);
+        push_key_values(out, &kv.values, depth + 1)?;
     } else if let Some(b) = &v.bytes {
         push_json_str(out, b);
     } else {
         out.extend_from_slice(b"null");
     }
+    Ok(())
 }
 
-fn push_key_values(out: &mut Vec<u8>, items: &[KeyValue<'_>]) {
+fn push_key_values(
+    out: &mut Vec<u8>,
+    items: &[KeyValue<'_>],
+    depth: usize,
+) -> Result<(), DatalakeError> {
     out.push(b'{');
     for (n, kv) in items.iter().enumerate() {
         if n > 0 {
@@ -364,21 +705,22 @@ fn push_key_values(out: &mut Vec<u8>, items: &[KeyValue<'_>]) {
         push_json_str(out, &kv.key);
         out.push(b':');
         match &kv.value {
-            Some(v) => push_any(out, v),
+            Some(v) => push_any(out, v, depth)?,
             None => out.extend_from_slice(b"null"),
         }
     }
     out.push(b'}');
+    Ok(())
 }
 
 /// Attributes as JSON text in `out` (cleared first); `false` when empty.
-fn attributes_json(out: &mut Vec<u8>, items: &[KeyValue<'_>]) -> bool {
+fn attributes_json(out: &mut Vec<u8>, items: &[KeyValue<'_>]) -> Result<bool, DatalakeError> {
     out.clear();
     if items.is_empty() {
-        return false;
+        return Ok(false);
     }
-    push_key_values(out, items);
-    true
+    push_key_values(out, items, 1)?;
+    Ok(true)
 }
 
 /// The string value of attribute `key`.
@@ -391,11 +733,8 @@ fn string_attribute<'a>(items: &'a [KeyValue<'_>], key: &str) -> Option<&'a str>
 
 /// Nanoseconds as RFC 3339 text with microseconds in `out` (cleared first);
 /// `false` for zero (unset) or out of range.
-fn time_text(out: &mut String, nanos: Option<Nanos>) -> bool {
+fn time_text(out: &mut String, nanos: u64) -> bool {
     out.clear();
-    let Some(Nanos(Some(nanos))) = nanos else {
-        return false;
-    };
     if nanos == 0 {
         return false;
     }
@@ -424,13 +763,14 @@ fn time_text(out: &mut String, nanos: Option<Nanos>) -> bool {
     true
 }
 
-fn non_empty<'a>(s: Option<&'a Cow<'_, str>>) -> Option<&'a str> {
-    s.map(AsRef::as_ref).filter(|s| !s.is_empty())
+fn non_empty(s: &str) -> Option<&str> {
+    (!s.is_empty()).then_some(s)
 }
 
-/// Lowercase hex id (OTLP/JSON ids are hex; some exporters use uppercase).
-fn hex_id<'a>(s: Option<&'a Cow<'_, str>>, buf: &'a mut String) -> Option<&'a str> {
-    let s = non_empty(s)?;
+/// Lowercase hex id (OTLP/JSON ids are hex; some exporters use uppercase);
+/// `None` when empty or all zeros (an invalid id).
+fn hex_id<'a>(s: Option<&'a str>, buf: &'a mut String) -> Option<&'a str> {
+    let s = s.filter(|s| s.bytes().any(|b| b != b'0'))?;
     if s.bytes().any(|b| b.is_ascii_uppercase()) {
         buf.clear();
         buf.extend(s.chars().map(|c| c.to_ascii_lowercase()));
@@ -440,15 +780,195 @@ fn hex_id<'a>(s: Option<&'a Cow<'_, str>>, buf: &'a mut String) -> Option<&'a st
     }
 }
 
+/// Lowercase hex of a binary id; `None` when empty or all zeros.
+fn hex_byte_id<'a>(id: &[u8], buf: &'a mut String) -> Option<&'a str> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if id.iter().all(|&b| b == 0) {
+        return None;
+    }
+    buf.clear();
+    for &b in id {
+        buf.push(char::from(HEX[usize::from(b >> 4)]));
+        buf.push(char::from(HEX[usize::from(b & 0x0f)]));
+    }
+    Some(buf.as_str())
+}
+
 fn as_text(bytes: &[u8]) -> &str {
     // The JSON writers above only produce UTF-8.
     std::str::from_utf8(bytes).unwrap_or_default()
 }
 
-/// Flattens an OTLP/JSON logs export request into one row per log record,
-/// grouped by the string value of the resource attribute `tenant_attribute`
+fn first_non_blank(data: &[u8]) -> Option<u8> {
+    data.iter().copied().find(|b| !b.is_ascii_whitespace())
+}
+
+/// Reads an OTLP/JSON request into `groups`.
+fn read_json(
+    body: &[u8],
+    tenant_attribute: &str,
+    groups: &mut Groups,
+) -> Result<(), DatalakeError> {
+    if first_non_blank(body) != Some(b'{') {
+        return Err(malformed("OTLP logs request must be a JSON object"));
+    }
+    let request: Request<'_> = serde_json::from_slice(body)
+        .map_err(|e| malformed(format!("OTLP logs request is not valid OTLP/JSON: {e}")))?;
+    let (mut trace, mut span) = (String::new(), String::new());
+    let (mut json, mut resource_json, mut body_json) = (Vec::new(), Vec::new(), Vec::new());
+    for resource_logs in &request.resource_logs {
+        let resource: &[KeyValue<'_>] = resource_logs
+            .resource
+            .as_ref()
+            .map_or(&[], |r| r.attributes.as_slice());
+        let resource_tenant = string_attribute(resource, tenant_attribute);
+        let has_resource = attributes_json(&mut resource_json, resource)?;
+        for scope_logs in &resource_logs.scope_logs {
+            let scope = scope_logs.scope.as_ref();
+            let origin = Origin {
+                service: string_attribute(resource, "service.name"),
+                resource: has_resource.then(|| as_text(&resource_json)),
+                scope_name: scope.and_then(|s| s.name.as_deref()).and_then(non_empty),
+                scope_version: scope.and_then(|s| s.version.as_deref()).and_then(non_empty),
+            };
+            for log in &scope_logs.log_records {
+                let tenant =
+                    resource_tenant.or_else(|| string_attribute(&log.attributes, tenant_attribute));
+                let body = match &log.body {
+                    Some(b) if b.string.is_some() => b.string.as_deref(),
+                    Some(b) => {
+                        body_json.clear();
+                        push_any(&mut body_json, b, 1)?;
+                        let text = as_text(&body_json);
+                        (text != "null").then_some(text)
+                    }
+                    None => None,
+                };
+                let has_attributes = attributes_json(&mut json, &log.attributes)?;
+                let record = Record {
+                    time: nanos(log.time),
+                    observed: nanos(log.observed),
+                    severity_number: int(log.severity_number),
+                    severity_text: log.severity_text.as_deref().unwrap_or_default(),
+                    body,
+                    attributes: has_attributes.then(|| as_text(&json)),
+                    trace_id: hex_id(log.trace_id.as_deref(), &mut trace),
+                    span_id: hex_id(log.span_id.as_deref(), &mut span),
+                    flags: int(log.flags),
+                    event_name: log.event_name.as_deref().unwrap_or_default(),
+                };
+                groups.push(tenant, &origin, &record);
+            }
+        }
+    }
+    Ok(())
+}
+
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// The request decompressed, at most `limit` bytes.
+fn decompress(
+    body: &[u8],
+    compression: OtlpCompression,
+    limit: usize,
+) -> Result<Cow<'_, [u8]>, DatalakeError> {
+    let compression = match compression {
+        OtlpCompression::Auto if body.starts_with(&GZIP_MAGIC) => OtlpCompression::Gzip,
+        OtlpCompression::Auto if body.starts_with(&ZSTD_MAGIC) => OtlpCompression::Zstd,
+        OtlpCompression::Auto => OtlpCompression::None,
+        c => c,
+    };
+    // Start from the size the stream declares, bounded so that a forged size
+    // cannot reserve much memory.
+    let capacity = |declared: Option<u64>| {
+        declared
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(body.len().saturating_mul(4))
+            .min(limit)
+            .min(body.len().saturating_mul(64))
+    };
+    match compression {
+        OtlpCompression::Gzip => {
+            // ISIZE: the last member's size modulo 2^32.
+            let declared = body
+                .len()
+                .checked_sub(4)
+                .and_then(|start| body.get(start..))
+                .and_then(|tail| <[u8; 4]>::try_from(tail).ok())
+                .map(|size| u64::from(u32::from_le_bytes(size)));
+            read_limited(
+                flate2::read::MultiGzDecoder::new(body),
+                capacity(declared),
+                limit,
+                "gzip",
+            )
+        }
+        OtlpCompression::Zstd => {
+            let declared = zstd::zstd_safe::get_frame_content_size(body).ok().flatten();
+            let decoder = zstd::stream::read::Decoder::with_buffer(body)
+                .map_err(|e| malformed(format!("cannot decompress the zstd OTLP request: {e}")))?;
+            read_limited(decoder, capacity(declared), limit, "zstd")
+        }
+        OtlpCompression::Auto | OtlpCompression::None => Ok(Cow::Borrowed(body)),
+    }
+}
+
+fn read_limited(
+    reader: impl Read,
+    capacity: usize,
+    limit: usize,
+    codec: &str,
+) -> Result<Cow<'static, [u8]>, DatalakeError> {
+    let mut out = Vec::with_capacity(capacity);
+    let cap = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    reader
+        .take(cap)
+        .read_to_end(&mut out)
+        .map_err(|e| malformed(format!("cannot decompress the {codec} OTLP request: {e}")))?;
+    if out.len() > limit {
+        return Err(DatalakeError::PayloadTooLarge { limit });
+    }
+    Ok(Cow::Owned(out))
+}
+
+/// One request: its groups and the encoding it was read in.
+fn flatten_request(
+    body: &[u8],
+    options: &OtlpOptions,
+) -> Result<(Vec<TenantLogs>, OtlpEncoding), DatalakeError> {
+    let data = decompress(body, options.compression, options.max_decompressed_bytes)?;
+    let encoding = match options.encoding {
+        OtlpEncoding::Auto if first_non_blank(&data) == Some(b'{') => OtlpEncoding::Json,
+        OtlpEncoding::Auto => OtlpEncoding::Protobuf,
+        e => e,
+    };
+    let mut groups = Groups::default();
+    if encoding == OtlpEncoding::Json {
+        read_json(&data, &options.tenant_attribute, &mut groups)?;
+    } else {
+        protobuf::read(&data, &options.tenant_attribute, &mut groups)?;
+    }
+    Ok((groups.finish()?, encoding))
+}
+
+/// Flattens an OTLP logs export request (protobuf or JSON, optionally
+/// compressed, as `options` says) into one row per log record, grouped by
+/// the string value of the resource attribute `options.tenant_attribute`
 /// (a record attribute of that name is used when the resource has none).
 /// Groups come in tenant order, records in request order.
+///
+/// # Errors
+///
+/// [`DatalakeError::MalformedPayload`] when `body` cannot be decompressed or
+/// is not a valid request in its encoding, or nests values deeper than
+/// [`MAX_VALUE_DEPTH`]; [`DatalakeError::PayloadTooLarge`] when it expands
+/// beyond `options.max_decompressed_bytes`.
+pub fn flatten_logs(body: &[u8], options: &OtlpOptions) -> Result<Vec<TenantLogs>, DatalakeError> {
+    flatten_request(body, options).map(|(groups, _)| groups)
+}
+
+/// [`flatten_logs`] for an uncompressed OTLP/JSON request.
 ///
 /// # Errors
 ///
@@ -457,133 +977,46 @@ pub fn flatten_logs_json(
     body: &[u8],
     tenant_attribute: &str,
 ) -> Result<Vec<TenantLogs>, DatalakeError> {
-    if body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
-        return Err(DatalakeError::MalformedPayload {
-            reason: "OTLP logs request must be a JSON object".into(),
-        });
-    }
-    let request: Request<'_> =
-        serde_json::from_slice(body).map_err(|e| DatalakeError::MalformedPayload {
-            reason: format!("OTLP logs request is not valid OTLP/JSON: {e}"),
-        })?;
-    // Few tenants per request: a linear search beats hashing owned keys.
-    let mut groups: Vec<(Option<String>, Rows)> = Vec::new();
-    let mut last: Option<usize> = None;
-    let (mut time, mut observed, mut trace, mut span) =
-        (String::new(), String::new(), String::new(), String::new());
-    let (mut json, mut resource_json, mut body_json) = (Vec::new(), Vec::new(), Vec::new());
-    for resource_logs in &request.resource_logs {
-        let resource: &[KeyValue<'_>] = resource_logs
-            .resource
-            .as_ref()
-            .map_or(&[], |r| r.attributes.as_slice());
-        let resource_tenant = string_attribute(resource, tenant_attribute);
-        let service = string_attribute(resource, "service.name");
-        let has_resource = attributes_json(&mut resource_json, resource);
-        for scope_logs in &resource_logs.scope_logs {
-            let scope = scope_logs.scope.as_ref();
-            let scope_name = scope.and_then(|s| non_empty(s.name.as_ref()));
-            let scope_version = scope.and_then(|s| non_empty(s.version.as_ref()));
-            for log in &scope_logs.log_records {
-                let tenant =
-                    resource_tenant.or_else(|| string_attribute(&log.attributes, tenant_attribute));
-                let index = match last {
-                    Some(i) if groups[i].0.as_deref() == tenant => i,
-                    _ => {
-                        let i = if let Some(i) =
-                            groups.iter().position(|(t, _)| t.as_deref() == tenant)
-                        {
-                            i
-                        } else {
-                            groups.push((tenant.map(str::to_owned), Rows::new()));
-                            groups.len() - 1
-                        };
-                        last = Some(i);
-                        i
-                    }
-                };
-                let rows = &mut groups[index].1;
-                let has_observed = time_text(&mut observed, log.observed);
-                // The record's time, or when it was observed if unset.
-                if time_text(&mut time, log.time) {
-                    rows.text[T_TIME].append_value(&time);
-                } else if has_observed {
-                    rows.text[T_TIME].append_value(&observed);
-                } else {
-                    rows.text[T_TIME].append_null();
-                }
-                rows.text[T_OBSERVED].append_option(has_observed.then_some(observed.as_str()));
-                rows.text[T_SEVERITY].append_option(non_empty(log.severity_text.as_ref()));
-                match &log.body {
-                    Some(b) if b.string.is_some() => {
-                        rows.text[T_BODY].append_option(b.string.as_deref());
-                    }
-                    Some(b) => {
-                        body_json.clear();
-                        push_any(&mut body_json, b);
-                        let text = as_text(&body_json);
-                        rows.text[T_BODY].append_option((text != "null").then_some(text));
-                    }
-                    None => rows.text[T_BODY].append_null(),
-                }
-                let has_attributes = attributes_json(&mut json, &log.attributes);
-                rows.text[T_ATTRIBUTES].append_option(has_attributes.then(|| as_text(&json)));
-                rows.text[T_TRACE].append_option(hex_id(log.trace_id.as_ref(), &mut trace));
-                rows.text[T_SPAN].append_option(hex_id(log.span_id.as_ref(), &mut span));
-                rows.text[T_EVENT].append_option(non_empty(log.event_name.as_ref()));
-                rows.text[T_SERVICE].append_option(service);
-                rows.text[T_SCOPE_NAME].append_option(scope_name);
-                rows.text[T_SCOPE_VERSION].append_option(scope_version);
-                rows.text[T_RESOURCE].append_option(has_resource.then(|| as_text(&resource_json)));
-                rows.ints[I_SEVERITY].append_option(log.severity_number.and_then(|Int(v)| v));
-                rows.ints[I_FLAGS].append_option(log.flags.and_then(|Int(v)| v));
-            }
-        }
-    }
-    groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    groups
-        .into_iter()
-        .map(|(tenant, rows)| {
-            Ok(TenantLogs {
-                tenant,
-                batch: rows.finish()?,
-                sources: vec![0],
-            })
-        })
-        .collect()
+    flatten_logs(body, &OtlpOptions::json(tenant_attribute))
 }
 
-/// Flattens several OTLP/JSON requests (for example the records of one
-/// queue batch) and merges their rows by tenant, in request order, so each
-/// tenant is ingested once.
+/// Flattens several requests (for example the records of one queue batch;
+/// each may have its own encoding and compression when `options` says
+/// `Auto`) and merges their rows by tenant, in request order, so each tenant
+/// is ingested once.
 ///
 /// # Errors
 ///
 /// [`DatalakeError::Storage`] if merging Arrow batches fails; unreadable
 /// requests are reported in [`FlattenedRequests::malformed`] instead.
-pub fn flatten_logs_json_many(
+pub fn flatten_logs_many(
     bodies: &[&[u8]],
-    tenant_attribute: &str,
+    options: &OtlpOptions,
 ) -> Result<FlattenedRequests, DatalakeError> {
     use rayon::prelude::*;
 
     // Requests are independent: flatten them on every core, merge in order.
     let flattened: Vec<_> = bodies
         .par_iter()
-        .map(|body| flatten_logs_json(body, tenant_attribute))
+        .map(|body| flatten_request(body, options))
         .collect();
     let mut groups: BTreeMap<Option<String>, (Vec<RecordBatch>, Vec<usize>)> = BTreeMap::new();
     let mut malformed = Vec::new();
+    let mut encodings = Vec::with_capacity(bodies.len());
     for (index, result) in flattened.into_iter().enumerate() {
         match result {
-            Ok(parts) => {
+            Ok((parts, encoding)) => {
+                encodings.push(Some(encoding));
                 for part in parts {
                     let (batches, sources) = groups.entry(part.tenant).or_default();
                     batches.push(part.batch);
                     sources.push(index);
                 }
             }
-            Err(e) => malformed.push((index, e)),
+            Err(e) => {
+                encodings.push(None);
+                malformed.push((index, e));
+            }
         }
     }
     let tenants = groups
@@ -602,209 +1035,24 @@ pub fn flatten_logs_json_many(
             })
         })
         .collect::<Result<_, DatalakeError>>()?;
-    Ok(FlattenedRequests { tenants, malformed })
+    Ok(FlattenedRequests {
+        tenants,
+        malformed,
+        encodings,
+    })
+}
+
+/// [`flatten_logs_many`] for uncompressed OTLP/JSON requests.
+///
+/// # Errors
+///
+/// As [`flatten_logs_many`].
+pub fn flatten_logs_json_many(
+    bodies: &[&[u8]],
+    tenant_attribute: &str,
+) -> Result<FlattenedRequests, DatalakeError> {
+    flatten_logs_many(bodies, &OtlpOptions::json(tenant_attribute))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::contracts::ContractRegistry;
-    use arrow::array::{Array, AsArray};
-    use arrow::datatypes::Int64Type;
-
-    fn request() -> Value {
-        json!({"resourceLogs": [
-            {"resource": {"attributes": [
-                {"key": "service.name", "value": {"stringValue": "checkout"}},
-                {"key": "tenant.id", "value": {"stringValue": "acme-001"}}]},
-             "scopeLogs": [{"scope": {"name": "app", "version": "1.2"}, "logRecords": [
-                {"timeUnixNano": "1772359200123456789", "observedTimeUnixNano": 1_772_359_200_200_000_000_u64,
-                 "severityNumber": 9, "severityText": "INFO",
-                 "body": {"stringValue": "order placed"},
-                 "attributes": [{"key": "order.id", "value": {"intValue": "42"}},
-                                {"key": "ok", "value": {"boolValue": true}}],
-                 "traceId": "5B8EFFF798038103D269B633813FC60C", "spanId": "EEE19B7EC3C1B174", "flags": 1},
-                {"observedTimeUnixNano": "1772359201000000000", "severityNumber": 17,
-                 "body": {"kvlistValue": {"values": [{"key": "error", "value": {"stringValue": "boom"}}]}}}]}]},
-            {"resource": {"attributes": [{"key": "tenant.id", "value": {"stringValue": "beta-002"}}]},
-             "scope_logs": [{"log_records": [{"time_unix_nano": "1772359202000000000"}]}]},
-            {"resource": {}, "scopeLogs": [{"logRecords": [
-                {"timeUnixNano": "1772359203000000000",
-                 "attributes": [{"key": "tenant.id", "value": {"stringValue": "acme-001"}}]},
-                {"timeUnixNano": "1772359204000000000"}]}]}
-        ]})
-    }
-
-    fn column<'a>(batch: &'a RecordBatch, name: &str) -> &'a ArrayRef {
-        batch.column_by_name(name).unwrap()
-    }
-
-    #[test]
-    fn records_are_flattened_and_grouped_by_tenant() {
-        let groups = flatten_logs_json(request().to_string().as_bytes(), "tenant.id").unwrap();
-        let tenants: Vec<_> = groups.iter().map(|g| g.tenant.as_deref()).collect();
-        assert_eq!(tenants, [None, Some("acme-001"), Some("beta-002")]);
-        let acme = &groups[1].batch;
-        assert_eq!(
-            acme.num_rows(),
-            3,
-            "two records plus one tagged on the record"
-        );
-        let ts = column(acme, "timestamp").as_string::<i32>();
-        assert_eq!(ts.value(0), "2026-03-01T10:00:00.123456Z");
-        assert_eq!(
-            ts.value(1),
-            "2026-03-01T10:00:01.000000Z",
-            "falls back to observed time"
-        );
-        let body = column(acme, "body").as_string::<i32>();
-        assert_eq!(body.value(0), "order placed");
-        assert_eq!(body.value(1), r#"{"error":"boom"}"#);
-        assert_eq!(
-            column(acme, "attributes").as_string::<i32>().value(0),
-            r#"{"order.id":42,"ok":true}"#
-        );
-        assert_eq!(
-            column(acme, "trace_id").as_string::<i32>().value(0),
-            "5b8efff798038103d269b633813fc60c"
-        );
-        assert_eq!(
-            column(acme, "service_name").as_string::<i32>().value(0),
-            "checkout"
-        );
-        assert_eq!(
-            column(acme, "scope_version").as_string::<i32>().value(0),
-            "1.2"
-        );
-        let severity = column(acme, "severity_number").as_primitive::<Int64Type>();
-        assert_eq!((severity.value(0), severity.value(1)), (9, 17));
-        assert!(column(acme, "severity_text").is_null(1));
-        assert!(column(acme, "resource_attributes").is_null(2));
-        assert_eq!(
-            groups[2].batch.num_rows(),
-            1,
-            "snake_case names are read too"
-        );
-        assert_eq!(groups[0].batch.num_rows(), 1);
-    }
-
-    #[test]
-    fn contract_matches_the_flattened_columns() {
-        let mut registry = ContractRegistry::default();
-        registry
-            .register(&logs_contract("otel", "logs", "1.0.0", "zstd", true))
-            .unwrap();
-        let contract = registry.get("otel/logs/1.0.0").unwrap();
-        let groups = flatten_logs_json(request().to_string().as_bytes(), "tenant.id").unwrap();
-        let schema = groups[0].batch.schema();
-        let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        let declared: Vec<_> = contract.fields().iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names.len(), declared.len());
-        for name in names {
-            assert!(declared.contains(&name), "{name} is not declared");
-        }
-        assert_eq!(contract.partition_by(), Some("timestamp"));
-    }
-
-    #[tokio::test]
-    async fn flattened_logs_ingest_with_typed_timestamps() {
-        use crate::pipeline::{BronzePipeline, IngestRequest, PipelineConfig, RecordSource};
-        use crate::storage::InMemoryStorage;
-        use crate::tenant::{TenantId, TenantProfile};
-        use arrow::datatypes::TimeUnit;
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-        let mut registry = ContractRegistry::default();
-        registry
-            .register(&logs_contract("otel", "logs", "1.0.0", "zstd", false))
-            .unwrap();
-        let storage = InMemoryStorage::new();
-        let config = PipelineConfig {
-            max_future_skew: None,
-            ..PipelineConfig::default()
-        };
-        let pipeline =
-            BronzePipeline::new(Arc::new(registry), Arc::new(storage.clone()), config).unwrap();
-        let groups = flatten_logs_json(request().to_string().as_bytes(), "tenant.id").unwrap();
-        let acme = groups
-            .into_iter()
-            .find(|g| g.tenant.as_deref() == Some("acme-001"))
-            .unwrap();
-        let tenant = Arc::new(
-            TenantProfile::for_bucket(TenantId::new("acme-001").unwrap(), "lake")
-                .unwrap()
-                .build()
-                .unwrap(),
-        );
-        let report = pipeline
-            .ingest(IngestRequest::new(
-                tenant,
-                "otel/logs/1.0.0",
-                RecordSource::Arrow(vec![acme.batch]),
-            ))
-            .await
-            .unwrap();
-        assert_eq!((report.records_ok, report.records_quarantined), (3, 0));
-        let uri = report.data_uri.unwrap();
-        let body = storage
-            .get(uri.strip_prefix("s3://").unwrap())
-            .unwrap()
-            .body;
-        let stored = ParquetRecordBatchReaderBuilder::try_new(body)
-            .unwrap()
-            .build()
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            stored.column_by_name("timestamp").unwrap().data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-        );
-    }
-
-    #[test]
-    fn several_requests_merge_by_tenant() {
-        let one = request().to_string();
-        let out = flatten_logs_json_many(&[one.as_bytes(), b"nope", one.as_bytes()], "tenant.id")
-            .unwrap();
-        let rows: Vec<_> = out.tenants.iter().map(|g| g.batch.num_rows()).collect();
-        assert_eq!(rows, [2, 6, 2]);
-        assert!(out.tenants.iter().all(|g| g.sources == [0, 2]));
-        assert_eq!(out.malformed.len(), 1);
-        assert_eq!(
-            out.malformed[0].0, 1,
-            "the unreadable request is reported, the rest kept"
-        );
-    }
-
-    /// The contract must keep the columnar fast path: content keywords are
-    /// annotations in draft 2020-12, but may be asserted by draft 7.
-    #[test]
-    fn contract_keeps_the_columnar_path() {
-        let mut registry = ContractRegistry::default();
-        registry
-            .register(&logs_contract("otel", "logs", "1.0.0", "zstd", false))
-            .unwrap();
-        assert!(registry
-            .get("otel/logs/1.0.0")
-            .unwrap()
-            .columnar()
-            .is_some());
-        let mut draft7 = logs_contract("otel", "logs7", "1.0.0", "zstd", false);
-        draft7["$schema"] = json!("http://json-schema.org/draft-07/schema#");
-        registry.register(&draft7).unwrap();
-        assert!(registry
-            .get("otel/logs7/1.0.0")
-            .unwrap()
-            .columnar()
-            .is_none());
-    }
-
-    #[test]
-    fn invalid_payloads_are_rejected() {
-        assert!(flatten_logs_json(b"not json", "tenant.id").is_err());
-        assert!(flatten_logs_json(b"[1, 2]", "tenant.id").is_err());
-        assert!(flatten_logs_json(b"{}", "tenant.id").unwrap().is_empty());
-    }
-}
+mod tests;

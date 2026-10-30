@@ -46,6 +46,15 @@ pub enum DatalakeError {
         reason: String,
     },
 
+    /// A compressed request expands beyond the configured limit (a guard
+    /// against compression bombs). Raised as `PayloadTooLargeError`, a
+    /// subclass of `MalformedPayloadError`.
+    #[error("malformed payload: the decompressed request exceeds {limit} bytes")]
+    PayloadTooLarge {
+        /// The limit, in bytes.
+        limit: usize,
+    },
+
     /// A record failed validation and the pipeline runs in fail-fast mode.
     #[error("record {record_index} rejected at level {level} [{code}]: {message}")]
     RecordRejected {
@@ -157,6 +166,12 @@ pub mod exceptions {
     );
     create_exception!(
         datalake_medallion_sdk,
+        PayloadTooLargeError,
+        MalformedPayloadError,
+        "A compressed request expands beyond the configured limit."
+    );
+    create_exception!(
+        datalake_medallion_sdk,
         RecordRejectedError,
         DatalakeError,
         "A record failed validation while the client runs with on_invalid='raise'."
@@ -211,6 +226,7 @@ impl From<DatalakeError> for PyErr {
             }
             DatalakeError::TenantViolation { .. } => ex::TenantViolationError::new_err(msg),
             DatalakeError::MalformedPayload { .. } => ex::MalformedPayloadError::new_err(msg),
+            DatalakeError::PayloadTooLarge { .. } => ex::PayloadTooLargeError::new_err(msg),
             DatalakeError::RecordRejected { level: lvl, .. } => match lvl {
                 level::PAYLOAD => ex::MalformedPayloadError::new_err(msg),
                 level::SCHEMA => ex::SchemaViolationError::new_err(msg),
@@ -243,6 +259,10 @@ pub(crate) fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "MalformedPayloadError",
         py.get_type::<ex::MalformedPayloadError>(),
+    )?;
+    m.add(
+        "PayloadTooLargeError",
+        py.get_type::<ex::PayloadTooLargeError>(),
     )?;
     m.add(
         "RecordRejectedError",
