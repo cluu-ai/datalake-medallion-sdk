@@ -219,6 +219,9 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - working-directory: datalake-medallion-sdk
         run: cargo +nightly fuzz run contract_compile -- -runs=20000
+      # Short smoke run; fuzz.yml runs every target for longer.
+      - working-directory: datalake-medallion-sdk
+        run: cargo +nightly fuzz run otlp_logs -- -max_total_time=60 -rss_limit_mb=2048
 
   coverage:
     name: Coverage (llvm-cov)
