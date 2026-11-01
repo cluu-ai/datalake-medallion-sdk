@@ -53,7 +53,7 @@ zstd = { version = "0.14", default-features = false }
 # No remote or file $ref resolution: contracts must be self-contained, and
 # compiling a schema must never perform network I/O. `idna` keeps the
 # `idn-email` and `idn-hostname` formats asserted (offline, pure Rust).
-jsonschema = { version = "0.58", default-features = false, features = ["idna"] }
+jsonschema = { version = "0.60", default-features = false, features = ["idna"] }
 serde = { version = "1", features = ["derive"] }
 # `float_roundtrip`: JSON text parses to the exact f64 it was printed from, so
 # Arrow input gives the same numbers on the columnar and the row path.
